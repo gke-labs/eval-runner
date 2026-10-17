@@ -113,6 +113,15 @@ func (h *Harness) DeployEvalRunner() {
 	h.DockerBuild("sample-runner:e2e", filepath.Join(gitRoot, "images/sample-runner/Dockerfile"), gitRoot)
 	h.KindLoad("sample-runner:e2e")
 
+	// Build and load sandboxd image from fork (clones into .build/agent-sandbox if sibling is absent)
+	h.runCmd(filepath.Join(gitRoot, "dev/tasks/build-sandboxd"))
+	agentSandboxDir := filepath.Join(gitRoot, "../agent-sandbox")
+	if _, err := os.Stat(agentSandboxDir); err != nil {
+		agentSandboxDir = filepath.Join(gitRoot, ".build/agent-sandbox")
+	}
+	h.DockerBuild("sandboxd:e2e", filepath.Join(agentSandboxDir, "packages/sandboxd/Dockerfile"), agentSandboxDir)
+	h.KindLoad("sandboxd:e2e")
+
 	// Apply namespaces
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/00-namespaces.yaml"))
 
@@ -150,6 +159,12 @@ data:
 		string(deployContent),
 		"image: eval-runner",
 		"image: eval-runner:e2e\n        imagePullPolicy: Never",
+		1,
+	)
+	modifiedDeploy = strings.Replace(
+		modifiedDeploy,
+		"args:",
+		"args:\n        - --sandboxd-image=sandboxd:e2e",
 		1,
 	)
 	h.KubectlApplyContent(modifiedDeploy)

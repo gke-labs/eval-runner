@@ -103,6 +103,24 @@ spec:
 			t.Errorf("Expected sandbox %s to be deleted, but found:\n%s", sandboxName, out)
 		}
 
+		// Assert CA Secret exists in eval-runner
+		caSec := harness.runCmd("kubectl", "get", "secret", "sandbox-ca", "-n", "eval-runner", "--ignore-not-found")
+		if strings.TrimSpace(caSec) == "" {
+			t.Errorf("Expected sandbox-ca Secret in eval-runner, got empty")
+		}
+
+		// Assert CA ConfigMap exists in eval-runner-sandbox
+		caCM := harness.runCmd("kubectl", "get", "configmap", "sandbox-ca", "-n", "eval-runner-sandbox", "--ignore-not-found")
+		if strings.TrimSpace(caCM) == "" {
+			t.Errorf("Expected sandbox-ca ConfigMap in eval-runner-sandbox, got empty")
+		}
+
+		// Assert server cert secret is deleted from eval-runner-sandbox
+		tlsSec := harness.runCmd("kubectl", "get", "secret", "sb-tls-"+sandboxName, "-n", "eval-runner-sandbox", "--ignore-not-found")
+		if strings.TrimSpace(tlsSec) != "" {
+			t.Errorf("Expected server cert secret sb-tls-%s to be deleted, but found:\n%s", sandboxName, tlsSec)
+		}
+
 		// Delete Run and assert no sandbox remains
 		harness.runCmd("kubectl", "delete", "run", runName, "-n", "eval-runner")
 		harness.WaitForRunDeleted("eval-runner", runName, 30*time.Second)

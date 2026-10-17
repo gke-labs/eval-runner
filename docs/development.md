@@ -41,6 +41,61 @@ To upgrade or repin the `sandboxd` image:
 3. Update `SandboxdImage` in `pkg/discovery/sandbox.go` with the pinned digest reference.
 4. Run `ap test` and `ap e2e` to verify.
 
+### Working Against the `agent-sandbox` Fork
+
+For mTLS support between the controller and `sandboxd`, `eval-runner` relies on a prototype fork of `kubernetes-sigs/agent-sandbox` (`github.com/codebot-robot/agent-sandbox` on branch `sandboxd-mtls`).
+
+#### Local Development with `go.work`
+For local multi-module development, a `go.work` file at the repository root points to a sibling checkout:
+```bash
+# Sibling checkout
+cd /workspaces
+git clone https://github.com/codebot-robot/agent-sandbox.git
+cd agent-sandbox
+git checkout sandboxd-mtls
+
+# In eval-runner:
+go work init . ../agent-sandbox
+```
+`go.work` and `go.work.sum` are git-ignored so local workspace configurations do not affect CI.
+
+#### CI Builds via `replace`
+In `go.mod`, a pinned `replace` directive resolves `sigs.k8s.io/agent-sandbox` to the fork commit on GitHub so CI builds succeed without requiring a multi-module workspace:
+```
+replace sigs.k8s.io/agent-sandbox => github.com/codebot-robot/agent-sandbox <commit>
+```
+
+#### Building the `sandboxd` Image
+To build the `sandboxd` image from the fork:
+```bash
+./dev/tasks/build-sandboxd
+```
+Pass `--push` to push the image to a container registry, or pass `IMAGE_PREFIX` and `IMAGE_TAG` to customize the tag.
+
+For production and multi-platform releases (`linux/amd64,linux/arm64`), maintainers build and push the image using:
+```bash
+git clone https://github.com/codebot-robot/agent-sandbox.git && cd agent-sandbox && git checkout 0d9e0d2e62d1
+docker buildx build --platform linux/amd64,linux/arm64 -f packages/sandboxd/Dockerfile \
+  --build-arg GIT_VERSION=v1.0.7-mtls --build-arg GIT_SHA=0d9e0d2e62d1 \
+  -t gcr.io/justinsb-knotai-dev/sandboxd:0d9e0d2 --push .
+```
+Note: Pushing the multi-arch image to the registry is a maintainer step whenever the fork commit changes. After pushing, update the pinned image digest in `pkg/discovery/sandbox.go`.
+
+### CA Bootstrap and Rotation Procedure
+
+The controller maintains a self-signed CA that issues the controller's client certificate and per-sandbox server certificates:
+1. **Initial Bootstrap**: At startup, the controller checks for Secret `sandbox-ca` in `eval-runner`. If absent, it generates an ECDSA P-256 keypair and self-signed CA certificate, stores both CA and client keypairs in `eval-runner/sandbox-ca`, and synchronizes the public CA certificate to ConfigMap `sandbox-ca` in `eval-runner-sandbox`.
+2. **Restart Idempotency**: Controller restarts read the existing `sandbox-ca` Secret and verify the ConfigMap without regenerating certificates.
+3. **Manual CA Rotation Procedure**:
+   - **Important**: Because sandboxd instances load the CA certificate pool once at startup and the controller verifies sandbox server certificates against the active CA, rotating `sandbox-ca` breaks mTLS handshakes with in-flight sandboxes (the controller's new client certificate will not be trusted by existing sandboxd daemons, and existing sandboxes' server certificates will not chain to the controller's new CA). Therefore, in-flight Runs will fail upon CA rotation. Operators should allow active Runs to complete (or drain/delete active Runs) before rotating the CA.
+   - Delete or replace Secret `eval-runner/sandbox-ca` with a newly minted CA keypair and client keypair.
+   - Restart the controller deployment:
+     ```bash
+     kubectl rollout restart deployment/eval-runner-controller -n eval-runner
+     ```
+   - On startup, the controller updates ConfigMap `eval-runner-sandbox/sandbox-ca` with the new public CA cert.
+   - All subsequent sandboxes created by the controller mount the updated ConfigMap and receive server certificates signed by the new CA.
+
 Tools like `kind` and `kubectl` do not need to be installed beforehand for testing; test scripts can download and manage them automatically under `.build/bin/`.
 
 ## Project Automation (`ap`)

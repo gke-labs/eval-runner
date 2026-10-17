@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
+	"github.com/gke-labs/eval-runner/pkg/discovery"
 )
 
 func TestRunSampleExecution(t *testing.T) {
@@ -105,6 +106,16 @@ spec:
 
 		// Assert task sandboxes are gone from eval-runner-sandbox
 		harness.WaitForAllSandboxesDeletedForRun("eval-runner-sandbox", runName, 30*time.Second)
+
+		// Assert that per-sandbox server cert secrets were deleted
+		for _, task := range run.Status.Tasks {
+			sbName := discovery.TaskSandboxNameForRun(runName, task.ID)
+			secName := "sb-tls-" + sbName
+			tlsSec := harness.runCmd("kubectl", "get", "secret", secName, "-n", "eval-runner-sandbox", "--ignore-not-found")
+			if strings.TrimSpace(tlsSec) != "" {
+				t.Errorf("Expected server cert secret %s to be deleted, but found:\n%s", secName, tlsSec)
+			}
+		}
 
 		// Assert that no model Secret was mounted
 		secretsOut := harness.runCmd("kubectl", "get", "secrets", "-n", "eval-runner-sandbox", "-o", "jsonpath={.items[*].metadata.name}")
