@@ -2,6 +2,10 @@
 .build/
 bin/
 
+# Go workspace
+go.work
+go.work.sum
+
 # Logs
 *.log
 *.eval
