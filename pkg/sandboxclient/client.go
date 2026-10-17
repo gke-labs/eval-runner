@@ -16,6 +16,7 @@ package sandboxclient
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/gke-labs/eval-runner/pkg/discovery"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
@@ -91,11 +93,19 @@ type ClientOptions struct {
 	StderrLimit   int64
 	ReadFileLimit int64
 	AuthToken     string
+	TLSConfig     *tls.Config
 	HTTPClient    *http.Client
 }
 
 // Option configures ClientOptions.
 type Option func(*ClientOptions)
+
+// WithTLSConfig sets the TLS configuration for connecting to sandboxd over mTLS.
+func WithTLSConfig(tlsConfig *tls.Config) Option {
+	return func(o *ClientOptions) {
+		o.TLSConfig = tlsConfig
+	}
+}
 
 // WithGRPCPort overrides the gRPC port.
 func WithGRPCPort(port int) Option {
@@ -185,7 +195,11 @@ func New(podIP string, opts ...Option) (Client, error) {
 	}
 
 	var dialOpts []grpc.DialOption
-	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if options.TLSConfig != nil {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(options.TLSConfig)))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
 	if options.AuthToken != "" {
 		token := options.AuthToken
 		dialOpts = append(dialOpts,
@@ -211,12 +225,23 @@ func New(podIP string, opts ...Option) (Client, error) {
 
 	httpClient := options.HTTPClient
 	if httpClient == nil {
+		var transport http.RoundTripper
+		if options.TLSConfig != nil {
+			t := http.DefaultTransport.(*http.Transport).Clone()
+			t.TLSClientConfig = options.TLSConfig
+			transport = t
+		}
 		httpClient = &http.Client{
-			Timeout: DefaultHTTPTimeout,
+			Transport: transport,
+			Timeout:   DefaultHTTPTimeout,
 		}
 	}
 
-	restBaseURL := fmt.Sprintf("http://%s", net.JoinHostPort(podIP, fmt.Sprintf("%d", options.RESTPort)))
+	scheme := "http"
+	if options.TLSConfig != nil {
+		scheme = "https"
+	}
+	restBaseURL := fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(podIP, fmt.Sprintf("%d", options.RESTPort)))
 
 	return &sandboxdClient{
 		grpcConn:      conn,

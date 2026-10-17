@@ -16,6 +16,7 @@ package sandboxclient
 
 import (
 	"context"
+	"crypto/tls"
 	"sync"
 )
 
@@ -52,6 +53,7 @@ type FakeClient struct {
 
 	LastPodIP     string
 	LastAuthToken string
+	LastTLSConfig *tls.Config
 }
 
 // NewFakeClient returns a new FakeClient.
@@ -68,6 +70,7 @@ func (f *FakeClient) NewClient(podIP string, opts ...Option) (Client, error) {
 	f.mu.Lock()
 	f.LastPodIP = podIP
 	f.LastAuthToken = o.AuthToken
+	f.LastTLSConfig = o.TLSConfig
 	f.mu.Unlock()
 	return f, nil
 }

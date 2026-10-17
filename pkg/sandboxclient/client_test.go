@@ -16,6 +16,7 @@ package sandboxclient
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -23,10 +24,13 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/eval-runner/pkg/discovery"
+	"github.com/gke-labs/eval-runner/pkg/pki"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
@@ -386,5 +390,151 @@ func TestSandboxClient_BearerAuth(t *testing.T) {
 	}
 	if execRes.Stdout != "authenticated exec" {
 		t.Errorf("unexpected execute result from factory client: %+v", execRes)
+	}
+}
+
+func TestSandboxClient_TLSAndSANVerification(t *testing.T) {
+	ca, err := pki.NewInMemoryCA()
+	if err != nil {
+		t.Fatalf("failed to create CA: %v", err)
+	}
+
+	sandboxName := "sandbox-a"
+	sandboxNamespace := "eval-runner-sandbox"
+	serverCertPEM, serverKeyPEM, err := ca.MintServerCert(sandboxName, sandboxNamespace, 1*time.Hour, net.ParseIP("127.0.0.1"))
+	if err != nil {
+		t.Fatalf("failed to mint server cert: %v", err)
+	}
+	serverTLS, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load server TLS: %v", err)
+	}
+
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverTLS},
+		ClientCAs:    ca.CertPool(),
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+
+	// 1. Start gRPC server with TLS
+	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen gRPC: %v", err)
+	}
+	defer grpcLis.Close()
+
+	mockSrv := &mockProcessServer{
+		execResp: &processv1.ExecuteResponse{
+			ExitCode: 0,
+			Stdout:   []byte("tls exec ok"),
+		},
+	}
+	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLSConfig)))
+	processv1.RegisterProcessServiceServer(grpcServer, mockSrv)
+	go func() {
+		_ = grpcServer.Serve(grpcLis)
+	}()
+	defer grpcServer.Stop()
+
+	_, grpcPortStr, _ := net.SplitHostPort(grpcLis.Addr().String())
+	grpcPort, _ := strconv.Atoi(grpcPortStr)
+
+	// 2. Start REST server with TLS
+	restLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen REST: %v", err)
+	}
+	defer restLis.Close()
+
+	restMux := http.NewServeMux()
+	restMux.HandleFunc("GET /v1/files/hello.txt", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("tls file ok"))
+	})
+	httpServer := &http.Server{
+		Handler:   restMux,
+		TLSConfig: serverTLSConfig,
+	}
+	go func() {
+		_ = httpServer.ServeTLS(restLis, "", "")
+	}()
+	defer httpServer.Close()
+
+	_, restPortStr, _ := net.SplitHostPort(restLis.Addr().String())
+	restPort, _ := strconv.Atoi(restPortStr)
+
+	// Case A: Correct client TLS config (chains to CA, matches sandbox-a SAN, presents valid client cert)
+	validTLSConfig := ca.ClientTLSConfig(sandboxName, sandboxNamespace)
+	client, err := New("127.0.0.1",
+		WithGRPCPort(grpcPort),
+		WithRESTPort(restPort),
+		WithTLSConfig(validTLSConfig),
+	)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	execRes, err := client.Execute(t.Context(), ProcessConfig{Command: []string{"echo"}})
+	if err != nil {
+		t.Fatalf("expected Execute to succeed over mTLS, got: %v", err)
+	}
+	if execRes.Stdout != "tls exec ok" {
+		t.Errorf("unexpected stdout: %q", execRes.Stdout)
+	}
+
+	content, err := client.ReadFile(t.Context(), "hello.txt")
+	if err != nil {
+		t.Fatalf("expected ReadFile to succeed over mTLS, got: %v", err)
+	}
+	if string(content) != "tls file ok" {
+		t.Errorf("unexpected content: %q", string(content))
+	}
+
+	// Case B: Client expects sandbox-b (SAN mismatch: server presents cert for sandbox-a)
+	mismatchedTLSConfig := ca.ClientTLSConfig("sandbox-b", sandboxNamespace)
+	mismatchedClient, err := New("127.0.0.1",
+		WithGRPCPort(grpcPort),
+		WithRESTPort(restPort),
+		WithTLSConfig(mismatchedTLSConfig),
+	)
+	if err != nil {
+		t.Fatalf("failed to create mismatched client: %v", err)
+	}
+	defer mismatchedClient.Close()
+
+	_, err = mismatchedClient.Execute(t.Context(), ProcessConfig{Command: []string{"echo"}})
+	if err == nil {
+		t.Errorf("expected Execute to fail due to SAN mismatch, but it succeeded")
+	}
+
+	_, err = mismatchedClient.ReadFile(t.Context(), "hello.txt")
+	if err == nil {
+		t.Errorf("expected ReadFile to fail due to SAN mismatch, but it succeeded")
+	}
+
+	// Case C: Client without client cert (sandboxd requires client cert)
+	noClientCertTLS := &tls.Config{
+		RootCAs:    ca.CertPool(),
+		ServerName: pki.ServerSAN(sandboxName, sandboxNamespace),
+	}
+	noCertClient, err := New("127.0.0.1",
+		WithGRPCPort(grpcPort),
+		WithRESTPort(restPort),
+		WithTLSConfig(noClientCertTLS),
+	)
+	if err != nil {
+		t.Fatalf("failed to create noCertClient: %v", err)
+	}
+	defer noCertClient.Close()
+
+	_, err = noCertClient.Execute(t.Context(), ProcessConfig{Command: []string{"echo"}})
+	if err == nil {
+		t.Errorf("expected Execute without client cert to fail, but it succeeded")
+	}
+
+	_, err = noCertClient.ReadFile(t.Context(), "hello.txt")
+	if err == nil {
+		t.Errorf("expected ReadFile without client cert to fail, but it succeeded")
 	}
 }
