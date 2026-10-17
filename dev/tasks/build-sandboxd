@@ -1,0 +1,57 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PINNED_COMMIT="0d9e0d2e62d1aff4ce6849b5d0433a672ec82db7"
+FORK_URL="https://github.com/codebot-robot/agent-sandbox.git"
+
+# Sibling checkout takes precedence if present; otherwise clone pinned commit into .build/agent-sandbox
+AGENT_SANDBOX_DIR="${AGENT_SANDBOX_DIR:-}"
+if [[ -z "${AGENT_SANDBOX_DIR}" ]]; then
+  if [[ -d "${REPO_ROOT}/../agent-sandbox" ]]; then
+    AGENT_SANDBOX_DIR="${REPO_ROOT}/../agent-sandbox"
+  else
+    AGENT_SANDBOX_DIR="${REPO_ROOT}/.build/agent-sandbox"
+  fi
+fi
+
+if [[ ! -d "${AGENT_SANDBOX_DIR}" ]]; then
+  echo "agent-sandbox checkout not found at ${AGENT_SANDBOX_DIR}; cloning ${FORK_URL} at commit ${PINNED_COMMIT}..."
+  mkdir -p "$(dirname "${AGENT_SANDBOX_DIR}")"
+  git clone "${FORK_URL}" "${AGENT_SANDBOX_DIR}"
+  git -C "${AGENT_SANDBOX_DIR}" checkout "${PINNED_COMMIT}"
+  rm -rf "${AGENT_SANDBOX_DIR}/examples"
+fi
+
+IMAGE_PREFIX="${IMAGE_PREFIX:-gcr.io/justinsb-knotai-dev}"
+IMAGE_TAG="${IMAGE_TAG:-0d9e0d2}"
+IMAGE_NAME="${IMAGE_PREFIX}/sandboxd:${IMAGE_TAG}"
+
+echo "Building sandboxd from ${AGENT_SANDBOX_DIR} as ${IMAGE_NAME}..."
+docker build -t "${IMAGE_NAME}" -f "${AGENT_SANDBOX_DIR}/packages/sandboxd/Dockerfile" "${AGENT_SANDBOX_DIR}"
+
+if [[ "${1:-}" == "--push" ]]; then
+  echo "Pushing ${IMAGE_NAME}..."
+  docker push "${IMAGE_NAME}"
+fi
+
+DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_NAME}" 2>/dev/null || docker inspect --format='{{.Id}}' "${IMAGE_NAME}")"
+echo "Successfully built sandboxd:"
+echo "  Image:  ${IMAGE_NAME}"
+echo "  Digest: ${DIGEST}"

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/eval-runner/pkg/discovery"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -480,26 +481,71 @@ func TestFlagsFromFlagSet(t *testing.T) {
 	execution := fs.Duration("execution-deadline", 30*time.Minute, "execution deadline")
 	parallel := fs.Int("max-parallel-tasks", 4, "max parallel tasks")
 	secret := fs.String("model-secret", "model-credentials", "model secret")
+	sandboxd := fs.String("sandboxd-image", "", "sandboxd image")
 	grace := fs.Duration("task-grace-period", 30*time.Second, "task grace period")
 
 	// Parse with only artifact-bucket and max-parallel-tasks set
-	err := fs.Parse([]string{"--artifact-bucket=gs://custom", "--max-parallel-tasks=10"})
+	err := fs.Parse([]string{"--artifact-bucket=gs://custom", "--max-parallel-tasks=10", "--sandboxd-image=my-sandboxd:tag"})
 	if err != nil {
 		t.Fatalf("failed to parse flags: %v", err)
 	}
 
-	rawFlags := FlagsFromFlagSet(fs, *bucket, *dir, *secret, *discovery, *execution, *grace, *parallel)
+	rawFlags := FlagsFromFlagSet(fs, *bucket, *dir, *secret, *sandboxd, *discovery, *execution, *grace, *parallel)
 	if !rawFlags.IsExplicit("artifact-bucket") {
 		t.Errorf("expected artifact-bucket to be explicit")
 	}
 	if !rawFlags.IsExplicit("max-parallel-tasks") {
 		t.Errorf("expected max-parallel-tasks to be explicit")
 	}
+	if !rawFlags.IsExplicit("sandboxd-image") {
+		t.Errorf("expected sandboxd-image to be explicit")
+	}
 	if rawFlags.IsExplicit("discovery-deadline") {
 		t.Errorf("expected discovery-deadline NOT to be explicit")
 	}
 	if rawFlags.IsExplicit("model-secret") {
 		t.Errorf("expected model-secret NOT to be explicit")
+	}
+}
+
+func TestResolveConfig_SandboxdImage(t *testing.T) {
+	// Default
+	defCfg := DefaultClusterConfig()
+	if defCfg.SandboxdImage != discovery.SandboxdImage {
+		t.Errorf("expected default SandboxdImage %q, got %q", discovery.SandboxdImage, defCfg.SandboxdImage)
+	}
+
+	// ConfigMap override
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultConfigMapName,
+			Namespace: "eval-runner",
+		},
+		Data: map[string]string{
+			ConfigMapKeySandboxdImage: "gcr.io/test/sandboxd:cm-tag",
+		},
+	}
+	flags := RawFlags{
+		Explicit: map[string]bool{},
+	}
+	cfg, err := ResolveConfig(cm, flags)
+	if err != nil {
+		t.Fatalf("ResolveConfig failed: %v", err)
+	}
+	if cfg.SandboxdImage != "gcr.io/test/sandboxd:cm-tag" {
+		t.Errorf("expected SandboxdImage gcr.io/test/sandboxd:cm-tag, got %q", cfg.SandboxdImage)
+	}
+
+	// Flag override takes precedence
+	flags.SandboxdImage = "gcr.io/test/sandboxd:flag-tag"
+	flags.Explicit["sandboxd-image"] = true
+
+	cfgOverride, err := ResolveConfig(cm, flags)
+	if err != nil {
+		t.Fatalf("ResolveConfig failed: %v", err)
+	}
+	if cfgOverride.SandboxdImage != "gcr.io/test/sandboxd:flag-tag" {
+		t.Errorf("expected SandboxdImage gcr.io/test/sandboxd:flag-tag, got %q", cfgOverride.SandboxdImage)
 	}
 }
 

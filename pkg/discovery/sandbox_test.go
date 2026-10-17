@@ -168,11 +168,11 @@ func TestBuildSandbox(t *testing.T) {
 		t.Errorf("Expected container command to run sandboxd, got: %v", c.Command)
 	}
 
-	// Ports: 8080 (REST) and 9090 (gRPC)
-	if len(c.Ports) != 2 {
-		t.Fatalf("Expected 2 container ports, got %d", len(c.Ports))
+	// Ports: 8080 (REST), 9090 (gRPC), and 8081 (health)
+	if len(c.Ports) != 3 {
+		t.Fatalf("Expected 3 container ports, got %d", len(c.Ports))
 	}
-	var has8080, has9090 bool
+	var has8080, has9090, has8081 bool
 	for _, p := range c.Ports {
 		if p.ContainerPort == 8080 {
 			has8080 = true
@@ -180,17 +180,20 @@ func TestBuildSandbox(t *testing.T) {
 		if p.ContainerPort == 9090 {
 			has9090 = true
 		}
+		if p.ContainerPort == 8081 {
+			has8081 = true
+		}
 	}
-	if !has8080 || !has9090 {
-		t.Errorf("Expected ports 8080 and 9090, got: %v", c.Ports)
+	if !has8080 || !has9090 || !has8081 {
+		t.Errorf("Expected ports 8080, 9090, and 8081, got: %v", c.Ports)
 	}
 
 	// Readiness probe
 	if c.ReadinessProbe == nil || c.ReadinessProbe.HTTPGet == nil {
 		t.Fatalf("Expected HTTPGet readiness probe")
 	}
-	if c.ReadinessProbe.HTTPGet.Path != "/v1/health" || c.ReadinessProbe.HTTPGet.Port.IntValue() != 8080 {
-		t.Errorf("Expected readiness probe GET /v1/health on 8080, got: %+v", c.ReadinessProbe.HTTPGet)
+	if c.ReadinessProbe.HTTPGet.Path != "/v1/health" || c.ReadinessProbe.HTTPGet.Port.IntValue() != 8081 {
+		t.Errorf("Expected readiness probe GET /v1/health on 8081, got: %+v", c.ReadinessProbe.HTTPGet)
 	}
 
 	// Resources checks
@@ -202,8 +205,8 @@ func TestBuildSandbox(t *testing.T) {
 	}
 
 	// Volumes
-	if len(podSpec.Volumes) != 2 {
-		t.Fatalf("Expected 2 volumes, got %d", len(podSpec.Volumes))
+	if len(podSpec.Volumes) != 4 {
+		t.Fatalf("Expected 4 volumes, got %d", len(podSpec.Volumes))
 	}
 
 	// Negative assertion: discovery sandbox container has no EnvFrom
@@ -429,12 +432,18 @@ func TestBuildTaskSandbox_NoGCSCredentialsOrVolumes(t *testing.T) {
 	}
 
 	// 3. Verify no GCS or cloud credential volumes exist
+	allowedVolumes := map[string]bool{
+		"sandboxd-bin": true,
+		"workspace":    true,
+		"sandbox-tls":  true,
+		"sandbox-ca":   true,
+	}
 	for _, v := range podSpec.Volumes {
-		if v.Name != "sandboxd-bin" && v.Name != "workspace" {
-			t.Errorf("Unexpected volume %q in sandbox pod spec; only sandboxd-bin and workspace should exist", v.Name)
+		if !allowedVolumes[v.Name] {
+			t.Errorf("Unexpected volume %q in sandbox pod spec; only sandboxd-bin, workspace, sandbox-tls, and sandbox-ca should exist", v.Name)
 		}
-		if v.Secret != nil || v.ConfigMap != nil || v.Projected != nil {
-			t.Errorf("Volume %q projects credentials into untrusted sandbox", v.Name)
+		if v.Projected != nil {
+			t.Errorf("Volume %q projects projected credentials into untrusted sandbox", v.Name)
 		}
 	}
 
@@ -448,7 +457,7 @@ func TestBuildTaskSandbox_NoGCSCredentialsOrVolumes(t *testing.T) {
 			}
 		}
 		for _, vm := range c.VolumeMounts {
-			if vm.Name != "sandboxd-bin" && vm.Name != "workspace" {
+			if !allowedVolumes[vm.Name] {
 				t.Errorf("Sandbox container %q has unexpected volume mount %q", c.Name, vm.Name)
 			}
 		}

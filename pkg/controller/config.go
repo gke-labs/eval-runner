@@ -48,6 +48,8 @@ const (
 	ConfigMapKeyMaxParallelTasks = "maxParallelTasks"
 	// ConfigMapKeyModelSecret is the ConfigMap key for default model credentials Secret name.
 	ConfigMapKeyModelSecret = "modelSecret"
+	// ConfigMapKeySandboxdImage is the ConfigMap key for sandboxd init container image.
+	ConfigMapKeySandboxdImage = "sandboxdImage"
 	// ConfigMapKeyTaskGracePeriod is the ConfigMap key for task sandbox cache grace period.
 	ConfigMapKeyTaskGracePeriod = "taskGracePeriod"
 )
@@ -61,6 +63,7 @@ type ClusterConfig struct {
 	ExecutionDeadline time.Duration
 	MaxParallelTasks  int
 	ModelSecret       string
+	SandboxdImage     string
 	TaskGracePeriod   time.Duration
 }
 
@@ -72,6 +75,7 @@ type RawFlags struct {
 	ExecutionDeadline time.Duration
 	MaxParallelTasks  int
 	ModelSecret       string
+	SandboxdImage     string
 	TaskGracePeriod   time.Duration
 	Explicit          map[string]bool
 }
@@ -93,6 +97,7 @@ func DefaultClusterConfig() ClusterConfig {
 		ExecutionDeadline: DefaultExecutionDeadline,
 		MaxParallelTasks:  DefaultMaxParallelTasks,
 		ModelSecret:       DefaultModelSecret,
+		SandboxdImage:     discovery.SandboxdImage,
 		TaskGracePeriod:   DefaultTaskGracePeriod,
 	}
 }
@@ -100,7 +105,7 @@ func DefaultClusterConfig() ClusterConfig {
 // FlagsFromFlagSet extracts RawFlags from a parsed flag.FlagSet.
 func FlagsFromFlagSet(
 	fs *flag.FlagSet,
-	artifactBucket, artifactDir, modelSecret string,
+	artifactBucket, artifactDir, modelSecret, sandboxdImage string,
 	discoveryDeadline, executionDeadline, taskGracePeriod time.Duration,
 	maxParallelTasks int,
 ) RawFlags {
@@ -115,6 +120,7 @@ func FlagsFromFlagSet(
 		ExecutionDeadline: executionDeadline,
 		MaxParallelTasks:  maxParallelTasks,
 		ModelSecret:       modelSecret,
+		SandboxdImage:     sandboxdImage,
 		TaskGracePeriod:   taskGracePeriod,
 		Explicit:          explicit,
 	}
@@ -225,6 +231,14 @@ func ResolveConfig(cm *corev1.ConfigMap, flags RawFlags) (ClusterConfig, error) 
 				cfg.TaskGracePeriod = d
 			}
 		}
+
+		// 7. sandboxdImage
+		if val, ok := cm.Data[ConfigMapKeySandboxdImage]; ok {
+			trimmed := strings.TrimSpace(val)
+			if trimmed != "" {
+				cfg.SandboxdImage = trimmed
+			}
+		}
 	}
 
 	// Apply explicit flag overrides
@@ -245,6 +259,9 @@ func ResolveConfig(cm *corev1.ConfigMap, flags RawFlags) (ClusterConfig, error) 
 	}
 	if flags.IsExplicit("model-secret") {
 		cfg.ModelSecret = flags.ModelSecret
+	}
+	if flags.IsExplicit("sandboxd-image") {
+		cfg.SandboxdImage = flags.SandboxdImage
 	}
 	if flags.IsExplicit("task-grace-period") {
 		cfg.TaskGracePeriod = flags.TaskGracePeriod
@@ -308,6 +325,7 @@ func LoadAndResolveClusterConfig(
 		"executionDeadline", resolved.ExecutionDeadline,
 		"maxParallelTasks", resolved.MaxParallelTasks,
 		"modelSecret", resolved.ModelSecret,
+		"sandboxdImage", resolved.SandboxdImage,
 		"taskGracePeriod", resolved.TaskGracePeriod,
 	)
 

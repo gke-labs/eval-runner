@@ -26,6 +26,7 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/artifacts/gcs"
 	"github.com/gke-labs/eval-runner/pkg/controller"
 	"github.com/gke-labs/eval-runner/pkg/discovery"
+	"github.com/gke-labs/eval-runner/pkg/pki"
 	"github.com/gke-labs/eval-runner/pkg/sandboxclient"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,6 +81,7 @@ func main() {
 	var maxParallelTasks int
 	var modelSecret string
 	var sampleRunnerImage string
+	var sandboxdImage string
 	var artifactBucket string
 	var artifactDir string
 
@@ -95,6 +97,7 @@ func main() {
 	flag.IntVar(&maxParallelTasks, "max-parallel-tasks", controller.DefaultMaxParallelTasks, "Maximum number of task sandboxes to run concurrently")
 	flag.StringVar(&modelSecret, "model-secret", controller.DefaultModelSecret, "Name of Secret in sandbox namespace containing model credentials")
 	flag.StringVar(&sampleRunnerImage, "sample-runner-image", "", "Container image used for sample execution sandboxes (derived from controller pod image if unset)")
+	flag.StringVar(&sandboxdImage, "sandboxd-image", "", "Container image used for sandboxd init container (defaults to pinned SandboxdImage if unset)")
 	flag.StringVar(&artifactBucket, "artifact-bucket", "", "GCS bucket URI or name for storing evaluation artifacts (e.g. gs://my-bucket)")
 	flag.StringVar(&artifactDir, "artifact-dir", "", "Local filesystem directory for storing evaluation artifacts")
 
@@ -111,6 +114,7 @@ func main() {
 		artifactBucket,
 		artifactDir,
 		modelSecret,
+		sandboxdImage,
 		discoveryDeadline,
 		executionDeadline,
 		taskGracePeriod,
@@ -252,6 +256,14 @@ func main() {
 		sandboxclient.WithStderrLimit(maxStderrBytes),
 	)
 
+	pkiManager := pki.NewManager(mgr.GetClient(), evalRunnerNamespace, sandboxNamespace)
+	pkiCtx, pkiCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer pkiCancel()
+	if _, err := pkiManager.EnsureCA(pkiCtx); err != nil {
+		setupLog.Error(err, "unable to bootstrap sandbox CA")
+		os.Exit(1)
+	}
+
 	var sink artifacts.ArtifactSink = &artifacts.NoopSink{}
 	if clusterConfig.ArtifactBucket != "" {
 		gcsSink, err := gcs.New(context.Background(), clusterConfig.ArtifactBucket)
@@ -269,7 +281,10 @@ func main() {
 		APIReader:            mgr.GetAPIReader(),
 		Scheme:               mgr.GetScheme(),
 		ClientFactory:        clientFactory,
+		ControllerNamespace:  evalRunnerNamespace,
 		SandboxNamespace:     sandboxNamespace,
+		PKIManager:           pkiManager,
+		SandboxdImage:        clusterConfig.SandboxdImage,
 		DiscoveryDeadline:    clusterConfig.DiscoveryDeadline,
 		ExecutionDeadline:    clusterConfig.ExecutionDeadline,
 		TaskGracePeriod:      clusterConfig.TaskGracePeriod,

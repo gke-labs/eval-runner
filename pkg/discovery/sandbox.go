@@ -20,10 +20,12 @@ import (
 	"strings"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
+	"github.com/gke-labs/eval-runner/pkg/pki"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
@@ -35,7 +37,7 @@ const (
 	DefaultControllerNamespace = "eval-runner"
 
 	// SandboxdImage is the pinned image containing the sandboxd binary.
-	SandboxdImage = "us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:v20261015-v1.0.7@sha256:1cce7c94565de950903595864098bd32bd87dbd10865cab3f94fd0c58668cd42"
+	SandboxdImage = "gcr.io/justinsb-knotai-dev/sandboxd:0d9e0d2@sha256:01efbe0c568ec76e73e0c1c9337a77f61f8b45e2b06efb39ec256c568d782609"
 
 	// DiscoveryImage is the pinned image used for discovery sandboxes.
 	DiscoveryImage = "alpine/git:v2.47.2"
@@ -165,6 +167,9 @@ type TaskSandboxConfig struct {
 	SampleRunnerImage string
 	ModelSecret       string
 	AuthTokenDigest   string
+	ServerCertSecret  string
+	CAConfigMap       string
+	SandboxdImage     string
 }
 
 // BuildTaskSandbox constructs the Sandbox CR for executing an eval task for a Run.
@@ -179,6 +184,19 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 	image := cfg.SampleRunnerImage
 	if image == "" {
 		image = DefaultSampleRunnerImage
+	}
+	sbName := TaskSandboxNameForRun(run.Name, taskID)
+	serverCertSecret := cfg.ServerCertSecret
+	if serverCertSecret == "" {
+		serverCertSecret = pki.ServerSecretName(sbName)
+	}
+	caConfigMap := cfg.CAConfigMap
+	if caConfigMap == "" {
+		caConfigMap = pki.DefaultCAConfigMapName
+	}
+	sandboxdImg := cfg.SandboxdImage
+	if sandboxdImg == "" {
+		sandboxdImg = SandboxdImage
 	}
 
 	automountToken := false
@@ -220,7 +238,12 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 		"--root-dir=/workspace",
 		"--rest-port=8080",
 		"--grpc-port=9090",
+		"--health-port=8081",
 		"--auth-token-sha256=" + cfg.AuthTokenDigest,
+		"--tls-cert-file=/sandbox-tls/tls.crt",
+		"--tls-key-file=/sandbox-tls/tls.key",
+		"--tls-client-ca-file=/sandbox-ca/ca.crt",
+		"--require-client-cert",
 	}
 
 	return &sandboxv1beta1.Sandbox{
@@ -229,7 +252,7 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 			Kind:       "Sandbox",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        TaskSandboxNameForRun(run.Name, taskID),
+			Name:        sbName,
 			Namespace:   sandboxNamespace,
 			Labels:      labels,
 			Annotations: annotations,
@@ -254,7 +277,7 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 						InitContainers: []corev1.Container{
 							{
 								Name:  SandboxdInitContainerName,
-								Image: SandboxdImage,
+								Image: sandboxdImg,
 								Command: []string{
 									"/bin/sh",
 									"-c",
@@ -305,12 +328,17 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 										ContainerPort: 9090,
 										Protocol:      corev1.ProtocolTCP,
 									},
+									{
+										Name:          "health",
+										ContainerPort: 8081,
+										Protocol:      corev1.ProtocolTCP,
+									},
 								},
 								ReadinessProbe: &corev1.Probe{
 									ProbeHandler: corev1.ProbeHandler{
 										HTTPGet: &corev1.HTTPGetAction{
 											Path: "/v1/health",
-											Port: intstr.FromInt(8080),
+											Port: intstr.FromInt(8081),
 										},
 									},
 									InitialDelaySeconds: 1,
@@ -349,6 +377,16 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 										Name:      "workspace",
 										MountPath: "/workspace",
 									},
+									{
+										Name:      "sandbox-tls",
+										MountPath: "/sandbox-tls",
+										ReadOnly:  true,
+									},
+									{
+										Name:      "sandbox-ca",
+										MountPath: "/sandbox-ca",
+										ReadOnly:  true,
+									},
 								},
 							},
 						},
@@ -363,6 +401,26 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 								Name: "workspace",
 								VolumeSource: corev1.VolumeSource{
 									EmptyDir: &corev1.EmptyDirVolumeSource{},
+								},
+							},
+							{
+								Name: "sandbox-tls",
+								VolumeSource: corev1.VolumeSource{
+									Secret: &corev1.SecretVolumeSource{
+										SecretName:  serverCertSecret,
+										DefaultMode: ptr.To(int32(0400)),
+									},
+								},
+							},
+							{
+								Name: "sandbox-ca",
+								VolumeSource: corev1.VolumeSource{
+									ConfigMap: &corev1.ConfigMapVolumeSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: caConfigMap,
+										},
+										DefaultMode: ptr.To(int32(0444)),
+									},
 								},
 							},
 						},
@@ -388,6 +446,13 @@ func SandboxNameForRun(runName string) string {
 	return fullName[:maxPrefixLen] + hashSuffix
 }
 
+// SandboxOptions configures optional settings for BuildSandbox.
+type SandboxOptions struct {
+	ServerCertSecret string
+	CAConfigMap      string
+	SandboxdImage    string
+}
+
 // BuildSandbox constructs the Sandbox CR for discovering tasks for a Run.
 // The pod spec implements deployment topology B (injecting sandboxd binary into rootfs)
 // and concept §3.2 "empty resources = zero privilege":
@@ -398,13 +463,32 @@ func SandboxNameForRun(runName string) string {
 // - pinned images
 // - resource requests and limits
 // - sandboxd gRPC (9090) and REST (8080) ports exposed
-// - readiness probe targeting sandboxd /v1/health
-func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest string) *sandboxv1beta1.Sandbox {
+// - readiness probe targeting sandboxd /v1/health on plaintext port 8081
+// - mutual TLS (mTLS) with controller CA and per-sandbox server cert Secret
+func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest string, opts ...SandboxOptions) *sandboxv1beta1.Sandbox {
 	if authTokenDigest == "" {
 		panic("authTokenDigest is required")
 	}
 	if sandboxNamespace == "" {
 		sandboxNamespace = DefaultSandboxNamespace
+	}
+
+	var opt SandboxOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	sbName := SandboxNameForRun(run.Name)
+	serverCertSecret := opt.ServerCertSecret
+	if serverCertSecret == "" {
+		serverCertSecret = pki.ServerSecretName(sbName)
+	}
+	caConfigMap := opt.CAConfigMap
+	if caConfigMap == "" {
+		caConfigMap = pki.DefaultCAConfigMapName
+	}
+	sandboxdImg := opt.SandboxdImage
+	if sandboxdImg == "" {
+		sandboxdImg = SandboxdImage
 	}
 
 	automountToken := false
@@ -431,7 +515,12 @@ func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest st
 		"--root-dir=/workspace",
 		"--rest-port=8080",
 		"--grpc-port=9090",
+		"--health-port=8081",
 		"--auth-token-sha256=" + authTokenDigest,
+		"--tls-cert-file=/sandbox-tls/tls.crt",
+		"--tls-key-file=/sandbox-tls/tls.key",
+		"--tls-client-ca-file=/sandbox-ca/ca.crt",
+		"--require-client-cert",
 	}
 
 	return &sandboxv1beta1.Sandbox{
@@ -463,7 +552,7 @@ func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest st
 						InitContainers: []corev1.Container{
 							{
 								Name:  SandboxdInitContainerName,
-								Image: SandboxdImage,
+								Image: sandboxdImg,
 								Command: []string{
 									"/bin/sh",
 									"-c",
@@ -513,12 +602,17 @@ func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest st
 										ContainerPort: 9090,
 										Protocol:      corev1.ProtocolTCP,
 									},
+									{
+										Name:          "health",
+										ContainerPort: 8081,
+										Protocol:      corev1.ProtocolTCP,
+									},
 								},
 								ReadinessProbe: &corev1.Probe{
 									ProbeHandler: corev1.ProbeHandler{
 										HTTPGet: &corev1.HTTPGetAction{
 											Path: "/v1/health",
-											Port: intstr.FromInt(8080),
+											Port: intstr.FromInt(8081),
 										},
 									},
 									InitialDelaySeconds: 1,
@@ -557,6 +651,16 @@ func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest st
 										Name:      "workspace",
 										MountPath: "/workspace",
 									},
+									{
+										Name:      "sandbox-tls",
+										MountPath: "/sandbox-tls",
+										ReadOnly:  true,
+									},
+									{
+										Name:      "sandbox-ca",
+										MountPath: "/sandbox-ca",
+										ReadOnly:  true,
+									},
 								},
 							},
 						},
@@ -571,6 +675,26 @@ func BuildSandbox(run *v1alpha1.Run, sandboxNamespace string, authTokenDigest st
 								Name: "workspace",
 								VolumeSource: corev1.VolumeSource{
 									EmptyDir: &corev1.EmptyDirVolumeSource{},
+								},
+							},
+							{
+								Name: "sandbox-tls",
+								VolumeSource: corev1.VolumeSource{
+									Secret: &corev1.SecretVolumeSource{
+										SecretName:  serverCertSecret,
+										DefaultMode: ptr.To(int32(0400)),
+									},
+								},
+							},
+							{
+								Name: "sandbox-ca",
+								VolumeSource: corev1.VolumeSource{
+									ConfigMap: &corev1.ConfigMapVolumeSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: caConfigMap,
+										},
+										DefaultMode: ptr.To(int32(0444)),
+									},
 								},
 							},
 						},

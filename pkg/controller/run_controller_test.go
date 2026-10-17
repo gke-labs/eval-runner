@@ -28,6 +28,7 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/artifacts"
 	"github.com/gke-labs/eval-runner/pkg/artifacts/gcs"
 	"github.com/gke-labs/eval-runner/pkg/discovery"
+	"github.com/gke-labs/eval-runner/pkg/pki"
 	"github.com/gke-labs/eval-runner/pkg/sandboxclient"
 	"github.com/gke-labs/eval-runner/pkg/stats"
 	"google.golang.org/grpc/codes"
@@ -5042,5 +5043,156 @@ func TestPrinterColumnFormatting(t *testing.T) {
 	}
 	if !strings.HasSuffix(capped, "...") {
 		t.Errorf("Expected capped string to end with '...', got %s", capped)
+	}
+}
+
+func TestReconcile_MTLSLifecycleAndSANVerification(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = sandboxv1beta1.AddToScheme(scheme)
+
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-run-mtls",
+			Namespace: "eval-runner",
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "git://git-server/repo.git",
+				Commit: "abcdef123456",
+			},
+		},
+	}
+
+	fakeClient := sandboxclient.NewFakeClient()
+	fakeClient.ListStdout = `{"tasks": [{"id": "task1", "spec": "eval.py@task1"}]}`
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(run).
+		WithStatusSubresource(run).
+		Build()
+
+	pkiMgr := pki.NewManager(cl, "eval-runner", "eval-runner-sandbox")
+	reconciler := &RunReconciler{
+		Client:           cl,
+		Scheme:           scheme,
+		ClientFactory:    fakeClient,
+		PKIManager:       pkiMgr,
+		SandboxNamespace: "eval-runner-sandbox",
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-mtls"}}
+
+	// Turn 1: Create discovery sandbox
+	res, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Turn 1 error: %v", err)
+	}
+	if !res.Requeue && res.RequeueAfter == 0 {
+		t.Errorf("Expected requeue from turn 1")
+	}
+
+	// Verify discovery sandbox has mTLS volumes and arguments
+	var sb sandboxv1beta1.Sandbox
+	sbName := discovery.SandboxNameForRun("test-run-mtls")
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner-sandbox", Name: sbName}, &sb); err != nil {
+		t.Fatalf("Failed to get discovery sandbox: %v", err)
+	}
+	podSpec := sb.Spec.PodTemplate.Spec
+	var hasTLSVol, hasCAVol bool
+	for _, v := range podSpec.Volumes {
+		if v.Name == "sandbox-tls" {
+			hasTLSVol = true
+		}
+		if v.Name == "sandbox-ca" {
+			hasCAVol = true
+		}
+	}
+	if !hasTLSVol || !hasCAVol {
+		t.Errorf("Expected sandbox-tls and sandbox-ca volumes on sandbox, got: %+v", podSpec.Volumes)
+	}
+
+	// Verify server cert Secret created in eval-runner-sandbox
+	secretName := pki.ServerSecretName(sbName)
+	var serverSecret corev1.Secret
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner-sandbox", Name: secretName}, &serverSecret); err != nil {
+		t.Fatalf("Server cert secret %q not found in eval-runner-sandbox: %v", secretName, err)
+	}
+	if len(serverSecret.Data[pki.TLSCertKey]) == 0 || len(serverSecret.Data[pki.TLSKeyKey]) == 0 {
+		t.Errorf("Server cert secret missing tls.crt or tls.key")
+	}
+
+	// Verify CA ConfigMap published in eval-runner-sandbox
+	var caCM corev1.ConfigMap
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner-sandbox", Name: pki.DefaultCAConfigMapName}, &caCM); err != nil {
+		t.Fatalf("CA configmap not found in eval-runner-sandbox: %v", err)
+	}
+	if len(caCM.Data[pki.CACertKey]) == 0 {
+		t.Errorf("CA configmap missing ca.crt")
+	}
+
+	// Simulate Pod Ready
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sbName,
+			Namespace: "eval-runner-sandbox",
+			Labels: map[string]string{
+				discovery.LabelRunName:      "test-run-mtls",
+				discovery.LabelRunNamespace: "eval-runner",
+				discovery.LabelRole:         "discovery",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.244.0.77",
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	if err := cl.Create(t.Context(), pod); err != nil {
+		t.Fatalf("Failed to create mock pod: %v", err)
+	}
+
+	// Turn 2: Run discovery over mTLS
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Turn 2 error: %v", err)
+	}
+
+	// Verify FakeClient received TLSConfig pinning expected SAN
+	if fakeClient.LastTLSConfig == nil {
+		t.Fatalf("Expected ClientFactory to receive non-nil TLSConfig")
+	}
+	expectedSAN := pki.ServerSAN(sbName, "eval-runner-sandbox")
+	if fakeClient.LastTLSConfig.ServerName != expectedSAN {
+		t.Errorf("Expected TLSConfig.ServerName %q, got %q", expectedSAN, fakeClient.LastTLSConfig.ServerName)
+	}
+	if len(fakeClient.LastTLSConfig.Certificates) != 1 {
+		t.Errorf("Expected 1 client certificate in TLSConfig, got %d", len(fakeClient.LastTLSConfig.Certificates))
+	}
+	if fakeClient.LastTLSConfig.RootCAs == nil {
+		t.Errorf("Expected RootCAs in TLSConfig to be populated")
+	}
+
+	// Verify server cert secret was cleaned up after discovery completed
+	var deletedSecret corev1.Secret
+	err = cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner-sandbox", Name: secretName}, &deletedSecret)
+	if err == nil {
+		t.Errorf("Expected server cert secret to be deleted upon sandbox cleanup, but it was found")
+	}
+
+	// Security assertion: no private key in Run status or conditions
+	var updatedRun v1alpha1.Run
+	_ = cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "test-run-mtls"}, &updatedRun)
+	for _, cond := range updatedRun.Status.Conditions {
+		if strings.Contains(cond.Message, "PRIVATE KEY") {
+			t.Errorf("Private key leaked into Condition message: %s", cond.Message)
+		}
 	}
 }
