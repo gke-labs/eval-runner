@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,9 +33,11 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/stats"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -64,20 +67,23 @@ type ComparisonTaskArtifact struct {
 	Dropped       v1alpha1.ComparisonDropped       `json:"dropped"`
 	Label         string                           `json:"label"`
 	PImprovement  float64                          `json:"pImprovement"`
+	SamplesRun    int                              `json:"samplesRun,omitempty"`
+	Decision      string                           `json:"decision,omitempty"`
 	PairsTable    []PairedSampleScore              `json:"pairsTable,omitempty"`
 }
 
 // ComparisonArtifact is the schema stored as comparisons/<name>.json in the artifact sink.
 type ComparisonArtifact struct {
-	Comparison   string                   `json:"comparison"`
-	Namespace    string                   `json:"namespace"`
-	Baseline     string                   `json:"baseline"`
-	Candidate    string                   `json:"candidate"`
-	Verdict      string                   `json:"verdict"`
-	PImprovement float64                  `json:"pImprovement"`
-	Summary      string                   `json:"summary,omitempty"`
-	Tasks        []ComparisonTaskArtifact `json:"tasks"`
-	CreatedAt    time.Time                `json:"createdAt"`
+	Comparison   string                           `json:"comparison"`
+	Namespace    string                           `json:"namespace"`
+	Baseline     string                           `json:"baseline"`
+	Candidate    string                           `json:"candidate"`
+	Verdict      string                           `json:"verdict"`
+	PImprovement float64                          `json:"pImprovement"`
+	Summary      string                           `json:"summary,omitempty"`
+	Tasks        []ComparisonTaskArtifact         `json:"tasks"`
+	Batches      []v1alpha1.ComparisonBatchStatus `json:"batches,omitempty"`
+	CreatedAt    time.Time                        `json:"createdAt"`
 }
 
 // GitHubCredentials holds credentials extracted from a Secret for factory injection.
@@ -312,7 +318,27 @@ func (r *ComparisonReconciler) findComparisonsForRun(ctx context.Context, obj cl
 
 	var requests []reconcile.Request
 	for _, comp := range compList.Items {
+		matched := false
 		if comp.Spec.Baseline.Run == run.Name || comp.Spec.Candidate.Run == run.Name {
+			matched = true
+		}
+		if !matched {
+			for _, b := range comp.Status.Batches {
+				if b.CandidateRun == run.Name || b.BaselineRun == run.Name {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			for _, ref := range run.OwnerReferences {
+				if ref.Kind == "Comparison" && ref.Name == comp.Name {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: comp.Namespace,
@@ -322,6 +348,41 @@ func (r *ComparisonReconciler) findComparisonsForRun(ctx context.Context, obj cl
 		}
 	}
 	return requests
+}
+
+func toComparisonTaskLabel(label stats.TaskLabel) v1alpha1.ComparisonTaskLabel {
+	if label == stats.TaskLabelContinue {
+		return v1alpha1.ComparisonTaskLabelRunning
+	}
+	return v1alpha1.ComparisonTaskLabel(label)
+}
+
+func effectiveSampleRange(spec v1alpha1.RunSpec, maxObserved int) *v1alpha1.SampleRange {
+	if spec.SampleRange != nil {
+		return spec.SampleRange
+	}
+	if spec.Limit != nil && *spec.Limit > 0 {
+		return &v1alpha1.SampleRange{Start: 1, End: *spec.Limit}
+	}
+	if maxObserved > 0 {
+		return &v1alpha1.SampleRange{Start: 1, End: maxObserved}
+	}
+	return nil
+}
+
+func runIncludesTask(run *v1alpha1.Run, taskID string) bool {
+	if run == nil {
+		return false
+	}
+	if len(run.Spec.Tasks) > 0 {
+		for _, t := range run.Spec.Tasks {
+			if t == taskID {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func determineRunningTaskIDs(comp *v1alpha1.Comparison, baseRun, candRun *v1alpha1.Run) []string {
@@ -556,158 +617,310 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		return ctrl.Result{}, fmt.Errorf("failed to get candidate run: %w", errCand)
 	}
 
-	// If either Run is not terminal, the Comparison is RUNNING and re-evaluates on Run updates
-	isTerminalBase := isTerminalRunPhase(baselineRun.Status.Phase)
-	isTerminalCand := isTerminalRunPhase(candidateRun.Status.Phase)
+	seedHasWindow := candidateRun.Spec.SampleRange != nil || (candidateRun.Spec.Limit != nil && *candidateRun.Spec.Limit > 0) ||
+		baselineRun.Spec.SampleRange != nil || (baselineRun.Spec.Limit != nil && *baselineRun.Spec.Limit > 0)
 
-	if !isTerminalBase || !isTerminalCand {
+	// Build or restore batches list
+	var batches []v1alpha1.ComparisonBatchStatus
+	if len(comp.Status.Batches) > 0 {
+		batches = append([]v1alpha1.ComparisonBatchStatus(nil), comp.Status.Batches...)
+	} else {
+		batches = []v1alpha1.ComparisonBatchStatus{
+			{
+				Index:        1,
+				CandidateRun: comp.Spec.Candidate.Run,
+				BaselineRun:  comp.Spec.Baseline.Run,
+			},
+		}
+	}
+
+	// Check if any subsequent batch Runs already exist on the cluster (for idempotency and state recovery)
+	for k := len(batches) + 1; ; k++ {
+		candName := fmt.Sprintf("%s-b%d-cand", comp.Name, k)
+		baseName := fmt.Sprintf("%s-b%d-base", comp.Name, k)
+		var cRun, bRun v1alpha1.Run
+		if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: candName}, &cRun); err != nil {
+			break
+		}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: baseName}, &bRun); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed looking up batch run %q: %w", baseName, err)
+		}
+		batches = append(batches, v1alpha1.ComparisonBatchStatus{
+			Index:        k,
+			SampleRange:  cRun.Spec.SampleRange,
+			CandidateRun: candName,
+			BaselineRun:  baseName,
+		})
+	}
+
+	type batchRunPair struct {
+		candRun *v1alpha1.Run
+		baseRun *v1alpha1.Run
+	}
+	batchRuns := make([]batchRunPair, len(batches))
+	allBatchesTerminal := true
+
+	for i := range batches {
+		var bCand, bBase v1alpha1.Run
+		batchFailed := false
+		if i == 0 {
+			bCand = candidateRun
+			bBase = baselineRun
+		} else {
+			cErr := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: batches[i].CandidateRun}, &bCand)
+			if cErr != nil {
+				if apierrors.IsNotFound(cErr) {
+					// Missing batch Run is treated as Failed (terminal)
+					bCand = v1alpha1.Run{
+						ObjectMeta: metav1.ObjectMeta{Name: batches[i].CandidateRun, Namespace: comp.Namespace},
+						Status:     v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseFailed},
+					}
+					batchFailed = true
+				} else {
+					return ctrl.Result{}, fmt.Errorf("failed to get candidate batch run %q: %w", batches[i].CandidateRun, cErr)
+				}
+			}
+
+			bErr := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: batches[i].BaselineRun}, &bBase)
+			if bErr != nil {
+				if apierrors.IsNotFound(bErr) {
+					// Missing batch Run is treated as Failed (terminal)
+					bBase = v1alpha1.Run{
+						ObjectMeta: metav1.ObjectMeta{Name: batches[i].BaselineRun, Namespace: comp.Namespace},
+						Status:     v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseFailed},
+					}
+					batchFailed = true
+				} else {
+					return ctrl.Result{}, fmt.Errorf("failed to get baseline batch run %q: %w", batches[i].BaselineRun, bErr)
+				}
+			}
+		}
+
+		batchRuns[i] = batchRunPair{candRun: &bCand, baseRun: &bBase}
+
+		if batches[i].SampleRange == nil {
+			if sr := effectiveSampleRange(bCand.Spec, 0); sr != nil {
+				batches[i].SampleRange = sr
+			} else if sr := effectiveSampleRange(bBase.Spec, 0); sr != nil {
+				batches[i].SampleRange = sr
+			}
+		}
+
+		termC := isTerminalRunPhase(bCand.Status.Phase)
+		termB := isTerminalRunPhase(bBase.Status.Phase)
+		if batchFailed || (termC && termB) {
+			batches[i].Phase = v1alpha1.ComparisonPhaseCompleted
+		} else {
+			batches[i].Phase = v1alpha1.ComparisonPhaseRunning
+			allBatchesTerminal = false
+		}
+	}
+
+	// If any batch Run is not terminal, the Comparison is RUNNING and re-evaluates on Run updates
+	if !allBatchesTerminal {
 		taskIDs := determineRunningTaskIDs(&comp, &baselineRun, &candidateRun)
 		var tasks []v1alpha1.ComparisonTaskStatus
-		for _, id := range taskIDs {
-			tasks = append(tasks, v1alpha1.ComparisonTaskStatus{
-				ID:    id,
-				Label: v1alpha1.ComparisonTaskLabelRunning,
-			})
+		if len(comp.Status.Tasks) > 0 {
+			tasks = comp.Status.Tasks
+		} else {
+			for _, id := range taskIDs {
+				tasks = append(tasks, v1alpha1.ComparisonTaskStatus{
+					ID:       id,
+					Label:    v1alpha1.ComparisonTaskLabelRunning,
+					Decision: v1alpha1.ComparisonTaskLabelContinue,
+				})
+			}
 		}
 		msg := "Runs are still executing"
-		if !isTerminalBase && !isTerminalCand {
-			msg = fmt.Sprintf("Both baseline run %q (%s) and candidate run %q (%s) are executing",
-				baselineRun.Name, baselineRun.Status.Phase, candidateRun.Name, candidateRun.Status.Phase)
-		} else if !isTerminalBase {
-			msg = fmt.Sprintf("Baseline run %q (%s) is executing", baselineRun.Name, baselineRun.Status.Phase)
-		} else {
-			msg = fmt.Sprintf("Candidate run %q (%s) is executing", candidateRun.Name, candidateRun.Status.Phase)
-		}
-
 		return r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
 			status.Phase = v1alpha1.ComparisonPhaseRunning
 			status.Verdict = v1alpha1.ComparisonVerdictRunning
+			status.Batches = batches
 			status.Tasks = tasks
 			status.Summary = &v1alpha1.ComparisonSummary{
-				Tasks: fmt.Sprintf("0/%d", len(tasks)),
+				Tasks: fmt.Sprintf("0/%d", len(taskIDs)),
 			}
 			status.Message = msg
 		})
 	}
 
-	// Both Runs are terminal; perform pairing and comparison
+	// All current batch Runs are terminal; perform pairing and comparison
 	taskIDs, unexecuted, candFailed := determineCompletedTaskIDs(&comp, &baselineRun, &candidateRun)
 	skippedNotPlanned := determineSkippedTaskIDs(&comp, &baselineRun, &candidateRun)
+
+	if batches[0].SampleRange == nil {
+		maxObs := 0
+		for _, t := range candidateRun.Status.Tasks {
+			if t.Samples > maxObs {
+				maxObs = t.Samples
+			}
+		}
+		for _, t := range baselineRun.Status.Tasks {
+			if t.Samples > maxObs {
+				maxObs = t.Samples
+			}
+		}
+		if maxObs > 0 {
+			batches[0].SampleRange = &v1alpha1.SampleRange{Start: 1, End: maxObs}
+		}
+	}
+
 	margin := stats.DefaultEquivalenceMargin
 	if comp.Spec.EquivalenceMargin != nil {
 		margin = *comp.Spec.EquivalenceMargin
 	}
 
-	var taskStatuses []v1alpha1.ComparisonTaskStatus
-	var reports []stats.TaskReport
-	var taskArtifacts []ComparisonTaskArtifact
+	maxSamples := 64
+	if comp.Spec.Sampling != nil {
+		maxSamples = comp.Spec.Sampling.EffectiveMaxSamplesPerTask()
+	}
+
+	type taskEval struct {
+		taskID     string
+		candScores []stats.SampleScore
+		baseScores []stats.SampleScore
+		exhausted  bool
+		est        stats.PairedEstimate
+		dec        stats.Decision
+		samplesRun int
+	}
+
+	var taskEvals []taskEval
 
 	for _, taskID := range taskIDs {
-		candTask := findTaskStatus(candidateRun.Status.Tasks, taskID)
-		baseTask := findTaskStatus(baselineRun.Status.Tasks, taskID)
+		var allCandScores []stats.SampleScore
+		var allBaseScores []stats.SampleScore
+		taskExhausted := false
 
-		if candTask == nil || baseTask == nil ||
-			candTask.Phase != v1alpha1.TaskPhaseCompleted ||
-			baseTask.Phase != v1alpha1.TaskPhaseCompleted ||
-			candTask.LogPath == "" || baseTask.LogPath == "" {
-
-			taskStatuses = append(taskStatuses, v1alpha1.ComparisonTaskStatus{
-				ID:    taskID,
-				Label: v1alpha1.ComparisonTaskLabelInconclusive,
-				Pairs: 0,
-			})
-			reports = append(reports, stats.TaskReport{
-				ID:           taskID,
-				Label:        stats.TaskLabelInconclusive,
-				PImprovement: 0.5,
-			})
-			taskArtifacts = append(taskArtifacts, ComparisonTaskArtifact{
-				ID:    taskID,
-				Label: string(v1alpha1.ComparisonTaskLabelInconclusive),
-			})
-			continue
-		}
-
-		// Verify that log paths match the commit prefixes of the respective runs
-		candPrefix := r.artifactSink().ArtifactPrefix(candidateRun.Spec.Repo.Commit)
-		if candPrefix != "" && !strings.HasPrefix(candTask.LogPath, candPrefix) {
-			msg := fmt.Sprintf("candidate log path %q does not match commit prefix %q", candTask.LogPath, candPrefix)
-			logger.Error(nil, msg, "task", taskID)
-			err := fmt.Errorf("%s", msg)
-			if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
-				status.Message = msg
-			}); statusErr != nil {
-				return ctrl.Result{}, errors.Join(err, statusErr)
+		for batchIdx, pair := range batchRuns {
+			if pair.candRun == nil || pair.baseRun == nil {
+				continue
 			}
-			return ctrl.Result{}, err
-		}
 
-		basePrefix := r.artifactSink().ArtifactPrefix(baselineRun.Spec.Repo.Commit)
-		if basePrefix != "" && !strings.HasPrefix(baseTask.LogPath, basePrefix) {
-			msg := fmt.Sprintf("baseline log path %q does not match commit prefix %q", baseTask.LogPath, basePrefix)
-			logger.Error(nil, msg, "task", taskID)
-			err := fmt.Errorf("%s", msg)
-			if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
-				status.Message = msg
-			}); statusErr != nil {
-				return ctrl.Result{}, errors.Join(err, statusErr)
+			// Check if this batch intended to run taskID
+			taskInBatch := runIncludesTask(pair.candRun, taskID) || runIncludesTask(pair.baseRun, taskID)
+			if !taskInBatch {
+				// Task was not part of this batch (e.g. stopped in an earlier batch)
+				continue
 			}
-			return ctrl.Result{}, err
-		}
 
-		// Load Inspect log for candidate
-		candData, err := r.artifactSink().Load(ctx, candTask.LogPath)
-		if err != nil {
-			msg := fmt.Sprintf("failed to load candidate log for task %q (%s): %v", taskID, candTask.LogPath, err)
-			logger.Error(err, "failed to load candidate log", "task", taskID, "path", candTask.LogPath)
-			if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
-				status.Message = msg
-			}); statusErr != nil {
-				return ctrl.Result{}, errors.Join(err, statusErr)
+			// If the task was part of this batch, check if either Run failed or task status is missing
+			candTask := findTaskStatus(pair.candRun.Status.Tasks, taskID)
+			baseTask := findTaskStatus(pair.baseRun.Status.Tasks, taskID)
+
+			if pair.candRun.Status.Phase == v1alpha1.RunPhaseFailed ||
+				pair.baseRun.Status.Phase == v1alpha1.RunPhaseFailed ||
+				candTask == nil || baseTask == nil ||
+				candTask.Phase != v1alpha1.TaskPhaseCompleted ||
+				baseTask.Phase != v1alpha1.TaskPhaseCompleted ||
+				candTask.LogPath == "" || baseTask.LogPath == "" {
+				taskExhausted = true
+				continue
 			}
-			return ctrl.Result{}, err
-		}
 
-		// Load Inspect log for baseline
-		baseData, err := r.artifactSink().Load(ctx, baseTask.LogPath)
-		if err != nil {
-			msg := fmt.Sprintf("failed to load baseline log for task %q (%s): %v", taskID, baseTask.LogPath, err)
-			logger.Error(err, "failed to load baseline log", "task", taskID, "path", baseTask.LogPath)
-			if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
-				status.Message = msg
-			}); statusErr != nil {
-				return ctrl.Result{}, errors.Join(err, statusErr)
+			// Verify that log paths match the commit prefixes of the respective runs
+			candPrefix := r.artifactSink().ArtifactPrefix(pair.candRun.Spec.Repo.Commit)
+			if candPrefix != "" && !strings.HasPrefix(candTask.LogPath, candPrefix) {
+				msg := fmt.Sprintf("candidate log path %q does not match commit prefix %q", candTask.LogPath, candPrefix)
+				logger.Error(nil, msg, "task", taskID)
+				err := fmt.Errorf("%s", msg)
+				if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+					status.Message = msg
+				}); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, err
-		}
 
-		candScores, err := artifacts.ParseInspectSampleScores(candData)
-		if err != nil {
-			msg := fmt.Sprintf("failed to parse candidate sample scores for task %q: %v", taskID, err)
-			logger.Error(err, "failed to parse candidate sample scores", "task", taskID)
-			if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
-				status.Message = msg
-			}); statusErr != nil {
-				return ctrl.Result{}, errors.Join(err, statusErr)
+			basePrefix := r.artifactSink().ArtifactPrefix(pair.baseRun.Spec.Repo.Commit)
+			if basePrefix != "" && !strings.HasPrefix(baseTask.LogPath, basePrefix) {
+				msg := fmt.Sprintf("baseline log path %q does not match commit prefix %q", baseTask.LogPath, basePrefix)
+				logger.Error(nil, msg, "task", taskID)
+				err := fmt.Errorf("%s", msg)
+				if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+					status.Message = msg
+				}); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, err
-		}
-		baseScores, err := artifacts.ParseInspectSampleScores(baseData)
-		if err != nil {
-			msg := fmt.Sprintf("failed to parse baseline sample scores for task %q: %v", taskID, err)
-			logger.Error(err, "failed to parse baseline sample scores", "task", taskID)
-			if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
-				status.Message = msg
-			}); statusErr != nil {
-				return ctrl.Result{}, errors.Join(err, statusErr)
+
+			// Load Inspect log for candidate
+			candData, err := r.artifactSink().Load(ctx, candTask.LogPath)
+			if err != nil {
+				msg := fmt.Sprintf("failed to load candidate log for task %q (%s): %v", taskID, candTask.LogPath, err)
+				logger.Error(err, "failed to load candidate log", "task", taskID, "path", candTask.LogPath)
+				if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+					status.Message = msg
+				}); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, err
+
+			// Load Inspect log for baseline
+			baseData, err := r.artifactSink().Load(ctx, baseTask.LogPath)
+			if err != nil {
+				msg := fmt.Sprintf("failed to load baseline log for task %q (%s): %v", taskID, baseTask.LogPath, err)
+				logger.Error(err, "failed to load baseline log", "task", taskID, "path", baseTask.LogPath)
+				if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+					status.Message = msg
+				}); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
+			}
+
+			candScores, err := artifacts.ParseInspectSampleScores(candData)
+			if err != nil {
+				msg := fmt.Sprintf("failed to parse candidate sample scores for task %q: %v", taskID, err)
+				logger.Error(err, "failed to parse candidate sample scores", "task", taskID)
+				if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+					status.Message = msg
+				}); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
+			}
+			baseScores, err := artifacts.ParseInspectSampleScores(baseData)
+			if err != nil {
+				msg := fmt.Sprintf("failed to parse baseline sample scores for task %q: %v", taskID, err)
+				logger.Error(err, "failed to parse baseline sample scores", "task", taskID)
+				if _, statusErr := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+					status.Message = msg
+				}); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
+			}
+
+			// Check window length for dataset exhaustion:
+			// If seeds had no window, batch 1 is the whole dataset: treat as exhausted and do not batch past end.
+			if batchIdx == 0 && !seedHasWindow {
+				taskExhausted = true
+			} else {
+				batchRange := batches[batchIdx].SampleRange
+				if batchRange != nil {
+					winLen := batchRange.End - batchRange.Start + 1
+					if len(candScores) < winLen || len(baseScores) < winLen {
+						taskExhausted = true
+					}
+				} else {
+					taskExhausted = true
+				}
+			}
+
+			allCandScores = append(allCandScores, candScores...)
+			allBaseScores = append(allBaseScores, baseScores...)
 		}
 
-		est := stats.ComparePaired(candScores, baseScores, 0.95)
+		est := stats.ComparePaired(allCandScores, allBaseScores, 0.95)
+		samplesRun := est.NumPairs
+		if samplesRun == 0 && len(allCandScores) > 0 {
+			samplesRun = len(allCandScores)
+		}
 
-		// When est.NumPairs == 0, decide inconclusive explicitly (otherwise Decide returns continue).
-		// When NumPairs > 0, sampleCap = est.NumPairs so that unresolved tasks become inconclusive.
+		// Stopping rule evaluation:
 		var dec stats.Decision
 		if est.NumPairs == 0 {
 			dec = stats.Decision{
@@ -716,45 +929,249 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 				Reason: "no matching sample IDs between candidate and baseline",
 			}
 			est.PImprovement = 0.5
+		} else if comp.Spec.Sampling == nil {
+			// Single comparison (today's behavior): sampleCap = samplesRun
+			dec = stats.Decide(est, margin, samplesRun, samplesRun, 0, 0)
+		} else if taskExhausted {
+			dec = stats.Decide(est, margin, samplesRun, maxSamples, 0, 0)
+			if dec.Label == stats.TaskLabelContinue {
+				dec.Label = stats.TaskLabelInconclusive
+				dec.Stop = true
+				dec.Reason = "dataset exhausted"
+			}
 		} else {
-			dec = stats.Decide(est, margin, est.NumPairs, est.NumPairs, 0, 0)
+			dec = stats.Decide(est, margin, samplesRun, maxSamples, 0, 0)
+			if dec.Label == stats.TaskLabelContinue {
+				rem := maxSamples - samplesRun
+				if rem <= 0 {
+					dec.Label = stats.TaskLabelInconclusive
+					dec.Stop = true
+					dec.Reason = fmt.Sprintf("sample cap (%d) reached without resolving", maxSamples)
+				}
+			}
 		}
 
+		taskEvals = append(taskEvals, taskEval{
+			taskID:     taskID,
+			candScores: allCandScores,
+			baseScores: allBaseScores,
+			exhausted:  taskExhausted,
+			est:        est,
+			dec:        dec,
+			samplesRun: samplesRun,
+		})
+	}
+
+	// Check if any tasks need to continue sampling
+	var continueTasks []string
+	maxRemaining := 0
+	if comp.Spec.Sampling != nil {
+		for _, te := range taskEvals {
+			if te.dec.Label == stats.TaskLabelContinue && !te.exhausted {
+				rem := maxSamples - te.samplesRun
+				if rem > 0 {
+					continueTasks = append(continueTasks, te.taskID)
+					if rem > maxRemaining {
+						maxRemaining = rem
+					}
+				}
+			}
+		}
+	}
+
+	// Schedule next batch if any tasks continue
+	if len(continueTasks) > 0 {
+		batchSize := comp.Spec.Sampling.EffectiveBatchSize()
+		if batchSize > maxRemaining {
+			batchSize = maxRemaining
+		}
+
+		nextBatchIndex := len(batches) + 1
+		lastBatch := batches[len(batches)-1]
+		nextStart := 1
+		if lastBatch.SampleRange != nil {
+			nextStart = lastBatch.SampleRange.End + 1
+		}
+		nextEnd := nextStart + batchSize - 1
+
+		if batchSize <= 0 || nextStart > nextEnd {
+			// No window can be issued; stop continuing tasks as inconclusive
+			for i := range taskEvals {
+				if taskEvals[i].dec.Label == stats.TaskLabelContinue {
+					taskEvals[i].dec.Label = stats.TaskLabelInconclusive
+					taskEvals[i].dec.Stop = true
+					taskEvals[i].dec.Reason = fmt.Sprintf("sample cap (%d) reached without resolving", maxSamples)
+				}
+			}
+			continueTasks = nil
+		} else {
+			candCloneName := fmt.Sprintf("%s-b%d-cand", comp.Name, nextBatchIndex)
+			baseRunName := fmt.Sprintf("%s-b%d-base", comp.Name, nextBatchIndex)
+
+			batchRange := v1alpha1.SampleRange{Start: nextStart, End: nextEnd}
+
+			// Idempotent creation: look up by name first
+			var existingBase v1alpha1.Run
+			if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: baseRunName}, &existingBase); apierrors.IsNotFound(err) {
+				baseSpec := baselineRun.Spec.DeepCopy()
+				baseSpec.Tasks = continueTasks
+				baseSpec.SampleRange = &v1alpha1.SampleRange{Start: nextStart, End: nextEnd}
+				baseSpec.Limit = nil
+
+				baseClone := &v1alpha1.Run{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      baseRunName,
+						Namespace: comp.Namespace,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         v1alpha1.GroupVersion.String(),
+								Kind:               "Comparison",
+								Name:               comp.Name,
+								UID:                comp.UID,
+								Controller:         ptr.To(true),
+								BlockOwnerDeletion: ptr.To(true),
+							},
+						},
+						Labels: map[string]string{
+							"evalrunner.gke-labs.dev/comparison": comp.Name,
+							"evalrunner.gke-labs.dev/batch":      strconv.Itoa(nextBatchIndex),
+							"evalrunner.gke-labs.dev/role":       "baseline",
+						},
+					},
+					Spec: *baseSpec,
+				}
+				if err := r.Create(ctx, baseClone); err != nil && !apierrors.IsAlreadyExists(err) {
+					return ctrl.Result{}, fmt.Errorf("failed to create baseline batch run: %w", err)
+				}
+			} else if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed looking up baseline run %q: %w", baseRunName, err)
+			}
+
+			var existingCand v1alpha1.Run
+			if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: candCloneName}, &existingCand); apierrors.IsNotFound(err) {
+				candSpec := candidateRun.Spec.DeepCopy()
+				candSpec.Tasks = continueTasks
+				candSpec.SampleRange = &v1alpha1.SampleRange{Start: nextStart, End: nextEnd}
+				candSpec.Limit = nil
+
+				candClone := &v1alpha1.Run{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      candCloneName,
+						Namespace: comp.Namespace,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         v1alpha1.GroupVersion.String(),
+								Kind:               "Comparison",
+								Name:               comp.Name,
+								UID:                comp.UID,
+								Controller:         ptr.To(true),
+								BlockOwnerDeletion: ptr.To(true),
+							},
+						},
+						Labels: map[string]string{
+							"evalrunner.gke-labs.dev/comparison": comp.Name,
+							"evalrunner.gke-labs.dev/batch":      strconv.Itoa(nextBatchIndex),
+							"evalrunner.gke-labs.dev/role":       "candidate",
+						},
+					},
+					Spec: *candSpec,
+				}
+				if err := r.Create(ctx, candClone); err != nil && !apierrors.IsAlreadyExists(err) {
+					return ctrl.Result{}, fmt.Errorf("failed to create candidate batch run: %w", err)
+				}
+			} else if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed looking up candidate run %q: %w", candCloneName, err)
+			}
+
+			batches = append(batches, v1alpha1.ComparisonBatchStatus{
+				Index:        nextBatchIndex,
+				SampleRange:  &batchRange,
+				CandidateRun: candCloneName,
+				BaselineRun:  baseRunName,
+				Phase:        v1alpha1.ComparisonPhaseRunning,
+			})
+
+			var partialStatuses []v1alpha1.ComparisonTaskStatus
+			for _, te := range taskEvals {
+				partialStatuses = append(partialStatuses, v1alpha1.ComparisonTaskStatus{
+					ID:            te.taskID,
+					BaseRate:      &te.est.BaseMean,
+					CandidateRate: &te.est.CandidateMean,
+					Delta:         &te.est.MeanDelta,
+					DeltaCI: &v1alpha1.DeltaConfidenceInterval{
+						Lower: te.est.CI.Lower,
+						Upper: te.est.CI.Upper,
+					},
+					Pairs:  te.est.NumPairs,
+					Wins:   te.est.Wins,
+					Losses: te.est.Losses,
+					Ties:   te.est.Ties,
+					Dropped: v1alpha1.ComparisonDropped{
+						Candidate: te.est.DroppedCandidate,
+						Baseline:  te.est.DroppedBaseline,
+					},
+					Label:      toComparisonTaskLabel(te.dec.Label),
+					SamplesRun: te.samplesRun,
+					Decision:   v1alpha1.ComparisonTaskLabel(te.dec.Label),
+				})
+			}
+
+			return r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+				status.Phase = v1alpha1.ComparisonPhaseRunning
+				status.Verdict = v1alpha1.ComparisonVerdictRunning
+				status.Batches = batches
+				status.Tasks = partialStatuses
+				status.Summary = &v1alpha1.ComparisonSummary{
+					Tasks: fmt.Sprintf("%d/%d", len(taskIDs)-len(continueTasks), len(taskIDs)),
+				}
+				status.Message = fmt.Sprintf("Running batch %d (%d tasks continuing)", nextBatchIndex, len(continueTasks))
+			})
+		}
+	}
+
+	// All tasks are decided or stopped; finalize comparison
+	var taskStatuses []v1alpha1.ComparisonTaskStatus
+	var reports []stats.TaskReport
+	var taskArtifacts []ComparisonTaskArtifact
+
+	for _, te := range taskEvals {
 		taskStatus := v1alpha1.ComparisonTaskStatus{
-			ID:            taskID,
-			BaseRate:      &est.BaseMean,
-			CandidateRate: &est.CandidateMean,
-			Delta:         &est.MeanDelta,
+			ID:            te.taskID,
+			BaseRate:      &te.est.BaseMean,
+			CandidateRate: &te.est.CandidateMean,
+			Delta:         &te.est.MeanDelta,
 			DeltaCI: &v1alpha1.DeltaConfidenceInterval{
-				Lower: est.CI.Lower,
-				Upper: est.CI.Upper,
+				Lower: te.est.CI.Lower,
+				Upper: te.est.CI.Upper,
 			},
-			Pairs:  est.NumPairs,
-			Wins:   est.Wins,
-			Losses: est.Losses,
-			Ties:   est.Ties,
+			Pairs:  te.est.NumPairs,
+			Wins:   te.est.Wins,
+			Losses: te.est.Losses,
+			Ties:   te.est.Ties,
 			Dropped: v1alpha1.ComparisonDropped{
-				Candidate: est.DroppedCandidate,
-				Baseline:  est.DroppedBaseline,
+				Candidate: te.est.DroppedCandidate,
+				Baseline:  te.est.DroppedBaseline,
 			},
-			Label: v1alpha1.ComparisonTaskLabel(dec.Label),
+			Label:      toComparisonTaskLabel(te.dec.Label),
+			SamplesRun: te.samplesRun,
+			Decision:   v1alpha1.ComparisonTaskLabel(te.dec.Label),
 		}
 		taskStatuses = append(taskStatuses, taskStatus)
 
 		reports = append(reports, stats.TaskReport{
-			ID:           taskID,
-			Label:        dec.Label,
-			Estimate:     est,
-			PImprovement: est.PImprovement,
+			ID:           te.taskID,
+			Label:        te.dec.Label,
+			Estimate:     te.est,
+			PImprovement: te.est.PImprovement,
 		})
 
 		// Build paired table for artifact
 		candMap := make(map[string]float64)
-		for _, s := range candScores {
+		for _, s := range te.candScores {
 			candMap[s.ID] = s.Score
 		}
 		baseMap := make(map[string]float64)
-		for _, s := range baseScores {
+		for _, s := range te.baseScores {
 			baseMap[s.ID] = s.Score
 		}
 		var commonIDs []string
@@ -778,24 +1195,26 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		}
 
 		taskArtifacts = append(taskArtifacts, ComparisonTaskArtifact{
-			ID:            taskID,
-			BaseRate:      est.BaseMean,
-			CandidateRate: est.CandidateMean,
-			Delta:         est.MeanDelta,
+			ID:            te.taskID,
+			BaseRate:      te.est.BaseMean,
+			CandidateRate: te.est.CandidateMean,
+			Delta:         te.est.MeanDelta,
 			DeltaCI: v1alpha1.DeltaConfidenceInterval{
-				Lower: est.CI.Lower,
-				Upper: est.CI.Upper,
+				Lower: te.est.CI.Lower,
+				Upper: te.est.CI.Upper,
 			},
-			Pairs:  est.NumPairs,
-			Wins:   est.Wins,
-			Losses: est.Losses,
-			Ties:   est.Ties,
+			Pairs:  te.est.NumPairs,
+			Wins:   te.est.Wins,
+			Losses: te.est.Losses,
+			Ties:   te.est.Ties,
 			Dropped: v1alpha1.ComparisonDropped{
-				Candidate: est.DroppedCandidate,
-				Baseline:  est.DroppedBaseline,
+				Candidate: te.est.DroppedCandidate,
+				Baseline:  te.est.DroppedBaseline,
 			},
-			Label:        string(dec.Label),
-			PImprovement: est.PImprovement,
+			Label:        string(te.dec.Label),
+			PImprovement: te.est.PImprovement,
+			SamplesRun:   te.samplesRun,
+			Decision:     string(te.dec.Label),
 			PairsTable:   pairsTable,
 		})
 	}
@@ -876,6 +1295,7 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		PImprovement: runVerdict.PImprovement,
 		Summary:      message,
 		Tasks:        taskArtifacts,
+		Batches:      batches,
 		CreatedAt:    time.Now().UTC(),
 	}
 
@@ -908,6 +1328,7 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		status.Phase = phase
 		status.Verdict = v1alpha1.ComparisonVerdict(runVerdict.Verdict)
 		status.PImprovement = &pImp
+		status.Batches = batches
 		status.Tasks = taskStatuses
 		status.Summary = &v1alpha1.ComparisonSummary{
 			Tasks:   fmt.Sprintf("%d/%d", completedTasks, len(taskStatuses)),

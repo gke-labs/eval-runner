@@ -483,4 +483,108 @@ spec:
 		// Clean up
 		harness.WaitForAllSandboxesDeletedForRun("eval-runner-sandbox", runName, 30*time.Second)
 	})
+
+	t.Run("SamplingPairedBatchLoop", func(t *testing.T) {
+		commit := harness.GetGitServerCommit("eval-runner-sandbox", "docs-eval.git")
+		candRunName := "batch-cand-run"
+		baseRunName := "batch-base-run"
+		compName := "batch-loop-comp"
+
+		// Clean up any previous runs or comparisons
+		harness.runCmd("kubectl", "delete", "run", candRunName, baseRunName, "-n", "eval-runner", "--ignore-not-found")
+		harness.runCmd("kubectl", "delete", "comparison", compName, "-n", "eval-runner", "--ignore-not-found")
+
+		candManifest := fmt.Sprintf(`
+apiVersion: evalrunner.gke-labs.dev/v1alpha1
+kind: Run
+metadata:
+  name: %s
+  namespace: eval-runner
+spec:
+  repo:
+    url: git://git-server.eval-runner-sandbox.svc/docs-eval.git
+    commit: %s
+  model: mockllm/model
+  sampleRange:
+    start: 1
+    end: 4
+`, candRunName, commit)
+
+		baseManifest := fmt.Sprintf(`
+apiVersion: evalrunner.gke-labs.dev/v1alpha1
+kind: Run
+metadata:
+  name: %s
+  namespace: eval-runner
+spec:
+  repo:
+    url: git://git-server.eval-runner-sandbox.svc/docs-eval.git
+    commit: %s
+  model: mockllm/model
+  sampleRange:
+    start: 1
+    end: 4
+`, baseRunName, commit)
+
+		compManifest := fmt.Sprintf(`
+apiVersion: evalrunner.gke-labs.dev/v1alpha1
+kind: Comparison
+metadata:
+  name: %s
+  namespace: eval-runner
+spec:
+  candidate:
+    run: %s
+  baseline:
+    run: %s
+  sampling:
+    batchSize: 4
+    maxSamplesPerTask: 12
+  equivalenceMargin: 0.05
+`, compName, candRunName, baseRunName)
+
+		harness.KubectlApplyContent(candManifest)
+		harness.KubectlApplyContent(baseManifest)
+		harness.KubectlApplyContent(compManifest)
+
+		// Wait for Comparison to reach terminal Completed phase (having executed multiple batches)
+		comp := harness.WaitForComparisonPhase("eval-runner", compName, string(v1alpha1.ComparisonPhaseCompleted), 180*time.Second)
+
+		if len(comp.Status.Batches) < 2 {
+			t.Fatalf("Expected at least 2 batches created, got %d (batches: %+v)", len(comp.Status.Batches), comp.Status.Batches)
+		}
+
+		b1 := comp.Status.Batches[0]
+		if b1.Index != 1 || b1.CandidateRun != candRunName || b1.BaselineRun != baseRunName {
+			t.Errorf("Unexpected batch 1 status: %+v", b1)
+		}
+
+		b2 := comp.Status.Batches[1]
+		if b2.Index != 2 {
+			t.Errorf("Expected batch 2 index 2, got %d", b2.Index)
+		}
+		if b2.SampleRange == nil || b2.SampleRange.Start != 5 || b2.SampleRange.End != 8 {
+			t.Errorf("Expected batch 2 range [5, 8], got %v", b2.SampleRange)
+		}
+
+		if len(comp.Status.Tasks) == 0 {
+			t.Fatalf("Expected status.tasks to be populated, got 0")
+		}
+		for _, task := range comp.Status.Tasks {
+			if task.SamplesRun < 8 {
+				t.Errorf("Expected task %s samplesRun >= 8 across batches, got %d", task.ID, task.SamplesRun)
+			}
+			if task.Decision == "" {
+				t.Errorf("Expected task %s decision to be recorded, got empty", task.ID)
+			}
+		}
+
+		// Clean up
+		harness.WaitForAllSandboxesDeletedForRun("eval-runner-sandbox", candRunName, 30*time.Second)
+		harness.WaitForAllSandboxesDeletedForRun("eval-runner-sandbox", baseRunName, 30*time.Second)
+		b2CandName := fmt.Sprintf("%s-b2-cand", compName)
+		b2BaseName := fmt.Sprintf("%s-b2-base", compName)
+		harness.WaitForAllSandboxesDeletedForRun("eval-runner-sandbox", b2CandName, 30*time.Second)
+		harness.WaitForAllSandboxesDeletedForRun("eval-runner-sandbox", b2BaseName, 30*time.Second)
+	})
 }
