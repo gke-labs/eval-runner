@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -5534,6 +5536,183 @@ func TestAdaptivePairedSampling_CostAccountingAndTokens(t *testing.T) {
 	}
 	if artTask.SamplesRun != 8 {
 		t.Errorf("Expected artifact samplesRun=8, got samplesRun=%d", artTask.SamplesRun)
+	}
+}
+
+func TestComparison_Tokens_AccountingInvariantWithFixture(t *testing.T) {
+	scheme := setupScheme(t)
+	taskID := "docs/readme_comprehension"
+	fakeGCS := fakes.NewFakeStorageClient()
+	sink, err := gcs.New(t.Context(), "gs://test-bucket", gcs.WithStorageClient(fakeGCS))
+	if err != nil {
+		t.Fatalf("Failed to create GCS sink: %v", err)
+	}
+
+	fixturePath := filepath.Join("..", "artifacts", "testdata", "model_usage_cache_reasoning.json")
+	candFixtureData, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("Failed to read fixture: %v", err)
+	}
+
+	// Candidate log has input=140708, output=788, total_tokens=272146 (cache_read=130000, cache_write=650, reasoning=150)
+	fakeGCS.Objects["test-bucket/runs/cand-commit/log.json"] = fakes.FakeObject{Data: candFixtureData}
+
+	// Baseline log with cache/reasoning fields: input=1000, output=200, total_tokens=3000 (cache_read=1800)
+	baseLogJSON := `{
+		"version": 2,
+		"status": "success",
+		"eval": {"task": "docs/readme_comprehension", "model": "mockllm/model"},
+		"stats": {
+			"model_usage": {
+				"mockllm/model": {
+					"input_tokens": 1000,
+					"output_tokens": 200,
+					"total_tokens": 3000,
+					"input_tokens_cache_read": 1800,
+					"reasoning_tokens": 50
+				}
+			}
+		},
+		"samples": [
+			{"id": 1, "scores": {"choice": {"value": "C"}}},
+			{"id": 2, "scores": {"choice": {"value": "C"}}}
+		]
+	}`
+	fakeGCS.Objects["test-bucket/runs/base-commit/log.json"] = fakes.FakeObject{Data: []byte(baseLogJSON)}
+
+	candRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "cand-run-tokens", Namespace: "eval-runner"},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: "cand-commit"},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 1, End: 2},
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseCompleted,
+			Tasks: []v1alpha1.TaskStatus{
+				{ID: taskID, Phase: v1alpha1.TaskPhaseCompleted, LogPath: "gs://test-bucket/runs/cand-commit/log.json", Samples: 2, SampleRange: &v1alpha1.SampleRange{Start: 1, End: 2}},
+			},
+		},
+	}
+	baseRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "base-run-tokens", Namespace: "eval-runner"},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: "base-commit"},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 1, End: 2},
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseCompleted,
+			Tasks: []v1alpha1.TaskStatus{
+				{ID: taskID, Phase: v1alpha1.TaskPhaseCompleted, LogPath: "gs://test-bucket/runs/base-commit/log.json", Samples: 2, SampleRange: &v1alpha1.SampleRange{Start: 1, End: 2}},
+			},
+		},
+	}
+
+	comp := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{Name: "comp-token-invariant", Namespace: "eval-runner"},
+		Spec: v1alpha1.ComparisonSpec{
+			Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run-tokens"},
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run-tokens"},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(candRun, baseRun, comp).
+		WithStatusSubresource(candRun, baseRun, comp).
+		Build()
+
+	reconciler := &ComparisonReconciler{
+		Client:       cl,
+		Scheme:       scheme,
+		ArtifactSink: sink,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-token-invariant"}}
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	var compFinal v1alpha1.Comparison
+	_ = cl.Get(t.Context(), req.NamespacedName, &compFinal)
+
+	if len(compFinal.Status.Tasks) != 1 {
+		t.Fatalf("Expected 1 task in comparison status, got %d", len(compFinal.Status.Tasks))
+	}
+	task := compFinal.Status.Tasks[0]
+	if task.Tokens == nil {
+		t.Fatalf("Expected non-nil task.Tokens in comparison status")
+	}
+
+	// Verify invariant Total == Input + Output on comparison status
+	if task.Tokens.Total != task.Tokens.Input+task.Tokens.Output {
+		t.Errorf("Comparison status token invariant violated: total %d != input %d + output %d",
+			task.Tokens.Total, task.Tokens.Input, task.Tokens.Output)
+	}
+	expectedCandTotal := 140708 + 788 // 141496 (Inspect total 272146 dropped)
+	expectedBaseTotal := 1000 + 200   // 1200 (Inspect total 3000 dropped)
+	expectedCombinedInput := 140708 + 1000
+	expectedCombinedOutput := 788 + 200
+	expectedCombinedTotal := expectedCandTotal + expectedBaseTotal
+
+	if task.Tokens.Input != expectedCombinedInput || task.Tokens.Output != expectedCombinedOutput || task.Tokens.Total != expectedCombinedTotal {
+		t.Errorf("Expected comparison task tokens {%d, %d, %d}, got %+v",
+			expectedCombinedInput, expectedCombinedOutput, expectedCombinedTotal, task.Tokens)
+	}
+
+	// Verify invariant in ComparisonArtifact
+	artData, ok := fakeGCS.Objects["test-bucket/comparisons/comp-token-invariant.json"]
+	if !ok {
+		t.Fatalf("Expected comparison artifact comp-token-invariant.json in sink")
+	}
+	var art ComparisonArtifact
+	if err := json.Unmarshal(artData.Data, &art); err != nil {
+		t.Fatalf("Failed to unmarshal artifact: %v", err)
+	}
+	if len(art.Tasks) != 1 {
+		t.Fatalf("Expected 1 task in artifact, got %d", len(art.Tasks))
+	}
+	artTask := art.Tasks[0]
+
+	// Check candidate tokens invariant in artifact
+	if artTask.CandidateTokens == nil {
+		t.Fatalf("Expected non-nil candidateTokens in artifact")
+	}
+	if artTask.CandidateTokens.Total != artTask.CandidateTokens.Input+artTask.CandidateTokens.Output {
+		t.Errorf("Artifact candidateTokens invariant violated: total %d != input %d + output %d",
+			artTask.CandidateTokens.Total, artTask.CandidateTokens.Input, artTask.CandidateTokens.Output)
+	}
+	if artTask.CandidateTokens.Input != 140708 || artTask.CandidateTokens.Output != 788 || artTask.CandidateTokens.Total != expectedCandTotal {
+		t.Errorf("Expected artifact candidateTokens {140708, 788, %d}, got %+v",
+			expectedCandTotal, artTask.CandidateTokens)
+	}
+
+	// Check base tokens invariant in artifact
+	if artTask.BaseTokens == nil {
+		t.Fatalf("Expected non-nil baseTokens in artifact")
+	}
+	if artTask.BaseTokens.Total != artTask.BaseTokens.Input+artTask.BaseTokens.Output {
+		t.Errorf("Artifact baseTokens invariant violated: total %d != input %d + output %d",
+			artTask.BaseTokens.Total, artTask.BaseTokens.Input, artTask.BaseTokens.Output)
+	}
+	if artTask.BaseTokens.Input != 1000 || artTask.BaseTokens.Output != 200 || artTask.BaseTokens.Total != expectedBaseTotal {
+		t.Errorf("Expected artifact baseTokens {1000, 200, %d}, got %+v",
+			expectedBaseTotal, artTask.BaseTokens)
+	}
+
+	// Check total tokens invariant in artifact
+	if artTask.Tokens == nil {
+		t.Fatalf("Expected non-nil tokens in artifact")
+	}
+	if artTask.Tokens.Total != artTask.Tokens.Input+artTask.Tokens.Output {
+		t.Errorf("Artifact tokens invariant violated: total %d != input %d + output %d",
+			artTask.Tokens.Total, artTask.Tokens.Input, artTask.Tokens.Output)
+	}
+	if artTask.Tokens.Input != expectedCombinedInput || artTask.Tokens.Output != expectedCombinedOutput || artTask.Tokens.Total != expectedCombinedTotal {
+		t.Errorf("Expected artifact tokens {%d, %d, %d}, got %+v",
+			expectedCombinedInput, expectedCombinedOutput, expectedCombinedTotal, artTask.Tokens)
 	}
 }
 

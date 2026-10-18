@@ -48,6 +48,7 @@ type RunMetadata struct {
 }
 
 // TaskTokens records token usage breakdown for an evaluation task.
+// Invariant: Total == Input + Output across all reporting surfaces.
 type TaskTokens struct {
 	Input  int `json:"input,omitempty"`
 	Output int `json:"output,omitempty"`

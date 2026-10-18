@@ -42,9 +42,12 @@ type InspectStats struct {
 
 // InspectModelUsage reports token counts for a model.
 type InspectModelUsage struct {
-	InputTokens  int `json:"input_tokens,omitempty"`
-	OutputTokens int `json:"output_tokens,omitempty"`
-	TotalTokens  int `json:"total_tokens,omitempty"`
+	InputTokens           int `json:"input_tokens,omitempty"`
+	OutputTokens          int `json:"output_tokens,omitempty"`
+	TotalTokens           int `json:"total_tokens,omitempty"`
+	InputTokensCacheRead  int `json:"input_tokens_cache_read,omitempty"`
+	InputTokensCacheWrite int `json:"input_tokens_cache_write,omitempty"`
+	ReasoningTokens       int `json:"reasoning_tokens,omitempty"`
 }
 
 // InspectEval contains task and scorer configuration metadata.
@@ -349,6 +352,8 @@ func ParseInspectSampleScores(data []byte) ([]stats.SampleScore, error) {
 }
 
 // ExtractInspectTokens parses raw Inspect log JSON bytes and returns token usage breakdown if present.
+// It enforces the token accounting invariant Total = Input + Output across all tasks, dropping
+// any provider-specific total_tokens from Inspect logs.
 // Returns nil if no token counts or model usage are present in the log.
 func ExtractInspectTokens(data []byte) (*TaskTokens, error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
@@ -362,38 +367,27 @@ func ExtractInspectTokens(data []byte) (*TaskTokens, error) {
 
 	inputTokens := 0
 	outputTokens := 0
-	totalTokens := 0
 	foundTokens := false
 
 	if log.Stats != nil && len(log.Stats.ModelUsage) > 0 {
 		for _, usage := range log.Stats.ModelUsage {
-			tot := usage.TotalTokens
-			if tot == 0 && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
-				tot = usage.InputTokens + usage.OutputTokens
-			}
-			if tot > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 {
+			if usage.TotalTokens > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 {
 				inputTokens += usage.InputTokens
 				outputTokens += usage.OutputTokens
-				totalTokens += tot
 				foundTokens = true
 			}
 		}
 		if foundTokens {
-			return &TaskTokens{Input: inputTokens, Output: outputTokens, Total: totalTokens}, nil
+			return &TaskTokens{Input: inputTokens, Output: outputTokens, Total: inputTokens + outputTokens}, nil
 		}
 	}
 
 	for _, s := range log.Samples {
 		if len(s.ModelUsage) > 0 {
 			for _, usage := range s.ModelUsage {
-				tot := usage.TotalTokens
-				if tot == 0 && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
-					tot = usage.InputTokens + usage.OutputTokens
-				}
-				if tot > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 {
+				if usage.TotalTokens > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 {
 					inputTokens += usage.InputTokens
 					outputTokens += usage.OutputTokens
-					totalTokens += tot
 					foundTokens = true
 				}
 			}
@@ -401,7 +395,7 @@ func ExtractInspectTokens(data []byte) (*TaskTokens, error) {
 	}
 
 	if foundTokens {
-		return &TaskTokens{Input: inputTokens, Output: outputTokens, Total: totalTokens}, nil
+		return &TaskTokens{Input: inputTokens, Output: outputTokens, Total: inputTokens + outputTokens}, nil
 	}
 	return nil, nil
 }

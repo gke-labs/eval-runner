@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -4427,6 +4429,174 @@ func TestReconcileArtifactSink_GCSArtifactsAndLogPathRecorded(t *testing.T) {
 	}
 	if summary.StartedAt == nil || summary.FinishedAt == nil {
 		t.Errorf("Expected StartedAt and FinishedAt to be populated")
+	}
+}
+
+func TestReconcileArtifactSink_TokenAccountingInvariantWithFixture(t *testing.T) {
+	scheme := setupScheme(t)
+
+	manifest := &v1alpha1.Manifest{
+		Tasks: []v1alpha1.ManifestTask{
+			{ID: "docs/readme_comprehension", Spec: "eval.py@task"},
+		},
+	}
+
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-run-token-invariant",
+			Namespace: "eval-runner",
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "git://git-server/repo.git",
+				Commit: "abcdef123456",
+			},
+			Model: "mockllm/model",
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseRunning,
+			Discovery: &v1alpha1.RunDiscoveryStatus{
+				TaskCount:         1,
+				EligibleTaskCount: 1,
+				TaskIDs:           []string{"docs/readme_comprehension"},
+			},
+			Tasks: []v1alpha1.TaskStatus{
+				{ID: "docs/readme_comprehension", Phase: v1alpha1.TaskPhasePending},
+			},
+		},
+	}
+
+	fixturePath := filepath.Join("..", "artifacts", "testdata", "model_usage_cache_reasoning.json")
+	fixtureData, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("Failed to read fixture: %v", err)
+	}
+
+	executor := &sandboxclient.FakeClient{
+		ExecFn: func(call int, ctx context.Context, cfg sandboxclient.ProcessConfig) (*sandboxclient.ExecuteResult, error) {
+			if len(cfg.Command) > 0 && cfg.Command[0] == "ls" {
+				return &sandboxclient.ExecuteResult{ExitCode: 0, Stdout: "2026-10-18_readme_eval.json\n"}, nil
+			}
+			return &sandboxclient.ExecuteResult{ExitCode: 0}, nil
+		},
+		ReadFileFn: func(ctx context.Context, path string) ([]byte, error) {
+			return fixtureData, nil
+		},
+	}
+
+	fakeGCSClient := fakes.NewFakeStorageClient()
+	gcsSink, err := gcs.New(t.Context(), "gs://justinbs-knotai-dev-eval-runner", gcs.WithStorageClient(fakeGCSClient))
+	if err != nil {
+		t.Fatalf("Failed to create GCSSink: %v", err)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(run).
+		WithStatusSubresource(run).
+		Build()
+
+	reconciler := &RunReconciler{
+		Client:           cl,
+		Scheme:           scheme,
+		SandboxClient:    executor,
+		ArtifactSink:     gcsSink,
+		SandboxNamespace: "eval-runner-sandbox",
+	}
+	reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-token-invariant"}}
+
+	// Turn 1: Creates pod
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile turn 1 error: %v", err)
+	}
+
+	// Create ready pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      discovery.TaskSandboxNameForRun("test-run-token-invariant", "docs/readme_comprehension"),
+			Namespace: "eval-runner-sandbox",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.244.0.50",
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	if err := cl.Create(t.Context(), pod); err != nil {
+		t.Fatalf("Failed to create pod: %v", err)
+	}
+
+	// Turn 2: Executes task and writes artifacts to GCS
+	res, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile turn 2 error: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected Requeue to check completion")
+	}
+
+	// Turn 3: Run marked Completed
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile turn 3 error: %v", err)
+	}
+
+	var updatedRun v1alpha1.Run
+	if err := cl.Get(t.Context(), req.NamespacedName, &updatedRun); err != nil {
+		t.Fatalf("Failed to get updated run: %v", err)
+	}
+
+	if updatedRun.Status.Phase != v1alpha1.RunPhaseCompleted {
+		t.Fatalf("Expected Run phase Completed, got %s", updatedRun.Status.Phase)
+	}
+	if len(updatedRun.Status.Tasks) != 1 {
+		t.Fatalf("Expected 1 task status, got %d", len(updatedRun.Status.Tasks))
+	}
+
+	taskTokens := updatedRun.Status.Tasks[0].Tokens
+	if taskTokens == nil {
+		t.Fatalf("Expected non-nil task Tokens in Run status")
+	}
+	if taskTokens.Input != 140708 || taskTokens.Output != 788 {
+		t.Errorf("Expected {Input: 140708, Output: 788}, got %+v", taskTokens)
+	}
+	if taskTokens.Total != taskTokens.Input+taskTokens.Output {
+		t.Errorf("Run status token accounting invariant violated: Total (%d) != Input (%d) + Output (%d)",
+			taskTokens.Total, taskTokens.Input, taskTokens.Output)
+	}
+	if taskTokens.Total != 141496 {
+		t.Errorf("Expected Run status total=141496 (Inspect total 272146 dropped), got %d", taskTokens.Total)
+	}
+
+	// Verify summary.json exists in fake GCS and enforces the invariant
+	summaryObj, exists := fakeGCSClient.GetObject("justinbs-knotai-dev-eval-runner", "runs/abcdef123456/docs/readme_comprehension/summary.json")
+	if !exists {
+		t.Fatalf("summary.json was not uploaded to GCS")
+	}
+	var summary artifacts.TaskSummary
+	if err := json.Unmarshal(summaryObj.Data, &summary); err != nil {
+		t.Fatalf("Failed to parse summary.json: %v", err)
+	}
+	if summary.Tokens == nil {
+		t.Fatalf("Expected non-nil Tokens in summary.json")
+	}
+	if summary.Tokens.Input != 140708 || summary.Tokens.Output != 788 {
+		t.Errorf("Expected summary.Tokens {Input: 140708, Output: 788}, got %+v", summary.Tokens)
+	}
+	if summary.Tokens.Total != summary.Tokens.Input+summary.Tokens.Output {
+		t.Errorf("summary.json token accounting invariant violated: Total (%d) != Input (%d) + Output (%d)",
+			summary.Tokens.Total, summary.Tokens.Input, summary.Tokens.Output)
+	}
+	if summary.Tokens.Total != 141496 {
+		t.Errorf("Expected summary.json total=141496 (Inspect total 272146 dropped), got %d", summary.Tokens.Total)
 	}
 }
 

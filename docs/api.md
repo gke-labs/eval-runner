@@ -154,7 +154,7 @@ status:
 | `message` | `string` | Failure detail or bounded error information if the task failed. |
 | `logPath` | `string` | Storage path or URI where the raw Inspect log was stored by the artifact sink. |
 | `sampleRange` | `*SampleRange` | Sample window evaluated for this task (`{start, end}`). |
-| `tokens` | `*int` | Total token count consumed for this task when present in Inspect logs. |
+| `tokens` | `*TaskTokens` | Token usage breakdown consumed for this task when present in Inspect logs. |
 
 ### ConfidenceInterval
 
@@ -317,6 +317,12 @@ spec:
 | `reporting` | `*ComparisonReportingStatus` | GitHub PR comment and Check Run reporting state (`commentID`, `checkRunID`, `lastPostedHash`, `message`). |
 
 ### TaskTokens (`status.tasks[].tokens`)
+
+`TaskTokens` records token usage breakdown for an evaluation task. Across all resources (`Run.status.tasks[].tokens`, `Comparison.status.tasks[].tokens`), summary files (`summary.json`), and comparison artifacts (`comparisons/<name>.json`), eval-runner enforces the token accounting invariant:
+
+$$\text{total} = \text{input} + \text{output}$$
+
+Inspect log provider-specific totals or unexposed fields (such as cache read/write or reasoning tokens) are dropped so that `total` is strictly and deterministically reproducible from the exposed components.
 
 | Field | Type | Description |
 |---|---|---|

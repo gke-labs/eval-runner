@@ -2298,7 +2298,7 @@ func (r *RunReconciler) executeTask(ctx context.Context, run *v1alpha1.Run, task
 		v1Tokens = &v1alpha1.TaskTokens{
 			Input:  tokens.Input,
 			Output: tokens.Output,
-			Total:  tokens.Total,
+			Total:  tokens.Input + tokens.Output,
 		}
 	}
 

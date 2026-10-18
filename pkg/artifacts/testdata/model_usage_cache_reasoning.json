@@ -1,0 +1,60 @@
+{
+  "version": 2,
+  "status": "success",
+  "eval": {
+    "task": "docs/readme_comprehension",
+    "model": "mockllm/model",
+    "scorers": [
+      {
+        "name": "choice"
+      }
+    ]
+  },
+  "stats": {
+    "model_usage": {
+      "mockllm/model": {
+        "input_tokens": 140708,
+        "output_tokens": 788,
+        "total_tokens": 272146,
+        "input_tokens_cache_read": 130000,
+        "input_tokens_cache_write": 650,
+        "reasoning_tokens": 150
+      }
+    }
+  },
+  "results": {
+    "total_samples": 2,
+    "completed_samples": 2,
+    "scores": [
+      {
+        "name": "choice",
+        "scorer": "choice",
+        "scored_samples": 2,
+        "metrics": {
+          "accuracy": {
+            "name": "accuracy",
+            "value": 1.0
+          }
+        }
+      }
+    ]
+  },
+  "samples": [
+    {
+      "id": 1,
+      "scores": {
+        "choice": {
+          "value": "C"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "scores": {
+        "choice": {
+          "value": "C"
+        }
+      }
+    }
+  ]
+}

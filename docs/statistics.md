@@ -434,8 +434,10 @@ To avoid redundant evaluation when multiple pull requests or extra sample reques
 
 Per-task sample counts (`samplesRun`) and model token usage are tracked across all evaluation batches:
 
-- **Token Extraction**: When Inspect logs contain `stats.model_usage` or sample-level `model_usage` (`input_tokens`, `output_tokens`, `total_tokens`), token usage is extracted via `ExtractInspectTokens` as a structured `{input, output, total}` object.
-- **Status & Summary**: Evaluated token counts are accumulated across candidate and baseline runs for each task, recorded in `Run.status.tasks[].tokens`, `Comparison.status.tasks[].tokens`, and written to `summary.json` alongside task execution metadata.
+- **Token Extraction & Invariant**: When Inspect logs contain `stats.model_usage` or sample-level `model_usage` (`input_tokens`, `output_tokens`, `total_tokens`), token usage is extracted via `ExtractInspectTokens` as a structured `{input, output, total}` object. Inspect AI logs may include provider-specific token fields in `stats.model_usage` (such as `input_tokens_cache_read`, `input_tokens_cache_write`, `reasoning_tokens`, or provider-specific `total_tokens` calculations that include cached or unexposed fields). Eval-runner enforces the strict token accounting invariant:
+  $$\text{total} = \text{input} + \text{output}$$
+  Inspect's reported `total_tokens` is dropped in favor of this invariant, ensuring `total` is always reproducible from the parts.
+- **Status & Summary**: Evaluated token counts are accumulated across candidate and baseline runs for each task, recorded in `Run.status.tasks[].tokens`, `Comparison.status.tasks[].tokens`, and written to `summary.json` alongside task execution metadata. The invariant $\text{total} = \text{input} + \text{output}$ is preserved across all reporting surfaces and Comparison artifacts.
 
 
 

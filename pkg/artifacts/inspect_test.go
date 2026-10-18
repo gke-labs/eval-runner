@@ -386,6 +386,34 @@ func TestExtractInspectTokens(t *testing.T) {
 		}
 	})
 
+	t.Run("FixtureWithCacheAndReasoningEnforcesInvariant", func(t *testing.T) {
+		data, err := os.ReadFile(filepath.Join("testdata", "model_usage_cache_reasoning.json"))
+		if err != nil {
+			t.Fatalf("failed to read fixture: %v", err)
+		}
+		tokens, err := ExtractInspectTokens(data)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tokens == nil {
+			t.Fatalf("expected non-nil tokens")
+		}
+		// Invariant: Total == Input + Output, dropping Inspect's total_tokens (272146).
+		if tokens.Input != 140708 {
+			t.Errorf("expected input=140708, got %d", tokens.Input)
+		}
+		if tokens.Output != 788 {
+			t.Errorf("expected output=788, got %d", tokens.Output)
+		}
+		expectedTotal := tokens.Input + tokens.Output
+		if tokens.Total != expectedTotal {
+			t.Errorf("token accounting invariant violated: total %d != input %d + output %d", tokens.Total, tokens.Input, tokens.Output)
+		}
+		if tokens.Total != 141496 {
+			t.Errorf("expected total=141496, got %d", tokens.Total)
+		}
+	})
+
 	t.Run("NoTokensReturnsNil", func(t *testing.T) {
 		raw := `{
 			"version": 2,
