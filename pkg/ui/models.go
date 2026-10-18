@@ -160,6 +160,8 @@ type ComparisonTaskRow struct {
 	Pairs       int
 	DroppedCand int
 	DroppedBase int
+	SamplesRun  int
+	Decision    string
 }
 
 // ComparisonRows maps a Comparison resource into a slice of ComparisonTaskRow
@@ -208,6 +210,8 @@ func ComparisonRows(comp *v1alpha1.Comparison) []ComparisonTaskRow {
 			Pairs:       task.Pairs,
 			DroppedCand: task.Dropped.Candidate,
 			DroppedBase: task.Dropped.Baseline,
+			SamplesRun:  task.SamplesRun,
+			Decision:    string(task.Decision),
 		})
 	}
 	return rows
@@ -459,7 +463,7 @@ func labelStatusClass(label v1alpha1.ComparisonTaskLabel) string {
 		return "neutral"
 	case v1alpha1.ComparisonTaskLabelInconclusive:
 		return "warn"
-	case v1alpha1.ComparisonTaskLabelRunning:
+	case v1alpha1.ComparisonTaskLabelRunning, v1alpha1.ComparisonTaskLabelContinue:
 		return "pending"
 	default:
 		return "neutral"

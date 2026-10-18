@@ -772,6 +772,21 @@ func TestRenderComparisonMarkdown_UIBaseURL(t *testing.T) {
 	_ = status
 }
 
+func TestRenderComparisonMarkdown_SamplesRun(t *testing.T) {
+	comp, baseRun, candRun := sameCommitComparisonFixture()
+	// Set explicit SamplesRun on the tasks
+	comp.Status.Tasks[0].SamplesRun = 32
+	comp.Status.Tasks[1].SamplesRun = 16
+
+	got := RenderComparisonMarkdown(comp, baseRun, candRun, "")
+	if !strings.Contains(got, "| docs/readme\\_comprehension | 1.00 | 1.00 | +0.00 [+0.00, +0.00] | unchanged | 32 |") {
+		t.Errorf("expected markdown to display 32 for task 0 runs, got:\n%s", got)
+	}
+	if !strings.Contains(got, "| docs/readme\\_comprehension\\_blind | 0.20 | 0.15 | -0.05 [-0.15, +0.00] | inconclusive | 16 |") {
+		t.Errorf("expected markdown to display 16 for task 1 runs, got:\n%s", got)
+	}
+}
+
 func TestReporter_CheckRunRetryableError_HashGateNotSwallowed(t *testing.T) {
 	ctx := t.Context()
 	server := NewFakeGitHubServer()

@@ -547,7 +547,7 @@ const ComparisonTableTemplate = `{{ define "comparison_table" }}
         </td>
         <td><span class="chip {{ .StatusClass }}"><span class="dot"></span>{{ .Label }}</span></td>
         <td class="num">
-          {{ .Pairs }}
+          {{ if gt .SamplesRun 0 }}{{ .SamplesRun }}{{ else }}{{ .Pairs }}{{ end }}
           {{ if or (gt .DroppedCand 0) (gt .DroppedBase 0) }}
           <span style="font-size:11px;color:var(--muted);display:block">dropped: {{ .DroppedCand }} cand, {{ .DroppedBase }} base</span>
           {{ end }}

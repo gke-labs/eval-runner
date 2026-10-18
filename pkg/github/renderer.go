@@ -80,13 +80,18 @@ func RenderComparisonMarkdown(comp *v1alpha1.Comparison, baseRun, candRun *v1alp
 			deltaStr = row.Delta
 		}
 
+		runsCount := row.Pairs
+		if row.SamplesRun > 0 {
+			runsCount = row.SamplesRun
+		}
+
 		sb.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %d |\n",
 			escapedID,
 			row.BaseRate,
 			row.CandRate,
 			deltaStr,
 			row.Label,
-			row.Pairs,
+			runsCount,
 		))
 	}
 	sb.WriteString("\n")
