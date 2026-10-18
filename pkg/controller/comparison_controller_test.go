@@ -1797,7 +1797,7 @@ func TestComparisonReconcile_SampleRangePairing(t *testing.T) {
 	taskID := "docs/readme_comprehension"
 
 	t.Run("same range yields full pairs", func(t *testing.T) {
-		fakeGCS := gcs.NewFakeStorageClient()
+		fakeGCS := fakes.NewFakeStorageClient()
 		sink, err := gcs.New(t.Context(), "gs://test-bucket", gcs.WithStorageClient(fakeGCS))
 		if err != nil {
 			t.Fatalf("Failed to create GCS sink: %v", err)
@@ -1810,10 +1810,10 @@ func TestComparisonReconcile_SampleRangePairing(t *testing.T) {
 			baseScores = append(baseScores, stats.SampleScore{ID: fmt.Sprint(i), Score: 1.0})
 		}
 
-		fakeGCS.Objects["test-bucket/runs/cand-commit/docs/readme_comprehension/log.json"] = gcs.FakeObject{
+		fakeGCS.Objects["test-bucket/runs/cand-commit/docs/readme_comprehension/log.json"] = fakes.FakeObject{
 			Data: makeSyntheticInspectLog(taskID, candScores),
 		}
-		fakeGCS.Objects["test-bucket/runs/base-commit/docs/readme_comprehension/log.json"] = gcs.FakeObject{
+		fakeGCS.Objects["test-bucket/runs/base-commit/docs/readme_comprehension/log.json"] = fakes.FakeObject{
 			Data: makeSyntheticInspectLog(taskID, baseScores),
 		}
 
@@ -1915,7 +1915,7 @@ func TestComparisonReconcile_SampleRangePairing(t *testing.T) {
 	})
 
 	t.Run("disjoint ranges yield zero pairs", func(t *testing.T) {
-		fakeGCS := gcs.NewFakeStorageClient()
+		fakeGCS := fakes.NewFakeStorageClient()
 		sink, err := gcs.New(t.Context(), "gs://test-bucket", gcs.WithStorageClient(fakeGCS))
 		if err != nil {
 			t.Fatalf("Failed to create GCS sink: %v", err)
@@ -1932,10 +1932,10 @@ func TestComparisonReconcile_SampleRangePairing(t *testing.T) {
 			baseScores = append(baseScores, stats.SampleScore{ID: fmt.Sprint(i), Score: 1.0})
 		}
 
-		fakeGCS.Objects["test-bucket/runs/cand-commit/docs/readme_comprehension/log.json"] = gcs.FakeObject{
+		fakeGCS.Objects["test-bucket/runs/cand-commit/docs/readme_comprehension/log.json"] = fakes.FakeObject{
 			Data: makeSyntheticInspectLog(taskID, candScores),
 		}
-		fakeGCS.Objects["test-bucket/runs/base-commit/docs/readme_comprehension/log.json"] = gcs.FakeObject{
+		fakeGCS.Objects["test-bucket/runs/base-commit/docs/readme_comprehension/log.json"] = fakes.FakeObject{
 			Data: makeSyntheticInspectLog(taskID, baseScores),
 		}
 
