@@ -814,6 +814,13 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 				candTask.Phase != v1alpha1.TaskPhaseCompleted ||
 				baseTask.Phase != v1alpha1.TaskPhaseCompleted ||
 				candTask.LogPath == "" || baseTask.LogPath == "" {
+				// A candidate-side task failure in any batch caps the final verdict (#141),
+				// exactly as a seed-Run failure does via determineCompletedTaskIDs.
+				if candTask != nil && candTask.Phase == v1alpha1.TaskPhaseFailed &&
+					baseTask != nil && baseTask.Phase == v1alpha1.TaskPhaseCompleted &&
+					!containsTask(candFailed, taskID) {
+					candFailed = append(candFailed, taskID)
+				}
 				taskExhausted = true
 				continue
 			}
