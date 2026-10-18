@@ -124,6 +124,24 @@ spec:
                 - number
                 - repository
                 type: object
+              sampling:
+                description: |-
+                  Sampling configures paired batch sampling driven by the stopping rule.
+                  When omitted, only the single pair of referenced runs is compared.
+                properties:
+                  batchSize:
+                    default: 8
+                    description: 'BatchSize is the number of samples to evaluate in
+                      each subsequent batch (default: 8).'
+                    minimum: 1
+                    type: integer
+                  maxSamplesPerTask:
+                    default: 64
+                    description: 'MaxSamplesPerTask is the maximum total number of
+                      samples evaluated per task across all batches (default: 64).'
+                    minimum: 1
+                    type: integer
+                type: object
               tasks:
                 description: |-
                   Tasks is an optional allow-list of task IDs to compare.
@@ -138,6 +156,59 @@ spec:
           status:
             description: ComparisonStatus defines the observed state of Comparison.
             properties:
+              batches:
+                description: Batches records the status of each paired batch of Runs
+                  evaluated for this Comparison.
+                items:
+                  description: ComparisonBatchStatus records the execution state of
+                    one paired batch of Runs.
+                  properties:
+                    baselineRun:
+                      description: BaselineRun is the name of the baseline Run for
+                        this batch.
+                      type: string
+                    candidateRun:
+                      description: CandidateRun is the name of the candidate Run for
+                        this batch.
+                      type: string
+                    index:
+                      description: Index is the 1-based index of this batch.
+                      minimum: 1
+                      type: integer
+                    phase:
+                      description: Phase is the lifecycle phase of this batch (Running,
+                        Completed).
+                      enum:
+                      - Running
+                      - Completed
+                      type: string
+                    sampleRange:
+                      description: SampleRange is the window of samples evaluated
+                        in this batch.
+                      properties:
+                        end:
+                          description: End is the 1-based inclusive end index in the
+                            dataset.
+                          minimum: 1
+                          type: integer
+                        start:
+                          description: Start is the 1-based inclusive start index
+                            in the dataset.
+                          minimum: 1
+                          type: integer
+                      required:
+                      - end
+                      - start
+                      type: object
+                      x-kubernetes-validations:
+                      - message: end must be greater than or equal to start
+                        rule: self.end >= self.start
+                  required:
+                  - baselineRun
+                  - candidateRun
+                  - index
+                  type: object
+                type: array
               message:
                 description: Message is human-readable detail on failure or current
                   status.
@@ -214,6 +285,17 @@ spec:
                       maximum: 1
                       minimum: 0
                       type: number
+                    decision:
+                      description: 'Decision is the stopping rule decision: improved,
+                        regressed, unchanged, inconclusive, or continue.'
+                      enum:
+                      - improved
+                      - regressed
+                      - unchanged
+                      - inconclusive
+                      - running
+                      - continue
+                      type: string
                     delta:
                       description: Delta is the sample mean difference (candidate
                         - baseline).
@@ -263,6 +345,7 @@ spec:
                       - unchanged
                       - inconclusive
                       - running
+                      - continue
                       type: string
                     losses:
                       description: Losses is the number of paired samples where the
@@ -271,6 +354,10 @@ spec:
                     pairs:
                       description: Pairs is the number of matched (paired) sample
                         pairs.
+                      type: integer
+                    samplesRun:
+                      description: SamplesRun is the total number of samples evaluated
+                        for this task across all batches.
                       type: integer
                     ties:
                       description: Ties is the number of paired samples where candidate

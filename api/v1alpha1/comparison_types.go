@@ -31,7 +31,7 @@ const (
 )
 
 // ComparisonTaskLabel represents the statistical decision label for a single task.
-// +kubebuilder:validation:Enum=improved;regressed;unchanged;inconclusive;running
+// +kubebuilder:validation:Enum=improved;regressed;unchanged;inconclusive;running;continue
 type ComparisonTaskLabel string
 
 const (
@@ -40,6 +40,7 @@ const (
 	ComparisonTaskLabelUnchanged    ComparisonTaskLabel = "unchanged"
 	ComparisonTaskLabelInconclusive ComparisonTaskLabel = "inconclusive"
 	ComparisonTaskLabelRunning      ComparisonTaskLabel = "running"
+	ComparisonTaskLabelContinue     ComparisonTaskLabel = "continue"
 )
 
 // ComparisonVerdict represents the aggregate run-level verdict.
@@ -59,6 +60,37 @@ type ComparisonRunRef struct {
 	// Run is the name of the Run resource in the same namespace.
 	// +kubebuilder:validation:Required
 	Run string `json:"run"`
+}
+
+// ComparisonSamplingSpec configures adaptive paired batch sampling.
+type ComparisonSamplingSpec struct {
+	// BatchSize is the number of samples to evaluate in each subsequent batch (default: 8).
+	// +kubebuilder:default=8
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	BatchSize int `json:"batchSize,omitempty"`
+
+	// MaxSamplesPerTask is the maximum total number of samples evaluated per task across all batches (default: 64).
+	// +kubebuilder:default=64
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxSamplesPerTask int `json:"maxSamplesPerTask,omitempty"`
+}
+
+// EffectiveBatchSize returns the configured batch size, defaulting to 8 if unset or non-positive.
+func (s *ComparisonSamplingSpec) EffectiveBatchSize() int {
+	if s == nil || s.BatchSize <= 0 {
+		return 8
+	}
+	return s.BatchSize
+}
+
+// EffectiveMaxSamplesPerTask returns the maximum total samples per task, defaulting to 64 if unset or non-positive.
+func (s *ComparisonSamplingSpec) EffectiveMaxSamplesPerTask() int {
+	if s == nil || s.MaxSamplesPerTask <= 0 {
+		return 64
+	}
+	return s.MaxSamplesPerTask
 }
 
 // PullRequestSpec references a pull request target for reporting.
@@ -97,6 +129,11 @@ type ComparisonSpec struct {
 	// +kubebuilder:validation:Maximum=0.5
 	// +optional
 	EquivalenceMargin *float64 `json:"equivalenceMargin,omitempty"`
+
+	// Sampling configures paired batch sampling driven by the stopping rule.
+	// When omitted, only the single pair of referenced runs is compared.
+	// +optional
+	Sampling *ComparisonSamplingSpec `json:"sampling,omitempty"`
 
 	// Tasks is an optional allow-list of task IDs to compare.
 	// If empty, all tasks present in both candidate and baseline runs are compared.
@@ -183,6 +220,35 @@ type ComparisonTaskStatus struct {
 	// Label is the decision outcome for this task: improved, regressed, unchanged, inconclusive, or running.
 	// +optional
 	Label ComparisonTaskLabel `json:"label,omitempty"`
+
+	// SamplesRun is the total number of samples evaluated for this task across all batches.
+	// +optional
+	SamplesRun int `json:"samplesRun,omitempty"`
+
+	// Decision is the stopping rule decision: improved, regressed, unchanged, inconclusive, or continue.
+	// +optional
+	Decision ComparisonTaskLabel `json:"decision,omitempty"`
+}
+
+// ComparisonBatchStatus records the execution state of one paired batch of Runs.
+type ComparisonBatchStatus struct {
+	// Index is the 1-based index of this batch.
+	// +kubebuilder:validation:Minimum=1
+	Index int `json:"index"`
+
+	// SampleRange is the window of samples evaluated in this batch.
+	// +optional
+	SampleRange *SampleRange `json:"sampleRange,omitempty"`
+
+	// CandidateRun is the name of the candidate Run for this batch.
+	CandidateRun string `json:"candidateRun"`
+
+	// BaselineRun is the name of the baseline Run for this batch.
+	BaselineRun string `json:"baselineRun"`
+
+	// Phase is the lifecycle phase of this batch (Running, Completed).
+	// +optional
+	Phase ComparisonPhase `json:"phase,omitempty"`
 }
 
 // ComparisonSummary provides aggregate statistics across tasks in a Comparison.
@@ -230,6 +296,10 @@ type ComparisonStatus struct {
 	// +kubebuilder:validation:Maximum=1
 	// +optional
 	PImprovement *float64 `json:"pImprovement,omitempty"`
+
+	// Batches records the status of each paired batch of Runs evaluated for this Comparison.
+	// +optional
+	Batches []ComparisonBatchStatus `json:"batches,omitempty"`
 
 	// Tasks records the status and paired comparison results for each evaluated task.
 	// +optional
