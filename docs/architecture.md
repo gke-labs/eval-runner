@@ -279,7 +279,8 @@ The trust model establishes strict boundaries around untrusted repository code:
 The controller uses strictly namespaced RBAC with **no ClusterRole**:
 
 1. **In namespace `eval-runner` (Role `eval-runner-controller`)**:
-   - `evalrunner.gke-labs.dev/runs` and `runs/status`: `get`, `list`, `watch`, `update`, `patch`.
+   - `evalrunner.gke-labs.dev/runs`: `get`, `list`, `watch`, `create`, `update`, `patch` (`create` allows spawning batch Runs; no `delete`, owner references handle GC).
+   - `evalrunner.gke-labs.dev/runs/status`, `comparisons`, and `comparisons/status`: `get`, `list`, `watch`, `update`, `patch`.
    - Core `secrets`: `get`, `create`, `delete` (used for controller CA keypair, dynamic per-Run bearer tokens, and GitHub credentials). *Design note on scoping*: `secrets get` remains unscoped in the controller namespace because the controller creates and reads per-Run Secrets with dynamic names (`discovery-auth-<run>`, `task-auth-<run>-<task>`, `sb-tls-<name>`), and Kubernetes RBAC `resourceNames` cannot express prefixes or wildcards; scoping `secrets get` with `resourceNames` would break dynamic secret retrieval. To reduce blast radius in the future, long-lived credentials (e.g. `github-token`/GitHub App private key, `github-webhook`) can be moved into a dedicated credentials namespace or behind a dedicated ServiceAccount.
    - Core `pods`: `get` (used for image derivation).
    - Core `configmaps`: `get` (scoped to `eval-runner-config`).

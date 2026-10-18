@@ -234,6 +234,19 @@ Future pull requests that introduce an architectural decision should append an e
   - **Baseline Reuse at Batch Granularity**: Baseline runs evaluated on window `1-8` or `9-16` can be reused by multiple candidate runs or PRs without re-evaluation.
   - **No Sandbox Re-attachment**: Sandboxes are cleanly provisioned and deleted per Run lifecycle, eliminating persistent pod leakage and complicated re-attachment protocols.
 
+### ADR-026: Paired Batch Loop Driven by Stopping Rule (Adaptive Paired Batches)
+- **Date**: 2026-10-18
+- **Status**: Accepted
+- **Decision**: Comparisons implement an adaptive paired batch loop bounded by confidence intervals and the stopping rule rather than fixed static budgets:
+  1. `Comparison.spec.sampling {batchSize, maxSamplesPerTask}` configures the loop. When omitted, the controller performs a single-pass comparison over the referenced Runs.
+  2. The initial referenced Runs define batch 1. When both Runs are terminal, the controller concatenates sample scores across all batches, pairs by sample ID, and evaluates `stats.Decide`.
+  3. If a task returns `continue` and has evaluated fewer samples than `maxSamplesPerTask` without dataset exhaustion, the controller spawns a new Run pair windowed to the next contiguous sample range (`[highestPosition + 1, nextEnd]`) evaluating only undecided tasks.
+  4. Runs remain strictly immutable and owned by the Comparison with deterministic names `<comparison>-b<k>-cand` and `-base` looked up idempotently before creation.
+  5. If a batch returns fewer samples than its window, the dataset is marked exhausted and decided with what exists (`inconclusive` if still `continue`), preventing any window from extending past the dataset boundary.
+- **Rationale**:
+  Fulfills Concept §4.2 and §4.5 ("bound the confidence interval, not the budget"). Identical runs (or large regressions/improvements) reach statistical certainty quickly within a few batches and terminate early, saving significant evaluation tokens and compute, while noisy or close comparisons gather additional evidence up to the task sample cap.
+
+
 
 
 

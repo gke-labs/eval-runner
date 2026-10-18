@@ -277,6 +277,9 @@ spec:
 | `baseline` | `ComparisonRunRef` | **Required.** Reference to the baseline `Run` resource in the same namespace (`spec.baseline.run`). |
 | `candidate` | `ComparisonRunRef` | **Required.** Reference to the candidate (e.g. PR) `Run` resource in the same namespace (`spec.candidate.run`). |
 | `equivalenceMargin` | `*float64` | Statistical equivalence margin $\delta$ (default: `0.05` for $\pm 0.05$). |
+| `sampling` | `*ComparisonSamplingSpec` | Optional. Configures adaptive paired batch sampling driven by the stopping rule. When omitted, only the single pair of referenced runs is compared. |
+| `sampling.batchSize` | `int` | Number of samples to evaluate in each subsequent batch (default: `8`). |
+| `sampling.maxSamplesPerTask` | `int` | Maximum total number of samples evaluated per task across all batches (default: `64`). |
 | `tasks` | `[]string` | Optional allow-list of task IDs to evaluate. When omitted, all tasks present in both runs are compared. |
 
 ## Status (`status`)
@@ -286,6 +289,7 @@ spec:
 | `phase` | `ComparisonPhase` | High-level comparison lifecycle phase: `Running`, `Completed`. |
 | `verdict` | `ComparisonVerdict` | Aggregate run-level verdict: `IMPROVED`, `REGRESSED`, `UNCHANGED`, `INCONCLUSIVE`, `RUNNING`. |
 | `pImprovement` | `*float64` | Posterior probability that the candidate is a net improvement across evaluated tasks (range `[0, 1]`). |
+| `batches` | `[]ComparisonBatchStatus` | Records execution state of each paired batch of Runs (`index`, `sampleRange`, `candidateRun`, `baselineRun`, `phase`). |
 | `tasks` | `[]ComparisonTaskStatus` | Per-task paired comparison statistics and labels. |
 | `tasks[].id` | `string` | Unique task identifier (e.g. `triage/runbook_lookup`). |
 | `tasks[].baseRate` | `*float64` | Mean score or success rate on baseline samples. |
@@ -298,6 +302,8 @@ spec:
 | `tasks[].ties` | `int` | Number of pairs where candidate and baseline scored equally. |
 | `tasks[].dropped` | `ComparisonDropped` | Samples dropped without matches (`candidate`, `baseline`). |
 | `tasks[].label` | `ComparisonTaskLabel` | Decision outcome: `improved`, `regressed`, `unchanged`, `inconclusive`, `running`. |
+| `tasks[].samplesRun` | `int` | Total number of samples evaluated for this task across all batches. |
+| `tasks[].decision` | `ComparisonTaskLabel` | Stopping rule decision: `improved`, `regressed`, `unchanged`, `inconclusive`, `continue`. |
 | `summaryPath` | `string` | Storage path or URI where the complete paired table was stored (`comparisons/<name>.json`). |
 | `message` | `string` | Human-readable explanation of the aggregate verdict or failure. |
 

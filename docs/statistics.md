@@ -357,3 +357,51 @@ In this real run:
 3. Because the run contains only `{unchanged, inconclusive}` tasks, `AggregateVerdict` caps the arithmetic mean by $\min_k P(\text{not\_reg}_k)$: $\min(0.38, 0.26) = 0.26$. With $P(\text{not\_reg}) = P(\text{imp})$ for inconclusive tasks (no floor), capping prevents the regression risk of the weak task from being diluted by unchanged tasks. At small $n$, the categorical label and verdict are authoritative and $P$ is a summary.
 4. Surfacing `wins/losses/ties` (`0/1/19`) immediately explains to readers why the confidence interval $[-0.15, +0.00]$ is wide: 19 out of 20 evaluations were ties, so uncertainty stems from the high proportion of tied samples rather than extreme variance.
 
+---
+
+## 5. Adaptive Paired Batch Loop and Stopping Rule
+
+Concept §4.2 and §4.5 dictate that evaluations should **bound the confidence interval, not the budget**. Rather than evaluating an arbitrary static number of samples up front, the `Comparison` controller extends evaluation in paired batches until each task is either statistically decided or capped.
+
+### 5.1 Configuration (`spec.sampling`)
+
+Adaptive batch sampling is enabled by configuring `spec.sampling` on the `Comparison`:
+
+```yaml
+spec:
+  baseline:
+    run: base-run
+  candidate:
+    run: cand-run
+  sampling:
+    batchSize: 8          # Number of samples evaluated per subsequent batch (default: 8)
+    maxSamplesPerTask: 64 # Maximum total samples evaluated per task across all batches (default: 64)
+  equivalenceMargin: 0.05
+```
+
+When `sampling` is omitted, the controller retains single-comparison behavior over the initial pair of referenced Runs without creating additional batches.
+
+### 5.2 Multi-Batch Lifecycle
+
+1. **Batch 1 (Initial Window)**: The referenced `candidate.run` and `baseline.run` serve as batch 1; their `sampleRange` (or `limit`) defines window 1.
+2. **Score Concatenation & Pairing**: For each task, sample scores from all completed batches are concatenated in order. Scores are paired by stable sample ID via `stats.ComparePaired`.
+3. **Stopping Rule Evaluation**: The controller runs `stats.Decide(est, margin, samplesRun, maxSamples, 0, 0)` on the concatenated paired scores.
+4. **Idempotent Batch Spawning**: If any task's decision is `continue` and `samplesRun < maxSamplesPerTask` without dataset exhaustion, the controller creates ONE new Run pair:
+   - Evaluates the next `batchSize` positions after the highest position evaluated so far (`[highestPosition + 1, nextEnd]`).
+   - `tasks` restricted to **only the undecided tasks**; previously decided tasks stop sampling and are excluded.
+   - Owner reference set to the Comparison with deterministic names `<comparison>-b<k>-cand` and `-base` (looked up idempotently before creation).
+   - Runs remain strictly immutable.
+5. **Finalization**: When all tasks have reached a stopping condition, the aggregate verdict is computed across all tasks, results are stored in `status.tasks` and `status.batches`, and GitHub reporting is triggered.
+
+### 5.3 Per-Task Stop Conditions
+
+For each evaluated task, sampling stops as soon as any of the following conditions is satisfied:
+
+1. **Decided**: With at least 8 pairs (`MinPairsToDecide = 8`), the 95% bootstrap confidence interval resolves:
+   - `CI.Lower > 0` $\implies$ `improved`
+   - `CI.Upper < 0` $\implies$ `regressed`
+   - `CI.Lower >= -margin && CI.Upper <= margin` $\implies$ `unchanged`
+2. **Cap Reached**: `samplesRun >= maxSamplesPerTask` without resolving the interval $\implies$ `inconclusive`.
+3. **Dataset Exhaustion**: A batch returns fewer samples than its requested window ($N_{\text{returned}} < \text{end} - \text{start} + 1$). The dataset has no more samples; the task is decided with what exists (`inconclusive` if still `continue`). The controller never issues a window entirely past the last observed sample.
+
+
