@@ -2162,26 +2162,9 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	}
 
 	runVerdict := stats.AggregateVerdict(reports)
-	pImp := runVerdict.PImprovement
-
 	sort.Strings(candFailed)
-
-	capped := false
-	if len(candFailed) > 0 {
-		if runVerdict.Verdict == stats.VerdictUnchanged || runVerdict.Verdict == stats.VerdictImproved {
-			capped = true
-			runVerdict.Verdict = stats.VerdictInconclusive
-			taskWord := "task"
-			if len(candFailed) > 1 {
-				taskWord = "tasks"
-			}
-			runVerdict.Summary = fmt.Sprintf("INCONCLUSIVE: candidate %s failed: %s; otherwise %s", taskWord, github.FormatIDList(candFailed, github.MaxIDList), runVerdict.Summary)
-			if pImp > 0.50 {
-				pImp = 0.50
-				runVerdict.PImprovement = 0.50
-			}
-		}
-	}
+	runVerdict, capped := stats.CapForCandidateFailures(runVerdict, candFailed)
+	pImp := runVerdict.PImprovement
 
 	var unexecutedNotes []string
 	if len(candFailed) > 0 && !capped {

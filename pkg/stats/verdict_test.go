@@ -15,7 +15,9 @@
 package stats
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -354,5 +356,205 @@ func TestAggregateVerdictUnchangedAndInconclusive(t *testing.T) {
 	}
 	if math.Abs(vParity.PImprovement-0.50) > 1e-6 {
 		t.Errorf("PImprovement = %v, want 0.50", vParity.PImprovement)
+	}
+}
+
+func TestCapForCandidateFailures(t *testing.T) {
+	tasks25 := make([]string, 25)
+	for i := 0; i < 25; i++ {
+		tasks25[i] = fmt.Sprintf("task-%02d", i+1)
+	}
+
+	tests := []struct {
+		name        string
+		verdict     RunVerdict
+		failed      []string
+		wantVerdict VerdictType
+		wantP       float64
+		wantSummary string
+		wantCapped  bool
+	}{
+		{
+			name: "empty failed tasks is a no-op with nil",
+			verdict: RunVerdict{
+				Verdict:      VerdictImproved,
+				PImprovement: 0.95,
+				Summary:      "IMPROVED: 1 task(s) improved, 0 unchanged",
+			},
+			failed:      nil,
+			wantVerdict: VerdictImproved,
+			wantP:       0.95,
+			wantSummary: "IMPROVED: 1 task(s) improved, 0 unchanged",
+			wantCapped:  false,
+		},
+		{
+			name: "empty failed tasks is a no-op with empty slice",
+			verdict: RunVerdict{
+				Verdict:      VerdictUnchanged,
+				PImprovement: 0.50,
+				Summary:      "UNCHANGED: all 1 task(s) unchanged",
+			},
+			failed:      []string{},
+			wantVerdict: VerdictUnchanged,
+			wantP:       0.50,
+			wantSummary: "UNCHANGED: all 1 task(s) unchanged",
+			wantCapped:  false,
+		},
+		{
+			name: "UNCHANGED capped to INCONCLUSIVE with single candidate failure",
+			verdict: RunVerdict{
+				Verdict:      VerdictUnchanged,
+				PImprovement: 0.50,
+				Summary:      "UNCHANGED: all 1 task(s) unchanged",
+			},
+			failed:      []string{"docs/task_two"},
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.50,
+			wantSummary: "INCONCLUSIVE: candidate task failed: docs/task_two; otherwise UNCHANGED: all 1 task(s) unchanged",
+			wantCapped:  true,
+		},
+		{
+			name: "UNCHANGED capped to INCONCLUSIVE with multiple candidate failures sorts IDs",
+			verdict: RunVerdict{
+				Verdict:      VerdictUnchanged,
+				PImprovement: 0.50,
+				Summary:      "UNCHANGED: all 2 task(s) unchanged",
+			},
+			failed:      []string{"task-b", "task-a"},
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.50,
+			wantSummary: "INCONCLUSIVE: candidate tasks failed: task-a, task-b; otherwise UNCHANGED: all 2 task(s) unchanged",
+			wantCapped:  true,
+		},
+		{
+			name: "IMPROVED capped to INCONCLUSIVE and P capped to 0.50",
+			verdict: RunVerdict{
+				Verdict:      VerdictImproved,
+				PImprovement: 0.975,
+				Summary:      "IMPROVED: 2 task(s) improved, 0 unchanged",
+			},
+			failed:      []string{"docs/task_two"},
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.50,
+			wantSummary: "INCONCLUSIVE: candidate task failed: docs/task_two; otherwise IMPROVED: 2 task(s) improved, 0 unchanged",
+			wantCapped:  true,
+		},
+		{
+			name: "IMPROVED capped to INCONCLUSIVE with P already <= 0.50 keeps lower P",
+			verdict: RunVerdict{
+				Verdict:      VerdictImproved,
+				PImprovement: 0.40,
+				Summary:      "IMPROVED: 1 task(s) improved, 0 unchanged",
+			},
+			failed:      []string{"docs/task_two"},
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.40,
+			wantSummary: "INCONCLUSIVE: candidate task failed: docs/task_two; otherwise IMPROVED: 1 task(s) improved, 0 unchanged",
+			wantCapped:  true,
+		},
+		{
+			name: "REGRESSED preserved and P untouched",
+			verdict: RunVerdict{
+				Verdict:      VerdictRegressed,
+				PImprovement: 0.04,
+				Summary:      "REGRESSED: 1 task(s) regressed",
+			},
+			failed:      []string{"docs/task_two"},
+			wantVerdict: VerdictRegressed,
+			wantP:       0.04,
+			wantSummary: "REGRESSED: 1 task(s) regressed",
+			wantCapped:  false,
+		},
+		{
+			name: "RUNNING preserved and P untouched",
+			verdict: RunVerdict{
+				Verdict:      VerdictRunning,
+				PImprovement: 0.0,
+				Summary:      "RUNNING: 2 task(s) in progress",
+			},
+			failed:      []string{"docs/task_two"},
+			wantVerdict: VerdictRunning,
+			wantP:       0.0,
+			wantSummary: "RUNNING: 2 task(s) in progress",
+			wantCapped:  false,
+		},
+		{
+			name: "already-INCONCLUSIVE keeps its P and summary",
+			verdict: RunVerdict{
+				Verdict:      VerdictInconclusive,
+				PImprovement: 0.35,
+				Summary:      "INCONCLUSIVE: 1 task(s) inconclusive; more samples recommended",
+			},
+			failed:      []string{"docs/task_two"},
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.35,
+			wantSummary: "INCONCLUSIVE: 1 task(s) inconclusive; more samples recommended",
+			wantCapped:  false,
+		},
+		{
+			name: "UNCHANGED capped with >20 failed tasks truncates with MaxIDList",
+			verdict: RunVerdict{
+				Verdict:      VerdictUnchanged,
+				PImprovement: 0.50,
+				Summary:      "UNCHANGED: all 1 task(s) unchanged",
+			},
+			failed:      tasks25,
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.50,
+			wantSummary: "INCONCLUSIVE: candidate tasks failed: " + strings.Join(tasks25[:20], ", ") + ", ... and 5 more; otherwise UNCHANGED: all 1 task(s) unchanged",
+			wantCapped:  true,
+		},
+		{
+			name: "empty summary handled defensively",
+			verdict: RunVerdict{
+				Verdict:      VerdictUnchanged,
+				PImprovement: 0.50,
+				Summary:      "",
+			},
+			failed:      []string{"task-x"},
+			wantVerdict: VerdictInconclusive,
+			wantP:       0.50,
+			wantSummary: "INCONCLUSIVE: candidate task failed: task-x",
+			wantCapped:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, capped := CapForCandidateFailures(tc.verdict, tc.failed)
+			if got.Verdict != tc.wantVerdict {
+				t.Errorf("Verdict = %v, want %v", got.Verdict, tc.wantVerdict)
+			}
+			if math.Abs(got.PImprovement-tc.wantP) > 1e-6 {
+				t.Errorf("PImprovement = %v, want %v", got.PImprovement, tc.wantP)
+			}
+			if got.Summary != tc.wantSummary {
+				t.Errorf("Summary = %q, want %q", got.Summary, tc.wantSummary)
+			}
+			if capped != tc.wantCapped {
+				t.Errorf("capped = %v, want %v", capped, tc.wantCapped)
+			}
+		})
+	}
+}
+
+func TestFormatIDList(t *testing.T) {
+	if got := FormatIDList(nil, 20); got != "" {
+		t.Errorf("expected empty string for nil, got %q", got)
+	}
+	if got := FormatIDList([]string{}, 20); got != "" {
+		t.Errorf("expected empty string for empty slice, got %q", got)
+	}
+	if got := FormatIDList([]string{"a", "b", "c"}, 20); got != "a, b, c" {
+		t.Errorf("expected 'a, b, c', got %q", got)
+	}
+	items := make([]string, 25)
+	for i := range items {
+		items[i] = fmt.Sprintf("id-%d", i+1)
+	}
+	got25 := FormatIDList(items, 20)
+	want25 := strings.Join(items[:20], ", ") + ", ... and 5 more"
+	if got25 != want25 {
+		t.Errorf("FormatIDList(25, 20) = %q, want %q", got25, want25)
 	}
 }

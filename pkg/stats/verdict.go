@@ -17,6 +17,8 @@ package stats
 import (
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 )
 
 // Verdict determines the overall run-level verdict across a collection of task labels
@@ -203,4 +205,65 @@ func AggregateVerdict(tasks []TaskReport) RunVerdict {
 	}
 
 	return verdict
+}
+
+// MaxIDList is the default maximum number of task IDs displayed in formatted summaries before truncation.
+const MaxIDList = 20
+
+// FormatIDList formats a slice of task IDs, truncating to maxIDs if exceeded,
+// appending an explicit "... and N more" marker.
+func FormatIDList(ids []string, maxIDs int) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	if maxIDs <= 0 || len(ids) <= maxIDs {
+		return strings.Join(ids, ", ")
+	}
+	truncated := ids[:maxIDs]
+	remaining := len(ids) - maxIDs
+	return fmt.Sprintf("%s, ... and %d more", strings.Join(truncated, ", "), remaining)
+}
+
+// CapForCandidateFailures applies the candidate-task-failure verdict cap to an aggregate RunVerdict:
+// If one or more candidate tasks failed (while baseline completed), any UNCHANGED or IMPROVED verdict
+// is capped to INCONCLUSIVE with P(improvement) capped at 0.50.
+//
+// Precedence order: RUNNING > REGRESSED > INCONCLUSIVE (cap) > UNCHANGED > IMPROVED.
+//
+// If the verdict is capped, the summary is prefixed with:
+//
+//	"INCONCLUSIVE: candidate task[s] failed: <ids>; otherwise <original summary>"
+//
+// Returns the updated RunVerdict and a boolean indicating whether the verdict was capped.
+func CapForCandidateFailures(v RunVerdict, failed []string) (RunVerdict, bool) {
+	if len(failed) == 0 {
+		return v, false
+	}
+
+	// RUNNING, REGRESSED, and already-INCONCLUSIVE take precedence over the cap.
+	if v.Verdict != VerdictUnchanged && v.Verdict != VerdictImproved {
+		return v, false
+	}
+
+	failedSorted := append([]string(nil), failed...)
+	sort.Strings(failedSorted)
+
+	taskWord := "task"
+	if len(failedSorted) > 1 {
+		taskWord = "tasks"
+	}
+
+	v.Verdict = VerdictInconclusive
+	if v.Summary != "" {
+		v.Summary = fmt.Sprintf("INCONCLUSIVE: candidate %s failed: %s; otherwise %s",
+			taskWord, FormatIDList(failedSorted, MaxIDList), v.Summary)
+	} else {
+		v.Summary = fmt.Sprintf("INCONCLUSIVE: candidate %s failed: %s",
+			taskWord, FormatIDList(failedSorted, MaxIDList))
+	}
+	if v.PImprovement > 0.50 {
+		v.PImprovement = 0.50
+	}
+
+	return v, true
 }
