@@ -2389,3 +2389,160 @@ func TestHandler_PullRequest_Closed_NotAllowed(t *testing.T) {
 		t.Errorf("expected comparison to still exist, got err: %v", err)
 	}
 }
+
+func TestProcessPullRequestClosed_PreservesSeedRunReusedBySurvivingComparison(t *testing.T) {
+	scheme := newTestScheme()
+
+	// 1. Seed Run for PR 7 that was chosen as baseline for live PR 8
+	reusedRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-7-aaaaaaa",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:      "7",
+				LabelRepo:    "gke-labs_eval-runner",
+				LabelHeadSHA: "aaaaaaa111111122222223333333444444455555",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "evalrunner.gke-labs.dev/v1alpha1",
+					Kind:       "Comparison",
+					Name:       "pr-8",
+					UID:        "pr-8-uid",
+				},
+			},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/gke-labs/eval-runner.git",
+				Commit: "aaaaaaa111111122222223333333444444455555",
+			},
+			Model: "mockllm/model",
+		},
+	}
+
+	// 2. An older seed Run for PR 7 that is NOT reused anywhere
+	unreusedRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-7-oldsha",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:      "7",
+				LabelRepo:    "gke-labs_eval-runner",
+				LabelHeadSHA: "old1111111111122222223333333444444455555",
+			},
+		},
+	}
+
+	// 3. A seed Run for PR 7 that carries an owner reference to live PR 8 (e.g. batch reuse)
+	ownedOnlyRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-7-ownedonly",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "7",
+				LabelRepo: "gke-labs_eval-runner",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "evalrunner.gke-labs.dev/v1alpha1",
+					Kind:       "Comparison",
+					Name:       "pr-8",
+					UID:        "pr-8-uid",
+				},
+			},
+		},
+	}
+
+	// 4. Comparison for PR 7
+	comp7 := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-7",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "7",
+				LabelRepo: "gke-labs_eval-runner",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base-init"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "pr-7-aaaaaaa"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "gke-labs/eval-runner",
+				Number:     7,
+			},
+		},
+	}
+
+	// 5. Live Comparison for PR 8 that uses pr-7-aaaaaaa as its baseline
+	comp8 := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-8",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "8",
+				LabelRepo: "gke-labs_eval-runner",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "pr-7-aaaaaaa"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "pr-8-bbbbbbb"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "gke-labs/eval-runner",
+				Number:     8,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(reusedRun, unreusedRun, ownedOnlyRun, comp7, comp8).
+		WithStatusSubresource(reusedRun, unreusedRun, ownedOnlyRun, comp7, comp8).
+		Build()
+
+	cfg := Config{
+		Namespace: "eval-runner",
+		Client:    cl,
+	}
+	wp := NewWorkerPool(cfg)
+
+	item := &PullRequestWorkItem{
+		Action:     ActionClosed,
+		PRNumber:   7,
+		TargetRepo: "gke-labs/eval-runner",
+	}
+
+	if err := wp.ProcessPullRequestClosed(t.Context(), item); err != nil {
+		t.Fatalf("ProcessPullRequestClosed failed: %v", err)
+	}
+
+	// comp7 must be deleted
+	var checkComp7 v1alpha1.Comparison
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-7"}, &checkComp7); !apierrors.IsNotFound(err) {
+		t.Errorf("expected comparison pr-7 to be deleted, got err: %v", err)
+	}
+
+	// unreusedRun must be deleted
+	var checkOldRun v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-7-oldsha"}, &checkOldRun); !apierrors.IsNotFound(err) {
+		t.Errorf("expected unreused seed run pr-7-oldsha to be deleted, got err: %v", err)
+	}
+
+	// reusedRun (pr-7-aaaaaaa) MUST BE PRESERVED because pr-8 is a live comparison referencing it as baseline
+	var checkReusedRun v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-7-aaaaaaa"}, &checkReusedRun); err != nil {
+		t.Fatalf("expected reused seed run pr-7-aaaaaaa to be preserved for surviving comparison pr-8, got err: %v", err)
+	}
+
+	// ownedOnlyRun (pr-7-ownedonly) MUST BE PRESERVED because it carries an owner reference to surviving comparison pr-8
+	var checkOwnedOnlyRun v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-7-ownedonly"}, &checkOwnedOnlyRun); err != nil {
+		t.Fatalf("expected seed run pr-7-ownedonly with owner reference to pr-8 to be preserved, got err: %v", err)
+	}
+
+	// comp8 must be preserved
+	var checkComp8 v1alpha1.Comparison
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-8"}, &checkComp8); err != nil {
+		t.Errorf("expected comparison pr-8 to be preserved, got err: %v", err)
+	}
+}

@@ -137,7 +137,7 @@ The `eval-runner-webhook` service (image `eval-runner-webhook`) receives GitHub 
 - **Signature verification**: Validates HMAC-SHA256 (`X-Hub-Signature-256`) against Secret `eval-runner/github-webhook` before JSON parsing.
 - **Fail-closed allow-list**: Filters events against a configured repository allow-list.
 - **Asynchronous bounded queue**: Decouples HTTP receipt from Kubernetes client operations using an in-memory bounded queue, responding to GitHub within 10 seconds.
-- **Deterministic resource creation**: On `pull_request` (opened, synchronize) and `push` events, creates candidate Run `pr-<num>-<headSHA7>`, baseline Run `base-<baseSHA7>`, and Comparison `pr-<num>`. Reuses existing Completed baseline Runs targeting the same commit and model across PRs.
+- **Deterministic resource creation & cleanup**: On `pull_request` (opened, synchronize, reopened) and `push` events, creates candidate Run `pr-<num>-<headSHA7>`, baseline Run `base-<baseSHA7>`, and Comparison `pr-<num>`. Reuses existing Completed baseline Runs targeting the same commit and model across PRs. On `pull_request` (`closed`), deletes the PR's Comparison(s) (owned batch Runs are deleted via Kubernetes owner references) and seed candidate Runs (unless referenced by a surviving live Comparison), while preserving baseline Runs for cache reuse across PRs; if reopened, resources are recreated on the next `pull_request` event. Note that artifacts in the artifact sink (GCS/local) are not purged by PR closure or TTL.
 
 ### Web Dashboard UI (`cmd/eval-runner-ui`)
 
@@ -376,13 +376,14 @@ The trust model establishes strict boundaries around untrusted repository code:
 - **Network reachability and egress**: Sandbox pod network egress is currently standard container network egress to allow cloning repositories from Git (e.g. over HTTP/HTTPS or Git protocol). Restricting egress to only declared task resources is a follow-up (tracked in issue [#33](https://github.com/gke-labs/eval-runner/issues/33)).
 - **Memory and API protection**: Even if `.evals/list` attempts a denial-of-service by printing gigabytes of output, `pkg/sandboxclient` owns limits on all sandbox communications: exec streams are capped via `LimitWriter` (1 MiB stdout, 64 KiB stderr defaults), gRPC receive size is bounded with headroom (mapping gRPC `ResourceExhausted` to typed limit errors), and REST file reads are capped (10 MiB default via `io.LimitReader`). The reconciler interprets typed `LimitError` failures without duplicate size checks. This guarantees that the controller is protected against memory exhaustion and status updates to the Kubernetes API server never exceed etcd's ~1.5 MiB request limit.
 
-### Controller RBAC Permissions
+### Controller and Webhook RBAC Permissions
 
-The controller uses strictly namespaced RBAC with **no ClusterRole**:
+The components use strictly namespaced RBAC with **no ClusterRole**:
 
 1. **In namespace `eval-runner` (Role `eval-runner-controller`)**:
    - `evalrunner.gke-labs.dev/runs`: `get`, `list`, `watch`, `create`, `update`, `patch` (`create` allows spawning batch Runs; no `delete`, owner references handle GC).
-   - `evalrunner.gke-labs.dev/runs/status`, `comparisons`, and `comparisons/status`: `get`, `list`, `watch`, `update`, `patch`.
+   - `evalrunner.gke-labs.dev/comparisons`: `get`, `list`, `watch`, `update`, `patch`, `delete` (`delete` allows deleting expired Completed Comparisons when `comparisonTTL` is configured; owned batch Runs are garbage-collected via owner references).
+   - `evalrunner.gke-labs.dev/runs/status` and `comparisons/status`: `get`, `list`, `watch`, `update`, `patch`.
    - Core `secrets`: `get`, `create`, `delete` (used for controller CA keypair, dynamic per-Run bearer tokens, and GitHub credentials). *Design note on scoping*: `secrets get` remains unscoped in the controller namespace because the controller creates and reads per-Run Secrets with dynamic names (`discovery-auth-<run>`, `task-auth-<run>-<task>`, `sb-tls-<name>`), and Kubernetes RBAC `resourceNames` cannot express prefixes or wildcards; scoping `secrets get` with `resourceNames` would break dynamic secret retrieval. To reduce blast radius in the future, long-lived credentials (e.g. `github-token`/GitHub App private key, `github-webhook`) can be moved into a dedicated credentials namespace or behind a dedicated ServiceAccount.
    - Core `pods`: `get` (used for image derivation).
    - Core `configmaps`: `get` (scoped to `eval-runner-config`).
@@ -391,8 +392,11 @@ The controller uses strictly namespaced RBAC with **no ClusterRole**:
    - Core `pods`: `get`, `list`, `watch` (used to look up sandbox pod IP addresses; `pods/exec` is dropped).
    - Core `configmaps`: `get`, `create`, `update` (used to publish public CA certificate `sandbox-ca`).
    - Core `secrets`: `get`, `create`, `delete` (used for per-sandbox server cert Secrets and reading optional `model-credentials`).
+3. **In namespace `eval-runner` (Role `eval-runner-webhook`)**:
+   - `evalrunner.gke-labs.dev/runs` and `comparisons`: `get`, `list`, `create`, `update`, `delete` (`create`/`update` allow creating Runs and Comparisons on PR open/sync; `delete` allows cleaning up Comparisons and seed candidate Runs when a pull request closes, while baseline Runs are preserved; owned batch Runs cascade via owner references).
+   - Core `secrets`: `get` scoped to `github-token` and `github-app` (for comment command authorization) and `github-webhook` (for HMAC verification).
 
-The controller cannot create, read, or modify resources in any other namespace.
+The controller and webhook cannot create, read, or modify resources in any other namespace.
 
 ---
 

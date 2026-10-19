@@ -165,6 +165,7 @@ func (wp *WorkerPool) ProcessPullRequestClosed(ctx context.Context, item *PullRe
 	}
 
 	candRunNames := make(map[string]bool)
+	deletedComparisonNames := make(map[string]bool)
 	var deletedComparisons int
 	for i := range compList.Items {
 		comp := &compList.Items[i]
@@ -185,7 +186,25 @@ func (wp *WorkerPool) ProcessPullRequestClosed(ctx context.Context, item *PullRe
 		if err := wp.cfg.Client.Delete(ctx, comp, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete comparison %s/%s for PR #%d: %w", comp.Namespace, comp.Name, prNum, err)
 		}
+		deletedComparisonNames[comp.Name] = true
 		deletedComparisons++
+	}
+
+	// Find any baseline Runs referenced by surviving Comparisons in the namespace so they are not deleted out from under them.
+	survivingBaselineRuns := make(map[string]bool)
+	var allComps v1alpha1.ComparisonList
+	var compListOpts []client.ListOption
+	if ns != "" {
+		compListOpts = append(compListOpts, client.InNamespace(ns))
+	}
+	if err := wp.cfg.Client.List(ctx, &allComps, compListOpts...); err != nil {
+		return fmt.Errorf("failed to list surviving comparisons: %w", err)
+	}
+	for i := range allComps.Items {
+		c := &allComps.Items[i]
+		if !deletedComparisonNames[c.Name] && c.Spec.Baseline.Run != "" {
+			survivingBaselineRuns[c.Spec.Baseline.Run] = true
+		}
 	}
 
 	// 2. Label-select seed Runs created by the webhook for the PR head and delete them.
@@ -209,6 +228,24 @@ func (wp *WorkerPool) ProcessPullRequestClosed(ctx context.Context, item *PullRe
 			(sanitizedCandRepo != "" && run.Labels[LabelRepo] == sanitizedCandRepo)
 
 		if !isMatch {
+			continue
+		}
+
+		// Guard: skip Runs referenced as baseline by a surviving Comparison,
+		// or carrying an owner reference to a Comparison not deleted in this call.
+		if survivingBaselineRuns[run.Name] {
+			log.Printf("preserving seed run %s/%s: referenced as baseline by surviving comparison", run.Namespace, run.Name)
+			continue
+		}
+		var ownedBySurvivingComp bool
+		for _, ref := range run.OwnerReferences {
+			if (ref.Kind == "Comparison" || ref.Kind == "") && !deletedComparisonNames[ref.Name] {
+				ownedBySurvivingComp = true
+				break
+			}
+		}
+		if ownedBySurvivingComp {
+			log.Printf("preserving seed run %s/%s: carries owner reference to surviving comparison", run.Namespace, run.Name)
 			continue
 		}
 

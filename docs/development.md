@@ -656,15 +656,21 @@ When an event arrives:
    - **Baseline Run**: `base-<baseSHA7>` (evaluates merge target commit with initial `sampleRange {1, defaultBatchSize}`). If an already `Completed` Run with that commit, repo URL, and model exists, it is reused immediately (baseline cache from concept §4.1).
    - **Comparison**: `pr-<number>` linking candidate and baseline runs with `spec.pullRequest` and `spec.sampling {batchSize: defaultBatchSize, maxSamplesPerTask: defaultMaxSamplesPerTask}` configured.
    - **Redelivery & Synchronize**: Redelivery of the same event is idempotent and makes no duplicate objects. A `synchronize` event creates the new candidate Run `pr-<number>-<newHead7>`, keeps previous candidate Runs in place (they are not deleted, preserving execution history), and updates `spec.candidate.run` and `spec.pullRequest.headSHA` on the existing Comparison.
-2. **On `push` to the default branch**:
+2. **On `pull_request` (`closed`)**:
+   - **Cleanup**: Label-selects the Comparison(s) matching `evalrunner.gke-labs.dev/pr` and `spec.pullRequest.repository` and deletes them; their owned batch Runs cascade via Kubernetes owner references.
+   - **Seed Runs**: Deletes seed candidate Runs for the PR head. If a seed Run carries an owner reference to a surviving live Comparison or is referenced as `spec.baseline.run` by another surviving Comparison (e.g. stacked branches or fast-forward merges), it is preserved.
+   - **Baseline Runs**: Preserved for reuse across PRs.
+   - **Reopen**: If a closed PR is subsequently reopened, resources are recreated on the next `pull_request` event.
+   - **Artifacts**: Artifacts stored in the artifact sink (GCS or local directory) are not purged by PR closure.
+3. **On `push` to the default branch**:
    - **Warm Baseline Run**: `base-<sha7>` is created with initial `sampleRange {1, defaultBatchSize}` so the baseline run is pre-warmed before PRs arrive.
-3. **On `issue_comment` (`created`)**:
+4. **On `issue_comment` (`created`)**:
    - **More Samples Command**: Comments of the form `/eval more <n>` on a pull request trigger evaluation of additional samples.
    - **Authorization**: The author must have write or admin access per the GitHub collaborator permission API, or be listed in the `commandUsers` ConfigMap allow-list. Unauthorized authors receive HTTP 403 Forbidden.
    - **Bounding**: The requested sample count $n$ is bounded by `defaultMaxSamplesPerTask`.
    - **Action**: Increments `spec.extraSamples` on the existing PR Comparison by $n$, scheduling additional adaptive paired batches.
    - **Acknowledgment & Idempotency**: Acknowledges the comment with a GitHub reaction (`eyes` or `+1`) or short comment. Comment IDs are stored in the Comparison annotation `evalrunner.gke-labs.dev/handled-comments`, ensuring redeliveries are strictly idempotent.
-4. **Labels**:
+5. **Labels**:
    All created resources are labeled with:
    - `evalrunner.gke-labs.dev/pr`: PR number (for PR runs and comparisons)
    - `evalrunner.gke-labs.dev/repo`: Sanitized repository identifier (e.g. `owner_name`)
