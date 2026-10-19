@@ -601,6 +601,24 @@ func (h *Harness) WaitForComparisonDeleted(namespace, compName string, timeout t
 	}
 }
 
+// WaitForRunsWithLabelDeleted waits until no Runs matching the label selector remain in the namespace.
+func (h *Harness) WaitForRunsWithLabelDeleted(namespace, selector string, timeout time.Duration) {
+	h.t.Logf("Waiting for Runs in %s matching %q to be deleted (timeout %v)", namespace, selector, timeout)
+	start := time.Now()
+	for {
+		cmd := exec.Command("kubectl", "get", "run", "-n", namespace, "-l", selector, "--no-headers", "--ignore-not-found")
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) == "" {
+			return
+		}
+
+		if time.Since(start) > timeout {
+			h.t.Fatalf("Timeout waiting for Runs in %s matching %q to be deleted; current: %s", namespace, selector, strings.TrimSpace(string(out)))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (h *Harness) WaitForComparisonVerdict(namespace, compName, expectedVerdict string, timeout time.Duration) *v1alpha1.Comparison {
 	h.t.Logf("Waiting for Comparison %s/%s to reach verdict %s (timeout %v)", namespace, compName, expectedVerdict, timeout)
 	start := time.Now()

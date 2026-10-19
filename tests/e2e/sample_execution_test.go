@@ -31,6 +31,7 @@ import (
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/pkg/artifacts"
+	"github.com/gke-labs/eval-runner/pkg/controller"
 	"github.com/gke-labs/eval-runner/pkg/discovery"
 )
 
@@ -597,8 +598,29 @@ spec:
 		compBaseRun := "gcs-batch-base"
 		samplingCompName := "gcs-sampling-comp"
 
-		harness.runCmd("kubectl", "delete", "run", compCandRun, compBaseRun, fmt.Sprintf("%s-b2-cand", samplingCompName), fmt.Sprintf("%s-b2-base", samplingCompName), "-n", "eval-runner", "--ignore-not-found")
+		// Batch Runs created by the controller carry this label; select them by it rather than by
+		// name so b2/b3 (and any further) batch Runs are covered.
+		samplingBatchSelector := fmt.Sprintf("%s=%s", controller.LabelComparison, samplingCompName)
+
 		harness.runCmd("kubectl", "delete", "comparison", samplingCompName, "-n", "eval-runner", "--ignore-not-found")
+		harness.runCmd("kubectl", "delete", "run", compCandRun, compBaseRun, "-n", "eval-runner", "--ignore-not-found")
+		harness.runCmd("kubectl", "delete", "run", "-n", "eval-runner", "-l", samplingBatchSelector, "--ignore-not-found")
+
+		// The objects created below live in the fake-gcs sink (gs:// log paths). The completed
+		// baseline batch Runs also carry the batch-key label, so once the sink is restored to
+		// LocalDir a later sampling Comparison (SamplingPairedBatchLoop) would reuse them by label
+		// and stall on the commit-prefix check (see #212). Delete them, and wait until they are
+		// gone, before the sink is restored. t.Cleanup runs LIFO, so registering this after the
+		// ConfigureLocalDirSink cleanup above guarantees the ordering, including on test failure.
+		t.Cleanup(func() {
+			harness.runCmd("kubectl", "delete", "comparison", samplingCompName, "-n", "eval-runner", "--ignore-not-found", "--wait=false")
+			harness.runCmd("kubectl", "delete", "run", compCandRun, compBaseRun, "-n", "eval-runner", "--ignore-not-found", "--wait=false")
+			harness.runCmd("kubectl", "delete", "run", "-n", "eval-runner", "-l", samplingBatchSelector, "--ignore-not-found", "--wait=false")
+			harness.WaitForComparisonDeleted("eval-runner", samplingCompName, 60*time.Second)
+			harness.WaitForRunDeleted("eval-runner", compCandRun, 60*time.Second)
+			harness.WaitForRunDeleted("eval-runner", compBaseRun, 60*time.Second)
+			harness.WaitForRunsWithLabelDeleted("eval-runner", samplingBatchSelector, 60*time.Second)
+		})
 
 		compCandManifest := fmt.Sprintf(`
 apiVersion: evalrunner.gke-labs.dev/v1alpha1
