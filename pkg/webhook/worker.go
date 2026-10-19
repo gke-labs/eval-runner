@@ -122,6 +122,9 @@ func (wp *WorkerPool) ProcessItem(ctx context.Context, item WorkItem) error {
 	switch item.Event {
 	case EventPullRequest:
 		if item.PullRequest != nil {
+			if item.PullRequest.Action == ActionClosed {
+				return wp.ProcessPullRequestClosed(ctx, item.PullRequest)
+			}
 			return wp.ProcessPullRequest(ctx, item.PullRequest)
 		}
 	case EventPush:
@@ -131,6 +134,91 @@ func (wp *WorkerPool) ProcessItem(ctx context.Context, item WorkItem) error {
 	default:
 		log.Printf("worker: unsupported work item event %q", item.Event)
 	}
+	return nil
+}
+
+// ProcessPullRequestClosed cleans up Comparisons and seed Runs when a pull request closes.
+// Baseline Runs are preserved for cache reuse. Owned batch Runs are cleaned up via
+// Kubernetes owner references cascading from the Comparison deletion.
+func (wp *WorkerPool) ProcessPullRequestClosed(ctx context.Context, item *PullRequestWorkItem) error {
+	if item == nil || wp.cfg.Client == nil {
+		return nil
+	}
+
+	ns := wp.cfg.Namespace
+	if ns == "" {
+		ns = DefaultNamespace
+	}
+	prNum := item.PRNumber
+	prNumStr := strconv.Itoa(prNum)
+	targetRepo := item.TargetRepo
+
+	// 1. Label-select Comparisons for that PR and delete them.
+	// Check spec.pullRequest.repository as well as number (see #163).
+	var compList v1alpha1.ComparisonList
+	opts := []client.ListOption{client.MatchingLabels{LabelPR: prNumStr}}
+	if ns != "" {
+		opts = append(opts, client.InNamespace(ns))
+	}
+	if err := wp.cfg.Client.List(ctx, &compList, opts...); err != nil {
+		return fmt.Errorf("failed to list comparisons for PR #%d: %w", prNum, err)
+	}
+
+	candRunNames := make(map[string]bool)
+	var deletedComparisons int
+	for i := range compList.Items {
+		comp := &compList.Items[i]
+		if comp.Spec.PullRequest == nil {
+			continue
+		}
+		if comp.Spec.PullRequest.Number != prNum {
+			continue
+		}
+		if targetRepo != "" && !strings.EqualFold(comp.Spec.PullRequest.Repository, targetRepo) {
+			continue
+		}
+
+		if comp.Spec.Candidate.Run != "" {
+			candRunNames[comp.Spec.Candidate.Run] = true
+		}
+
+		if err := wp.cfg.Client.Delete(ctx, comp, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete comparison %s/%s for PR #%d: %w", comp.Namespace, comp.Name, prNum, err)
+		}
+		deletedComparisons++
+	}
+
+	// 2. Label-select seed Runs created by the webhook for the PR head and delete them.
+	// Baseline Runs do not carry LabelPR and are preserved.
+	var runList v1alpha1.RunList
+	if err := wp.cfg.Client.List(ctx, &runList, opts...); err != nil {
+		return fmt.Errorf("failed to list runs for PR #%d: %w", prNum, err)
+	}
+
+	sanitizedTargetRepo := SanitizeLabelValue(targetRepo)
+	var sanitizedCandRepo string
+	if item.CandidateRepo != "" {
+		sanitizedCandRepo = SanitizeLabelValue(item.CandidateRepo)
+	}
+
+	var deletedRuns int
+	for i := range runList.Items {
+		run := &runList.Items[i]
+		isMatch := candRunNames[run.Name] ||
+			(sanitizedTargetRepo != "" && run.Labels[LabelRepo] == sanitizedTargetRepo) ||
+			(sanitizedCandRepo != "" && run.Labels[LabelRepo] == sanitizedCandRepo)
+
+		if !isMatch {
+			continue
+		}
+
+		if err := wp.cfg.Client.Delete(ctx, run); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete seed run %s/%s for PR #%d: %w", run.Namespace, run.Name, prNum, err)
+		}
+		deletedRuns++
+	}
+
+	log.Printf("closed PR #%d for %s: deleted %d comparison(s) and %d seed run(s)", prNum, targetRepo, deletedComparisons, deletedRuns)
 	return nil
 }
 

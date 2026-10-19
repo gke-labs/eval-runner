@@ -212,6 +212,65 @@ func runWebhookSmoke(t *testing.T, harness *Harness) {
 	if updatedComp.Spec.ExtraSamples != 8 {
 		t.Errorf("expected comparison ExtraSamples=8, got %d", updatedComp.Spec.ExtraSamples)
 	}
+
+	// 8. Post signed pull_request closed event and assert Comparison and Candidate Run are deleted while Baseline Run is preserved
+	closedPayload := []byte(`{
+		"action": "closed",
+		"number": 305,
+		"pull_request": {
+			"number": 305,
+			"head": {
+				"sha": "aaaaaaa111111122222223333333444444455555",
+				"ref": "feature",
+				"repo": {
+					"full_name": "contributor-fork/eval-runner",
+					"name": "eval-runner",
+					"owner": {"login": "contributor-fork"}
+				}
+			},
+			"base": {
+				"sha": "bbbbbbb111111122222223333333444444455555",
+				"ref": "main",
+				"repo": {
+					"full_name": "gke-labs/eval-runner",
+					"name": "eval-runner",
+					"owner": {"login": "gke-labs"}
+				}
+			}
+		},
+		"repository": {
+			"full_name": "gke-labs/eval-runner",
+			"name": "eval-runner",
+			"owner": {"login": "gke-labs"}
+		}
+	}`)
+	closedSig := webhook.ComputeSignature(closedPayload, webhookSecret)
+
+	reqClosed, err := http.NewRequest(http.MethodPost, baseURL+"/webhook", bytes.NewReader(closedPayload))
+	if err != nil {
+		t.Fatalf("failed to create closed pull_request webhook HTTP request: %v", err)
+	}
+	reqClosed.Header.Set("Content-Type", "application/json")
+	reqClosed.Header.Set(webhook.HeaderGitHubEvent, webhook.EventPullRequest)
+	reqClosed.Header.Set(webhook.HeaderHubSignature256, closedSig)
+	reqClosed.Header.Set(webhook.HeaderGitHubDelivery, "e2e-smoke-closed-delivery")
+
+	closedResp, err := http.DefaultClient.Do(reqClosed)
+	if err != nil {
+		t.Fatalf("failed to POST closed pull_request webhook payload: %v", err)
+	}
+	closedRespBody, _ := io.ReadAll(closedResp.Body)
+	closedResp.Body.Close()
+	if closedResp.StatusCode != http.StatusOK {
+		t.Fatalf("closed pull_request webhook returned status %d: %s", closedResp.StatusCode, string(closedRespBody))
+	}
+
+	// 9. Assert Comparison and Candidate Run are deleted; Baseline Run is preserved
+	harness.WaitForComparisonDeleted("eval-runner", compName, 30*time.Second)
+	harness.WaitForRunDeleted("eval-runner", candRunName, 30*time.Second)
+
+	// Baseline Run must be preserved for future PR reuse
+	_ = harness.WaitForRunExists("eval-runner", baseRunName, 5*time.Second)
 }
 
 // TestWebhookSmoke is retained for backwards compatibility with `go test -run TestWebhookSmoke`.

@@ -212,6 +212,7 @@ rules:
   - list
   - create
   - update
+  - delete
 - apiGroups:
   - ""
   resources:

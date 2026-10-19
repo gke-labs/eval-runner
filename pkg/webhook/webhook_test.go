@@ -29,6 +29,7 @@ import (
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/pkg/github"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -2004,5 +2005,387 @@ func TestHandler_IssueComment_IdempotentOnRedelivery(t *testing.T) {
 	// Reactions must remain 1 (NOT reacted again)
 	if len(fakeGH.CommentReactions(3001)) != 1 {
 		t.Errorf("expected reactions count to remain 1 on redelivery, got %d", len(fakeGH.CommentReactions(3001)))
+	}
+}
+
+func TestHandler_PullRequest_Closed(t *testing.T) {
+	secretKey := []byte("test-secret-key-12345")
+	scheme := newTestScheme()
+
+	// 1. Seed objects for PR 105 on gke-labs/eval-runner
+	candRun105 := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-105-aaaaaaa",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:      "105",
+				LabelRepo:    "gke-labs_eval-runner",
+				LabelHeadSHA: "aaaaaaa111111122222223333333444444455555",
+			},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/gke-labs/eval-runner.git",
+				Commit: "aaaaaaa111111122222223333333444444455555",
+			},
+			Model: "mockllm/model",
+		},
+	}
+
+	baseRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "base-bbbbbbb",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelRepo:    "gke-labs_eval-runner",
+				LabelHeadSHA: "bbbbbbb111111122222223333333444444455555",
+			},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/gke-labs/eval-runner.git",
+				Commit: "bbbbbbb111111122222223333333444444455555",
+			},
+			Model: "mockllm/model",
+		},
+	}
+
+	comp105 := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-105",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:      "105",
+				LabelRepo:    "gke-labs_eval-runner",
+				LabelHeadSHA: "aaaaaaa111111122222223333333444444455555",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base-bbbbbbb"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "pr-105-aaaaaaa"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "gke-labs/eval-runner",
+				Number:     105,
+				HeadSHA:    "aaaaaaa111111122222223333333444444455555",
+				BaseSHA:    "bbbbbbb111111122222223333333444444455555",
+			},
+		},
+	}
+
+	// 2. Objects for a different PR (PR 200) on the same repo
+	candRun200 := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-200-xxxxxxx",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "200",
+				LabelRepo: "gke-labs_eval-runner",
+			},
+		},
+	}
+	comp200 := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-200",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "200",
+				LabelRepo: "gke-labs_eval-runner",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base-bbbbbbb"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "pr-200-xxxxxxx"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "gke-labs/eval-runner",
+				Number:     200,
+			},
+		},
+	}
+
+	// 3. Objects for PR 105 on a different repo (testing #163 isolation)
+	candRunOther := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-105-other-cand",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "105",
+				LabelRepo: "other-org_other-repo",
+			},
+		},
+	}
+	compOther := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-105-other",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "105",
+				LabelRepo: "other-org_other-repo",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base-bbbbbbb"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "pr-105-other-cand"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "other-org/other-repo",
+				Number:     105,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(candRun105, baseRun, comp105, candRun200, comp200, candRunOther, compOther).
+		WithStatusSubresource(candRun105, baseRun, comp105, candRun200, comp200, candRunOther, compOther).
+		Build()
+
+	cfg := Config{
+		Namespace:           "eval-runner",
+		StaticWebhookSecret: secretKey,
+		WebhookRepositories: []string{"gke-labs/eval-runner", "other-org/other-repo"},
+		Client:              cl,
+	}
+
+	server := NewServer(cfg)
+	server.Start()
+	defer server.Stop()
+
+	closedPayload := []byte(`{
+		"action": "closed",
+		"number": 105,
+		"pull_request": {
+			"number": 105,
+			"head": {
+				"sha": "aaaaaaa111111122222223333333444444455555",
+				"ref": "feature",
+				"repo": {
+					"full_name": "gke-labs/eval-runner",
+					"name": "eval-runner",
+					"owner": {"login": "gke-labs"}
+				}
+			},
+			"base": {
+				"sha": "bbbbbbb111111122222223333333444444455555",
+				"ref": "main",
+				"repo": {
+					"full_name": "gke-labs/eval-runner",
+					"name": "eval-runner",
+					"owner": {"login": "gke-labs"}
+				}
+			}
+		},
+		"repository": {
+			"full_name": "gke-labs/eval-runner",
+			"name": "eval-runner",
+			"owner": {"login": "gke-labs"}
+		}
+	}`)
+
+	sig := ComputeSignature(closedPayload, secretKey)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(closedPayload))
+	req.Header.Set(HeaderGitHubEvent, EventPullRequest)
+	req.Header.Set(HeaderHubSignature256, sig)
+	rr := httptest.NewRecorder()
+
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for closed PR, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Poll until Comparison pr-105 is deleted
+	pollUntil(t, 2*time.Second, func() bool {
+		var c v1alpha1.Comparison
+		return apierrors.IsNotFound(cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-105"}, &c))
+	})
+
+	// Verify candidate run pr-105-aaaaaaa is deleted
+	var cand v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-105-aaaaaaa"}, &cand); !apierrors.IsNotFound(err) {
+		t.Errorf("expected candidate run pr-105-aaaaaaa to be deleted, got err: %v", err)
+	}
+
+	// Verify baseline run base-bbbbbbb is preserved
+	var bRun v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "base-bbbbbbb"}, &bRun); err != nil {
+		t.Errorf("expected baseline run base-bbbbbbb to be preserved, got err: %v", err)
+	}
+
+	// Verify PR 200 objects are preserved
+	var c200 v1alpha1.Comparison
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-200"}, &c200); err != nil {
+		t.Errorf("expected PR 200 comparison to be preserved, got err: %v", err)
+	}
+	var cand200 v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-200-xxxxxxx"}, &cand200); err != nil {
+		t.Errorf("expected PR 200 candidate run to be preserved, got err: %v", err)
+	}
+
+	// Verify other repo's PR 105 objects are preserved
+	var cOther v1alpha1.Comparison
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-105-other"}, &cOther); err != nil {
+		t.Errorf("expected other repo PR 105 comparison to be preserved, got err: %v", err)
+	}
+	var candOther v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-105-other-cand"}, &candOther); err != nil {
+		t.Errorf("expected other repo PR 105 candidate run to be preserved, got err: %v", err)
+	}
+}
+
+func TestProcessPullRequestClosed_ForkAndIdempotent(t *testing.T) {
+	scheme := newTestScheme()
+
+	// Fork PR seed run with LabelRepo = sanitized fork repo
+	forkRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-55-fork123",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "55",
+				LabelRepo: "contributor-fork_eval-runner",
+			},
+		},
+	}
+
+	baseRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "base-shared",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelRepo: "gke-labs_eval-runner",
+			},
+		},
+	}
+
+	comp := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-55",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "55",
+				LabelRepo: "gke-labs_eval-runner",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base-shared"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "pr-55-fork123"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "gke-labs/eval-runner",
+				Number:     55,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(forkRun, baseRun, comp).
+		WithStatusSubresource(forkRun, baseRun, comp).
+		Build()
+
+	cfg := Config{
+		Namespace: "eval-runner",
+		Client:    cl,
+	}
+	wp := NewWorkerPool(cfg)
+
+	item := &PullRequestWorkItem{
+		Action:        ActionClosed,
+		PRNumber:      55,
+		CandidateRepo: "contributor-fork/eval-runner",
+		TargetRepo:    "gke-labs/eval-runner",
+	}
+
+	// First call deletes comparison and fork seed run
+	if err := wp.ProcessPullRequestClosed(t.Context(), item); err != nil {
+		t.Fatalf("ProcessPullRequestClosed failed: %v", err)
+	}
+
+	var checkComp v1alpha1.Comparison
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-55"}, &checkComp); !apierrors.IsNotFound(err) {
+		t.Errorf("expected comparison to be deleted, got err: %v", err)
+	}
+
+	var checkForkRun v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-55-fork123"}, &checkForkRun); !apierrors.IsNotFound(err) {
+		t.Errorf("expected fork candidate run to be deleted, got err: %v", err)
+	}
+
+	var checkBaseRun v1alpha1.Run
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "base-shared"}, &checkBaseRun); err != nil {
+		t.Errorf("expected baseline run to be preserved, got err: %v", err)
+	}
+
+	// Second call (idempotency / redelivery) must succeed without error
+	if err := wp.ProcessPullRequestClosed(t.Context(), item); err != nil {
+		t.Errorf("second call to ProcessPullRequestClosed should succeed idempotently, got: %v", err)
+	}
+}
+
+func TestHandler_PullRequest_Closed_NotAllowed(t *testing.T) {
+	secretKey := []byte("secret")
+	scheme := newTestScheme()
+
+	comp := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-99",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelPR:   "99",
+				LabelRepo: "unauthorized_repo",
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: "base"},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "cand"},
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "unauthorized/repo",
+				Number:     99,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(comp).
+		WithStatusSubresource(comp).
+		Build()
+
+	cfg := Config{
+		Namespace:           "eval-runner",
+		StaticWebhookSecret: secretKey,
+		WebhookRepositories: []string{"allowed/repo"},
+		Client:              cl,
+	}
+
+	server := NewServer(cfg)
+
+	closedPayload := []byte(`{
+		"action": "closed",
+		"number": 99,
+		"pull_request": {
+			"number": 99
+		},
+		"repository": {
+			"full_name": "unauthorized/repo",
+			"name": "repo",
+			"owner": {"login": "unauthorized"}
+		}
+	}`)
+
+	sig := ComputeSignature(closedPayload, secretKey)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(closedPayload))
+	req.Header.Set(HeaderGitHubEvent, EventPullRequest)
+	req.Header.Set(HeaderHubSignature256, sig)
+	rr := httptest.NewRecorder()
+
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "ignored: repository not in allow-list") {
+		t.Errorf("expected ignored response, got %s", rr.Body.String())
+	}
+
+	var checkComp v1alpha1.Comparison
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "pr-99"}, &checkComp); err != nil {
+		t.Errorf("expected comparison to still exist, got err: %v", err)
 	}
 }

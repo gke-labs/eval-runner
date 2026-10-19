@@ -525,6 +525,23 @@ func (h *Harness) WaitForRunDeleted(namespace, runName string, timeout time.Dura
 	}
 }
 
+func (h *Harness) WaitForComparisonDeleted(namespace, compName string, timeout time.Duration) {
+	h.t.Logf("Waiting for Comparison %s/%s to be deleted (timeout %v)", namespace, compName, timeout)
+	start := time.Now()
+	for {
+		cmd := exec.Command("kubectl", "get", "comparison", compName, "-n", namespace, "--ignore-not-found")
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) == "" {
+			return
+		}
+
+		if time.Since(start) > timeout {
+			h.t.Fatalf("Timeout waiting for Comparison %s/%s to be deleted; current: %s", namespace, compName, strings.TrimSpace(string(out)))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (h *Harness) WaitForComparisonVerdict(namespace, compName, expectedVerdict string, timeout time.Duration) *v1alpha1.Comparison {
 	h.t.Logf("Waiting for Comparison %s/%s to reach verdict %s (timeout %v)", namespace, compName, expectedVerdict, timeout)
 	start := time.Now()

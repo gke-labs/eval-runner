@@ -66,6 +66,9 @@ const (
 	// ActionReopened is the pull_request action when a closed PR is reopened.
 	ActionReopened = "reopened"
 
+	// ActionClosed is the pull_request action when a PR is closed or merged.
+	ActionClosed = "closed"
+
 	// ActionCreated is the issue_comment action when a comment is created.
 	ActionCreated = "created"
 
@@ -178,6 +181,7 @@ func ParseEvalMoreCommand(body string, maxSamplesPerTask int) (int, bool) {
 
 // PullRequestWorkItem contains pre-validated fields for PR reconciliation in the worker.
 type PullRequestWorkItem struct {
+	Action            string
 	PRNumber          int
 	HeadSHA           string
 	BaseSHA           string

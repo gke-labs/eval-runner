@@ -237,11 +237,39 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Filter actions: opened, synchronize, reopened
+		// Filter actions: opened, synchronize, reopened, closed
 		action := event.Action
-		if action != ActionOpened && action != ActionSynchronize && action != ActionReopened {
+		if action != ActionOpened && action != ActionSynchronize && action != ActionReopened && action != ActionClosed {
 			log.Printf("ignoring pull_request action %q for %s #%d", action, targetRepoFullName, prNum)
 			writeResponse(w, http.StatusOK, "ignored: action not actionable\n")
+			return
+		}
+
+		if action == ActionClosed {
+			candRepoFullName := ""
+			if candRepoObj := event.PullRequest.Head.Repo; candRepoObj != nil {
+				candOwner, candName, err := ParseOwnerAndName(candRepoObj)
+				if err != nil {
+					log.Printf("ignoring invalid head repository in closed pull_request: %v", err)
+				} else {
+					candRepoFullName = fmt.Sprintf("%s/%s", candOwner, candName)
+				}
+			}
+			item := WorkItem{
+				Event: EventPullRequest,
+				PullRequest: &PullRequestWorkItem{
+					Action:        ActionClosed,
+					PRNumber:      prNum,
+					CandidateRepo: candRepoFullName,
+					TargetRepo:    targetRepoFullName,
+				},
+			}
+			if !s.worker.Enqueue(item) {
+				log.Printf("warning: worker queue full, dropping pull_request event delivery %s", deliveryID)
+				http.Error(w, "worker queue full", http.StatusServiceUnavailable)
+				return
+			}
+			writeResponse(w, http.StatusOK, "ok: enqueued pull_request\n")
 			return
 		}
 
@@ -287,6 +315,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		item := WorkItem{
 			Event: EventPullRequest,
 			PullRequest: &PullRequestWorkItem{
+				Action:            action,
 				PRNumber:          prNum,
 				HeadSHA:           headSHA,
 				BaseSHA:           baseSHA,
