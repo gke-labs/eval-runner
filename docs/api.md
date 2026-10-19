@@ -362,15 +362,18 @@ Eval-runner provides two complementary mechanisms to clean up Comparisons and Ru
 ### 1. Webhook PR Close Cleanup
 When a pull request closes (merged or closed without merge), GitHub sends a `pull_request` event with `action: closed`. The `eval-runner-webhook` handler matches the Comparisons and seed candidate Runs for that pull request by label (`evalrunner.gke-labs.dev/pr`) and repository (`spec.pullRequest.repository` matching the target repository) and deletes them:
 - **Comparisons**: Deleted directly. Their owned batch Runs are automatically garbage-collected by Kubernetes via `metadata.ownerReferences`.
-- **Seed Candidate Runs**: Deleted directly by the webhook.
+- **Seed Candidate Runs**: Deleted directly by the webhook, unless referenced as `spec.baseline.run` by another surviving live Comparison or carrying an owner reference to a surviving Comparison (e.g. stacked branches or fast-forward merges), in which case they are preserved.
 - **Baseline Runs**: Preserved. Baseline Runs are keyed to default branch commits (`base-<sha7>`), are not tagged with PR labels, and are reused across pull requests to eliminate redundant evaluation work.
+- **Reopen**: If a closed PR is reopened, its resources are recreated on the next incoming `pull_request` event.
+- **Artifacts**: Artifacts in the artifact sink (GCS or local directory) are not purged by PR closure or TTL; artifact retention is governed independently by storage lifecycle policies.
 
 ### 2. Comparison TTL (`comparisonTTL`)
 As a safety net for standalone or lingering Comparisons, the controller supports an optional time-to-live (`comparisonTTL` in the ConfigMap or `--comparison-ttl` CLI flag, duration, default `0` = disabled). When configured:
-- The controller automatically deletes `Completed` Comparisons whose age exceeds the TTL.
+- The controller automatically deletes `Completed` Comparisons whose age exceeds the TTL. Age is measured from creation (`metadata.creationTimestamp`), so a Comparison that took longer than the TTL to finish is deleted the moment it completes.
 - Owned batch Runs are garbage-collected via owner references.
 - Baseline Runs are preserved.
 - Active Comparisons (`Running` phase, or `Completed` comparisons with pending `extraSamples` requested) are not deleted until complete.
+- Artifacts in the artifact sink (GCS or local directory) are not purged.
 
 ## Printer Columns
 

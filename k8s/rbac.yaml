@@ -42,7 +42,6 @@ rules:
   - evalrunner.gke-labs.dev
   resources:
   - runs/status
-  - comparisons
   - comparisons/status
   verbs:
   - get
@@ -50,6 +49,17 @@ rules:
   - watch
   - update
   - patch
+- apiGroups:
+  - evalrunner.gke-labs.dev
+  resources:
+  - comparisons
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+  - delete
 - apiGroups:
   - ""
   resources:

@@ -6592,8 +6592,7 @@ func TestComparisonReconciler_ArtifactRecordsAllUnexecutedAndFailedLists(t *test
 }
 
 func TestComparisonReconciler_TTLReconcile(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = v1alpha1.AddToScheme(scheme)
+	scheme := setupScheme(t)
 
 	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	ttl := 1 * time.Hour
@@ -6816,6 +6815,98 @@ func TestComparisonReconciler_TTLReconcile(t *testing.T) {
 		var checkComp v1alpha1.Comparison
 		if err := cl.Get(t.Context(), req.NamespacedName, &checkComp); err != nil {
 			t.Fatalf("expected comparison to NOT be deleted when TTL=0, got err: %v", err)
+		}
+	})
+
+	t.Run("CompletedComparisonRetriesReportingWhenTTLConfigured", func(t *testing.T) {
+		baseRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-report", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "base-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		candRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-report", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "cand-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "comp-report-retry",
+				Namespace:         "eval-runner",
+				CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute)), // 50m remaining
+			},
+			Spec: v1alpha1.ComparisonSpec{
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-report"},
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-report"},
+				PullRequest: &v1alpha1.PullRequestSpec{
+					Repository: "owner/repo",
+					Number:     42,
+					HeadSHA:    "cand-sha",
+					BaseSHA:    "base-sha",
+				},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase: v1alpha1.ComparisonPhaseCompleted,
+			},
+		}
+		tokenSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: "eval-runner"},
+			Data:       map[string][]byte{"token": []byte("ghp_test")},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(baseRun, candRun, comp, tokenSecret).
+			WithStatusSubresource(baseRun, candRun, comp).
+			Build()
+
+		server := github.NewFakeGitHubServer()
+		defer server.Close()
+		server.InjectError(500, `{"message":"Internal Server Error"}`)
+
+		fakeGCS := fakes.NewFakeStorageClient()
+		sink, err := gcs.New(t.Context(), "gs://eval-bucket", gcs.WithStorageClient(fakeGCS))
+		if err != nil {
+			t.Fatalf("failed to create GCS sink: %v", err)
+		}
+
+		reconciler := &ComparisonReconciler{
+			Client:              cl,
+			Scheme:              scheme,
+			ArtifactSink:        sink,
+			ComparisonTTL:       ttl,
+			Now:                 func() time.Time { return now },
+			ControllerNamespace: "eval-runner",
+			GitHubTokenSecret:   "github-token",
+			GitHubClientFactory: func(creds GitHubCredentials) github.Client {
+				return server.Client(creds.Token)
+			},
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-report-retry"}}
+
+		// 1. First reconcile should return error from GitHub report, NOT swallow it with RequeueAfter
+		_, err = reconciler.Reconcile(t.Context(), req)
+		if err == nil {
+			t.Fatalf("expected error from failed GitHub report on Completed comparison with TTL, got nil")
+		}
+
+		// 2. Second reconcile with GitHub recovered (InjectError was one-shot) should succeed and schedule TTL RequeueAfter
+		res, err := reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("unexpected error on second reconcile: %v", err)
+		}
+		if res.RequeueAfter != 50*time.Minute {
+			t.Errorf("expected RequeueAfter 50m, got %v", res.RequeueAfter)
+		}
+		if len(server.Comments()) != 1 {
+			t.Errorf("expected 1 comment posted to GitHub, got %d", len(server.Comments()))
 		}
 	})
 }
