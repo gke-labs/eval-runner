@@ -280,6 +280,10 @@ spec:
                   description: ComparisonPendingCommand represents an unhandled command
                     received from a GitHub review comment.
                   properties:
+                    attempts:
+                      description: Attempts is the number of times the controller
+                        has attempted to process this command.
+                      type: integer
                     commentId:
                       description: CommentID is the GitHub issue comment ID where
                         the command was issued.
@@ -288,6 +292,12 @@ spec:
                     login:
                       description: Login is the GitHub username of the user who issued
                         the command.
+                      type: string
+                    nextAttemptAt:
+                      description: |-
+                        NextAttemptAt is the earliest time when the controller should next attempt this command.
+                        If nil or in the past, the command is eligible for processing immediately.
+                      format: date-time
                       type: string
                     receivedAt:
                       description: ReceivedAt is the time when the webhook received

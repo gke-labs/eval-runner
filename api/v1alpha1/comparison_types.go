@@ -317,6 +317,9 @@ const (
 
 	// MaxHandledCommands is the maximum number of handled commands preserved in a Comparison status.
 	MaxHandledCommands = 100
+
+	// MaxCommandAttempts is the maximum number of processing attempts before transient command errors become terminal.
+	MaxCommandAttempts = 3
 )
 
 // ComparisonPendingCommand represents an unhandled command received from a GitHub review comment.
@@ -332,6 +335,15 @@ type ComparisonPendingCommand struct {
 
 	// ReceivedAt is the time when the webhook received and recorded the command.
 	ReceivedAt metav1.Time `json:"receivedAt"`
+
+	// Attempts is the number of times the controller has attempted to process this command.
+	// +optional
+	Attempts int `json:"attempts,omitempty"`
+
+	// NextAttemptAt is the earliest time when the controller should next attempt this command.
+	// If nil or in the past, the command is eligible for processing immediately.
+	// +optional
+	NextAttemptAt *metav1.Time `json:"nextAttemptAt,omitempty"`
 }
 
 // ComparisonHandledCommand represents a review comment command that has been processed by the controller.
