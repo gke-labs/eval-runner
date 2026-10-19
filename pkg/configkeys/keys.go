@@ -55,6 +55,8 @@ const (
 	ConfigMapKeyUIBaseURL = "uiBaseURL"
 	// ConfigMapKeyInconclusivePolicy is the ConfigMap key for check run inconclusive verdict policy ("neutral" or "failure").
 	ConfigMapKeyInconclusivePolicy = "inconclusivePolicy"
+	// ConfigMapKeyComparisonTTL is the ConfigMap key for completed comparison TTL duration.
+	ConfigMapKeyComparisonTTL = "comparisonTTL"
 
 	// Webhook keys
 

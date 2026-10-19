@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/internal/fakes"
@@ -6588,4 +6589,233 @@ func TestComparisonReconciler_ArtifactRecordsAllUnexecutedAndFailedLists(t *test
 	if strings.Contains(string(artObj.Data), `"skippedNotPlanned":`) {
 		t.Errorf("Expected artifact JSON to omit 'skippedNotPlanned', got: %s", string(artObj.Data))
 	}
+}
+
+func TestComparisonReconciler_TTLReconcile(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	ttl := 1 * time.Hour
+
+	t.Run("ExpiredCompletedComparisonIsDeleted", func(t *testing.T) {
+		baseRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-run", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "base-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		candRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-run", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "cand-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "comp-expired",
+				Namespace:         "eval-runner",
+				CreationTimestamp: metav1.NewTime(now.Add(-2 * ttl)),
+			},
+			Spec: v1alpha1.ComparisonSpec{
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run"},
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run"},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase: v1alpha1.ComparisonPhaseCompleted,
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(baseRun, candRun, comp).
+			WithStatusSubresource(baseRun, candRun, comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:        cl,
+			Scheme:        scheme,
+			ComparisonTTL: ttl,
+			Now:           func() time.Time { return now },
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-expired"}}
+		res, err := reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+		if res.RequeueAfter != 0 {
+			t.Errorf("expected RequeueAfter 0, got %v", res.RequeueAfter)
+		}
+
+		var checkComp v1alpha1.Comparison
+		err = cl.Get(t.Context(), req.NamespacedName, &checkComp)
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("expected comparison to be deleted (NotFound), got err: %v", err)
+		}
+
+		// Baseline run must be preserved
+		var checkBase v1alpha1.Run
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: "base-run"}, &checkBase); err != nil {
+			t.Fatalf("expected baseline run to be preserved, got err: %v", err)
+		}
+	})
+
+	t.Run("ActiveCompletedComparisonWithinTTLRequeues", func(t *testing.T) {
+		baseRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-run-active", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "base-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		candRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-run-active", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "cand-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "comp-active",
+				Namespace:         "eval-runner",
+				CreationTimestamp: metav1.NewTime(now.Add(-20 * time.Minute)), // 40m remaining
+			},
+			Spec: v1alpha1.ComparisonSpec{
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run-active"},
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run-active"},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase: v1alpha1.ComparisonPhaseCompleted,
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(baseRun, candRun, comp).
+			WithStatusSubresource(baseRun, candRun, comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:        cl,
+			Scheme:        scheme,
+			ComparisonTTL: ttl,
+			Now:           func() time.Time { return now },
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-active"}}
+		res, err := reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+		if res.RequeueAfter != 40*time.Minute {
+			t.Errorf("expected RequeueAfter 40m, got %v", res.RequeueAfter)
+		}
+
+		var checkComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &checkComp); err != nil {
+			t.Fatalf("expected comparison to still exist, got err: %v", err)
+		}
+	})
+
+	t.Run("CompletedComparisonWithExtraSamplesRequestedNotDeleted", func(t *testing.T) {
+		baseRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-run-extra", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "base-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		candRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-run-extra", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "cand-sha"},
+				Model: "mockllm/model",
+			},
+			Status: v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseCompleted},
+		}
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "comp-extra",
+				Namespace:         "eval-runner",
+				CreationTimestamp: metav1.NewTime(now.Add(-2 * ttl)),
+			},
+			Spec: v1alpha1.ComparisonSpec{
+				Baseline:     v1alpha1.ComparisonRunRef{Run: "base-run-extra"},
+				Candidate:    v1alpha1.ComparisonRunRef{Run: "cand-run-extra"},
+				ExtraSamples: 10,
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase:               v1alpha1.ComparisonPhaseCompleted,
+				ExtraSamplesApplied: 5,
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(baseRun, candRun, comp).
+			WithStatusSubresource(baseRun, candRun, comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:        cl,
+			Scheme:        scheme,
+			ComparisonTTL: ttl,
+			Now:           func() time.Time { return now },
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-extra"}}
+		_, _ = reconciler.Reconcile(t.Context(), req)
+
+		var checkComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &checkComp); err != nil {
+			t.Fatalf("expected comparison with extraSamples pending to NOT be deleted, got err: %v", err)
+		}
+	})
+
+	t.Run("DisabledTTLDoesNotDelete", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "comp-no-ttl",
+				Namespace:         "eval-runner",
+				CreationTimestamp: metav1.NewTime(now.Add(-48 * time.Hour)),
+			},
+			Spec: v1alpha1.ComparisonSpec{
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run"},
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run"},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase: v1alpha1.ComparisonPhaseCompleted,
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(comp).
+			WithStatusSubresource(comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:        cl,
+			Scheme:        scheme,
+			ComparisonTTL: 0, // disabled
+			Now:           func() time.Time { return now },
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-no-ttl"}}
+		_, _ = reconciler.Reconcile(t.Context(), req)
+
+		var checkComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &checkComp); err != nil {
+			t.Fatalf("expected comparison to NOT be deleted when TTL=0, got err: %v", err)
+		}
+	})
 }

@@ -64,6 +64,8 @@ const (
 	ConfigMapKeyUIBaseURL = configkeys.ConfigMapKeyUIBaseURL
 	// ConfigMapKeyInconclusivePolicy is the ConfigMap key for check run inconclusive verdict policy ("neutral" or "failure").
 	ConfigMapKeyInconclusivePolicy = configkeys.ConfigMapKeyInconclusivePolicy
+	// ConfigMapKeyComparisonTTL is the ConfigMap key for completed comparison TTL duration.
+	ConfigMapKeyComparisonTTL = configkeys.ConfigMapKeyComparisonTTL
 	// ConfigMapKeyDefaultBatchSize is the ConfigMap key for default batch size.
 	ConfigMapKeyDefaultBatchSize = configkeys.ConfigMapKeyDefaultBatchSize
 	// ConfigMapKeyDefaultMaxSamplesPerTask is the ConfigMap key for default maximum samples per task.
@@ -98,6 +100,7 @@ var KnownConfigMapKeys = map[string]struct{}{
 	configkeys.ConfigMapKeyGitHubAppSecret:          {},
 	configkeys.ConfigMapKeyUIBaseURL:                {},
 	configkeys.ConfigMapKeyInconclusivePolicy:       {},
+	configkeys.ConfigMapKeyComparisonTTL:            {},
 	configkeys.ConfigMapKeyGitHubWebhookSecret:      {},
 	configkeys.ConfigMapKeyWebhookRepositories:      {},
 	configkeys.ConfigMapKeyDefaultModel:             {},
@@ -142,6 +145,7 @@ type ClusterConfig struct {
 	SandboxdImage          string
 	TaskGracePeriod        time.Duration
 	UIBaseURL              string
+	ComparisonTTL          time.Duration
 }
 
 // RawFlags contains the flag values passed to the controller and tracks which flags were explicitly set.
@@ -159,6 +163,7 @@ type RawFlags struct {
 	SandboxdImage          string
 	TaskGracePeriod        time.Duration
 	UIBaseURL              string
+	ComparisonTTL          time.Duration
 	StrictConfig           bool
 	Explicit               map[string]bool
 }
@@ -187,6 +192,7 @@ func DefaultClusterConfig() ClusterConfig {
 		SandboxdImage:          discovery.SandboxdImage,
 		TaskGracePeriod:        DefaultTaskGracePeriod,
 		UIBaseURL:              "",
+		ComparisonTTL:          0,
 	}
 }
 
@@ -199,6 +205,7 @@ func FlagsFromFlagSet(
 	strictConfig bool,
 	artifactMaxUploadBytes int64,
 	inconclusivePolicy string,
+	comparisonTTL time.Duration,
 ) RawFlags {
 	explicit := make(map[string]bool)
 	fs.Visit(func(f *flag.Flag) {
@@ -218,6 +225,7 @@ func FlagsFromFlagSet(
 		SandboxdImage:          sandboxdImage,
 		TaskGracePeriod:        taskGracePeriod,
 		UIBaseURL:              uiBaseURL,
+		ComparisonTTL:          comparisonTTL,
 		StrictConfig:           strictConfig,
 		Explicit:               explicit,
 	}
@@ -429,6 +437,25 @@ func ResolveConfig(cm *corev1.ConfigMap, flags RawFlags) (ClusterConfig, error) 
 				cfg.InconclusivePolicy = lower
 			}
 		}
+
+		// 13. comparisonTTL
+		if val, ok := cm.Data[ConfigMapKeyComparisonTTL]; ok {
+			trimmed := strings.TrimSpace(val)
+			if trimmed != "" {
+				if strings.EqualFold(trimmed, ConfigSentinelDisabled) {
+					cfg.ComparisonTTL = 0
+				} else {
+					d, err := time.ParseDuration(trimmed)
+					if err != nil {
+						return cfg, fmt.Errorf("invalid %s %q in ConfigMap %s/%s: %w", ConfigMapKeyComparisonTTL, val, ns, name, err)
+					}
+					if d < 0 {
+						return cfg, fmt.Errorf("invalid %s %q in ConfigMap %s/%s: duration cannot be negative", ConfigMapKeyComparisonTTL, val, ns, name)
+					}
+					cfg.ComparisonTTL = d
+				}
+			}
+		}
 	}
 
 	// Apply explicit flag overrides
@@ -448,6 +475,12 @@ func ResolveConfig(cm *corev1.ConfigMap, flags RawFlags) (ClusterConfig, error) 
 	}
 	if flags.IsExplicit("artifact-max-upload-bytes") {
 		cfg.ArtifactMaxUploadBytes = flags.ArtifactMaxUploadBytes
+	}
+	if flags.IsExplicit("comparison-ttl") {
+		if flags.ComparisonTTL < 0 {
+			return cfg, fmt.Errorf("invalid flag --comparison-ttl: duration cannot be negative")
+		}
+		cfg.ComparisonTTL = flags.ComparisonTTL
 	}
 	if flags.IsExplicit("discovery-deadline") {
 		cfg.DiscoveryDeadline = flags.DiscoveryDeadline
@@ -563,6 +596,7 @@ func LoadAndResolveClusterConfig(
 
 	logger.Info("effective cluster settings",
 		"artifactBucket", resolved.ArtifactBucket,
+		"comparisonTTL", resolved.ComparisonTTL,
 		"discoveryDeadline", resolved.DiscoveryDeadline,
 		"executionDeadline", resolved.ExecutionDeadline,
 		"githubTokenSecret", resolved.GitHubTokenSecret,

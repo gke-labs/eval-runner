@@ -248,6 +248,7 @@ Limits on exec streams and sandbox file reads are owned exclusively by `pkg/sand
 | Artifact directory | `--artifact-dir` | `""` (in-memory sink) | Local filesystem directory for storing manifests, evaluation logs, and comparison artifacts when GCS is not configured. |
 | Artifact upload size | `--artifact-max-upload-bytes` / ConfigMap `artifactMaxUploadBytes` | `10485760` (10 MiB) | Maximum size of an uploaded artifact (default 10 MiB, equal to sandbox ReadFile limit); manifests error above cap; task logs are capped and recorded with `capped` in `summary.json`. |
 | Artifact load size | `DefaultMaxLoadBytes` | `10485760` (10 MiB) | Maximum size of an artifact loaded from the sink. |
+| Comparison TTL | `--comparison-ttl` / ConfigMap `comparisonTTL` | `0` (disabled) | Duration after which `Completed` Comparisons are deleted by the controller as a safety net; defaults to `0` (disabled). Owned batch Runs are deleted via Kubernetes owner references. Baseline Runs are preserved. |
 
 ---
 
@@ -353,6 +354,23 @@ Inspect log provider-specific totals are dropped so that `total` is strictly and
 | `message` | `string` | Informational status message (e.g. `"disabled"`, permanent error message). |
 
 Check run titles display per-label counts: `<VERDICT>: N improved, M unchanged, K regressed, J inconclusive` built from `status.tasks[].label` (omitting zero buckets). The check run conclusion for `INCONCLUSIVE` comparisons is governed by the `inconclusivePolicy` cluster ConfigMap key: `"neutral"` (default, non-blocking) or `"failure"` (blocks merging).
+
+## Retention and Cleanup
+
+Eval-runner provides two complementary mechanisms to clean up Comparisons and Runs:
+
+### 1. Webhook PR Close Cleanup
+When a pull request closes (merged or closed without merge), GitHub sends a `pull_request` event with `action: closed`. The `eval-runner-webhook` handler matches the Comparisons and seed candidate Runs for that pull request by label (`evalrunner.gke-labs.dev/pr`) and repository (`spec.pullRequest.repository` matching the target repository) and deletes them:
+- **Comparisons**: Deleted directly. Their owned batch Runs are automatically garbage-collected by Kubernetes via `metadata.ownerReferences`.
+- **Seed Candidate Runs**: Deleted directly by the webhook.
+- **Baseline Runs**: Preserved. Baseline Runs are keyed to default branch commits (`base-<sha7>`), are not tagged with PR labels, and are reused across pull requests to eliminate redundant evaluation work.
+
+### 2. Comparison TTL (`comparisonTTL`)
+As a safety net for standalone or lingering Comparisons, the controller supports an optional time-to-live (`comparisonTTL` in the ConfigMap or `--comparison-ttl` CLI flag, duration, default `0` = disabled). When configured:
+- The controller automatically deletes `Completed` Comparisons whose age exceeds the TTL.
+- Owned batch Runs are garbage-collected via owner references.
+- Baseline Runs are preserved.
+- Active Comparisons (`Running` phase, or `Completed` comparisons with pending `extraSamples` requested) are not deleted until complete.
 
 ## Printer Columns
 

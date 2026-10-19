@@ -499,14 +499,15 @@ func TestFlagsFromFlagSet(t *testing.T) {
 	strictConfig := fs.Bool("strict-config", false, "strict config")
 	uploadBytes := fs.Int64("artifact-max-upload-bytes", 10*1024*1024, "artifact max upload bytes")
 	inconclusivePolicy := fs.String("inconclusive-policy", DefaultInconclusivePolicy, "inconclusive policy")
+	compTTL := fs.Duration("comparison-ttl", 0, "comparison ttl")
 
-	// Parse with only artifact-bucket, max-parallel-tasks, ui-base-url, strict-config, artifact-max-upload-bytes set
-	err := fs.Parse([]string{"--artifact-bucket=gs://custom", "--max-parallel-tasks=10", "--sandboxd-image=my-sandboxd:tag", "--github-token-secret=my-gh-secret", "--ui-base-url=https://eval.example.com", "--strict-config", "--artifact-max-upload-bytes=5242880", "--inconclusive-policy=failure"})
+	// Parse with only artifact-bucket, max-parallel-tasks, ui-base-url, strict-config, artifact-max-upload-bytes, inconclusive-policy, comparison-ttl set
+	err := fs.Parse([]string{"--artifact-bucket=gs://custom", "--max-parallel-tasks=10", "--sandboxd-image=my-sandboxd:tag", "--github-token-secret=my-gh-secret", "--ui-base-url=https://eval.example.com", "--strict-config", "--artifact-max-upload-bytes=5242880", "--inconclusive-policy=failure", "--comparison-ttl=24h"})
 	if err != nil {
 		t.Fatalf("failed to parse flags: %v", err)
 	}
 
-	rawFlags := FlagsFromFlagSet(fs, *bucket, *dir, *secret, *sandboxd, *githubToken, *githubApp, *uiURL, *discovery, *execution, *grace, *parallel, *strictConfig, *uploadBytes, *inconclusivePolicy)
+	rawFlags := FlagsFromFlagSet(fs, *bucket, *dir, *secret, *sandboxd, *githubToken, *githubApp, *uiURL, *discovery, *execution, *grace, *parallel, *strictConfig, *uploadBytes, *inconclusivePolicy, *compTTL)
 	if !rawFlags.IsExplicit("artifact-bucket") {
 		t.Errorf("expected artifact-bucket to be explicit")
 	}
@@ -536,6 +537,12 @@ func TestFlagsFromFlagSet(t *testing.T) {
 	}
 	if rawFlags.ArtifactMaxUploadBytes != 5242880 {
 		t.Errorf("expected ArtifactMaxUploadBytes 5242880, got %d", rawFlags.ArtifactMaxUploadBytes)
+	}
+	if !rawFlags.IsExplicit("comparison-ttl") {
+		t.Errorf("expected comparison-ttl to be explicit")
+	}
+	if rawFlags.ComparisonTTL != 24*time.Hour {
+		t.Errorf("expected ComparisonTTL 24h, got %v", rawFlags.ComparisonTTL)
 	}
 	if rawFlags.IsExplicit("github-app-secret") {
 		t.Errorf("expected github-app-secret NOT to be explicit")
@@ -1343,6 +1350,109 @@ func TestResolveConfig_ArtifactMaxUploadBytes(t *testing.T) {
 	}
 	if _, err := ResolveConfig(invalidCM, RawFlags{}); err == nil {
 		t.Errorf("expected error for negative artifactMaxUploadBytes, got nil")
+	}
+}
+
+func TestResolveConfig_ComparisonTTL(t *testing.T) {
+	// 1. Default when unset is 0 (disabled)
+	cfg, err := ResolveConfig(nil, RawFlags{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ComparisonTTL != 0 {
+		t.Errorf("expected default ComparisonTTL 0, got %v", cfg.ComparisonTTL)
+	}
+
+	// 2. Valid duration from ConfigMap
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultConfigMapName,
+			Namespace: "eval-runner",
+		},
+		Data: map[string]string{
+			ConfigMapKeyComparisonTTL: "24h",
+		},
+	}
+	cfg, err = ResolveConfig(cm, RawFlags{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ComparisonTTL != 24*time.Hour {
+		t.Errorf("expected ComparisonTTL 24h, got %v", cfg.ComparisonTTL)
+	}
+
+	// 3. Disabled via "0", "0s", or "none"
+	for _, val := range []string{"0", "0s", "none", "NONE"} {
+		cmDisabled := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      DefaultConfigMapName,
+				Namespace: "eval-runner",
+			},
+			Data: map[string]string{
+				ConfigMapKeyComparisonTTL: val,
+			},
+		}
+		cfg, err = ResolveConfig(cmDisabled, RawFlags{})
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", val, err)
+		}
+		if cfg.ComparisonTTL != 0 {
+			t.Errorf("expected ComparisonTTL 0 for %q, got %v", val, cfg.ComparisonTTL)
+		}
+	}
+
+	// 4. Invalid duration string
+	cmInvalid := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultConfigMapName,
+			Namespace: "eval-runner",
+		},
+		Data: map[string]string{
+			ConfigMapKeyComparisonTTL: "not-a-duration",
+		},
+	}
+	if _, err := ResolveConfig(cmInvalid, RawFlags{}); err == nil {
+		t.Errorf("expected error for invalid duration string, got nil")
+	}
+
+	// 5. Negative duration in ConfigMap
+	cmNegative := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultConfigMapName,
+			Namespace: "eval-runner",
+		},
+		Data: map[string]string{
+			ConfigMapKeyComparisonTTL: "-1h",
+		},
+	}
+	if _, err := ResolveConfig(cmNegative, RawFlags{}); err == nil {
+		t.Errorf("expected error for negative duration, got nil")
+	}
+
+	// 6. Explicit flag overrides ConfigMap
+	flags := RawFlags{
+		ComparisonTTL: 48 * time.Hour,
+		Explicit: map[string]bool{
+			"comparison-ttl": true,
+		},
+	}
+	cfg, err = ResolveConfig(cm, flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ComparisonTTL != 48*time.Hour {
+		t.Errorf("expected flag override 48h, got %v", cfg.ComparisonTTL)
+	}
+
+	// 7. Explicit negative flag returns error
+	flagsNeg := RawFlags{
+		ComparisonTTL: -1 * time.Minute,
+		Explicit: map[string]bool{
+			"comparison-ttl": true,
+		},
+	}
+	if _, err := ResolveConfig(nil, flagsNeg); err == nil {
+		t.Errorf("expected error for negative flag --comparison-ttl, got nil")
 	}
 }
 

@@ -127,10 +127,19 @@ type ComparisonReconciler struct {
 	InconclusivePolicy  string
 	GitHubBaseURL       string
 	GitHubClientFactory func(creds GitHubCredentials) github.Client
+	ComparisonTTL       time.Duration
+	Now                 func() time.Time
 
 	cachedAppMu   sync.Mutex
 	cachedAppKey  string
 	cachedAppAuth *github.AppTokenProvider
+}
+
+func (r *ComparisonReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 func (r *ComparisonReconciler) artifactSink() artifacts.ArtifactSink {
@@ -692,6 +701,21 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 
 	if comp.DeletionTimestamp != nil {
 		return ctrl.Result{}, nil
+	}
+
+	// Check TTL expiration for completed comparisons
+	if r.ComparisonTTL > 0 && comp.Status.Phase == v1alpha1.ComparisonPhaseCompleted && comp.Spec.ExtraSamples <= comp.Status.ExtraSamplesApplied {
+		if !comp.CreationTimestamp.IsZero() {
+			age := r.now().Sub(comp.CreationTimestamp.Time)
+			if age >= r.ComparisonTTL {
+				logger.Info("deleting completed comparison past TTL", "comparison", comp.Name, "age", age, "ttl", r.ComparisonTTL)
+				if err := r.Delete(ctx, &comp); err != nil && !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, fmt.Errorf("failed to delete expired comparison %s: %w", comp.Name, err)
+				}
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{RequeueAfter: r.ComparisonTTL - age}, nil
+		}
 	}
 
 	baselineRunKey := types.NamespacedName{
@@ -1777,7 +1801,7 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		phase = v1alpha1.ComparisonPhaseRunning
 	}
 
-	return r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
+	result, err := r.updateComparisonStatus(ctx, &comp, &baselineRun, &candidateRun, func(status *v1alpha1.ComparisonStatus) {
 		status.Phase = phase
 		status.Verdict = v1alpha1.ComparisonVerdict(runVerdict.Verdict)
 		status.PImprovement = &pImp
@@ -1791,6 +1815,26 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		status.SummaryPath = summaryPath
 		status.Message = message
 	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if r.ComparisonTTL > 0 && phase == v1alpha1.ComparisonPhaseCompleted && comp.Spec.ExtraSamples <= comp.Status.ExtraSamplesApplied && !comp.CreationTimestamp.IsZero() {
+		age := r.now().Sub(comp.CreationTimestamp.Time)
+		if age >= r.ComparisonTTL {
+			logger.Info("deleting completed comparison past TTL", "comparison", comp.Name, "age", age, "ttl", r.ComparisonTTL)
+			if err := r.Delete(ctx, &comp); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to delete expired comparison %s: %w", comp.Name, err)
+			}
+			return ctrl.Result{}, nil
+		}
+		remaining := r.ComparisonTTL - age
+		if result.RequeueAfter == 0 || remaining < result.RequeueAfter {
+			result.RequeueAfter = remaining
+		}
+	}
+
+	return result, nil
 }
 
 func (r *ComparisonReconciler) updateComparisonStatus(
