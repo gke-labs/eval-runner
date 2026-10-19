@@ -127,23 +127,67 @@ type GitHubCredentials struct {
 // ComparisonReconciler reconciles a Comparison object.
 type ComparisonReconciler struct {
 	client.Client
-	Scheme              *runtime.Scheme
-	ArtifactSink        artifacts.ArtifactSink
-	ControllerNamespace string
-	GitHubTokenSecret   string
-	GitHubAppSecret     string
-	UIBaseURL           string
-	InconclusivePolicy  string
-	GitHubBaseURL       string
-	GitHubClientFactory func(creds GitHubCredentials) github.Client
-	ComparisonTTL       time.Duration
-	CommandUsers        []string
-	Now                 func() time.Time
-	ModelPrices         map[string]ModelPrice
+	Scheme               *runtime.Scheme
+	ArtifactSink         artifacts.ArtifactSink
+	ControllerNamespace  string
+	GitHubTokenSecret    string
+	GitHubAppSecret      string
+	UIBaseURL            string
+	InconclusivePolicy   string
+	GitHubBaseURL        string
+	GitHubClientFactory  func(creds GitHubCredentials) github.Client
+	ComparisonTTL        time.Duration
+	CommandRetryInterval time.Duration
+	CommandUsers         []string
+	Now                  func() time.Time
+	ModelPrices          map[string]ModelPrice
 
 	cachedAppMu   sync.Mutex
 	cachedAppKey  string
 	cachedAppAuth *github.AppTokenProvider
+}
+
+func (r *ComparisonReconciler) commandBackoff(attempts int, err error) time.Duration {
+	if r.CommandRetryInterval > 0 {
+		return r.CommandRetryInterval
+	}
+	var rle *github.RateLimitError
+	if errors.As(err, &rle) && rle.RetryAfter > 0 {
+		return rle.RetryAfter
+	}
+	switch attempts {
+	case 1:
+		return 10 * time.Second
+	case 2:
+		return 1 * time.Minute
+	default:
+		return 5 * time.Minute
+	}
+}
+
+func (r *ComparisonReconciler) earliestPendingCommandWait(comp *v1alpha1.Comparison) (time.Duration, bool) {
+	if comp == nil || len(comp.Status.PendingCommands) == 0 {
+		return 0, false
+	}
+	now := r.now()
+	var minWait time.Duration
+	found := false
+	for _, cmd := range comp.Status.PendingCommands {
+		var wait time.Duration
+		if cmd.NextAttemptAt == nil || !cmd.NextAttemptAt.After(now) {
+			wait = 1 * time.Second
+		} else {
+			wait = cmd.NextAttemptAt.Sub(now)
+			if wait <= 0 {
+				wait = 1 * time.Second
+			}
+		}
+		if !found || wait < minWait {
+			minWait = wait
+			found = true
+		}
+	}
+	return minWait, found
 }
 
 func (r *ComparisonReconciler) now() time.Time {
@@ -283,11 +327,46 @@ func (r *ComparisonReconciler) getGitHubClient(ctx context.Context) (github.Clie
 	return nil, nil
 }
 
-func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp *v1alpha1.Comparison) (bool, error) {
+func isTransientPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if github.IsPermanent(err) {
+		return false
+	}
+	return true
+}
+
+func (r *ComparisonReconciler) reactToDeniedOrErroredCommand(
+	ctx context.Context,
+	ghClient github.Client,
+	prSpec *v1alpha1.PullRequestSpec,
+	commentID int64,
+) {
+	if ghClient == nil || prSpec == nil {
+		return
+	}
+	parts := strings.Split(prSpec.Repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return
+	}
+	owner, repo := parts[0], parts[1]
+	logger := log.FromContext(ctx)
+	if err := ghClient.CreateCommentReaction(ctx, owner, repo, commentID, "confused"); err != nil {
+		logger.Info("failed to react with confused to denied or errored comment", "commentId", commentID, "err", err)
+	}
+}
+
+func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp *v1alpha1.Comparison) error {
 	if len(comp.Status.PendingCommands) == 0 {
-		return false, nil
+		return nil
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	now := r.now()
 	logger := log.FromContext(ctx)
 	ghClient, ghErr := r.getGitHubClient(ctx)
 	if ghErr != nil {
@@ -295,36 +374,54 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 	}
 
 	var newHandled []v1alpha1.ComparisonHandledCommand
+	updatedPending := make(map[int64]v1alpha1.ComparisonPendingCommand)
 	totalExtraBump := 0
 
 	for _, cmd := range comp.Status.PendingCommands {
+		if cmd.NextAttemptAt != nil && cmd.NextAttemptAt.After(now) {
+			// Command retry is not yet due; skip and preserve untouched.
+			continue
+		}
+
 		authorized := false
-		var outcome string
+		var terminalOutcome string
+		isTransient := false
+		var transientErr error
 
 		// Reject bot logins (e.g. renovate[bot], dependabot[bot], etc.)
 		if strings.HasSuffix(strings.ToLower(strings.TrimSpace(cmd.Login)), "[bot]") {
-			outcome = "denied: bot"
+			terminalOutcome = "denied: bot"
 		} else if IsUserAllowed(cmd.Login, r.CommandUsers) {
 			// 1. Check commandUsers allow-list (exact case-insensitive match)
 			authorized = true
 		} else {
 			// 2. Check GitHub collaborator permissions API
 			if comp.Spec.PullRequest == nil {
-				outcome = "denied: no pull request configured"
-			} else if ghClient == nil || ghErr != nil {
-				outcome = "error: github credentials unavailable"
+				terminalOutcome = "denied: no pull request configured"
+			} else if ghClient == nil {
+				if ghErr != nil {
+					isTransient = true
+					transientErr = ghErr
+				} else {
+					terminalOutcome = "error: github credentials unavailable"
+				}
 			} else {
 				parts := strings.Split(comp.Spec.PullRequest.Repository, "/")
 				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-					outcome = fmt.Sprintf("denied: invalid pullRequest.repository %q", comp.Spec.PullRequest.Repository)
+					terminalOutcome = fmt.Sprintf("denied: invalid pullRequest.repository %q", comp.Spec.PullRequest.Repository)
 				} else {
 					owner, repo := parts[0], parts[1]
 					perm, err := ghClient.GetRepoPermission(ctx, owner, repo, cmd.Login)
 					if err != nil {
 						logger.Info("github collaborator permission check failed", "user", cmd.Login, "repo", comp.Spec.PullRequest.Repository, "err", err)
-						outcome = fmt.Sprintf("error: failed to verify permissions: %v", err)
+						if isTransientPermissionError(err) {
+							isTransient = true
+							transientErr = err
+						} else {
+							terminalOutcome = fmt.Sprintf("error: failed to verify permissions: %v", err)
+						}
 					} else if !github.HasWriteAccess(perm) {
-						outcome = "denied: unauthorized"
+						terminalOutcome = "denied: unauthorized"
 					} else {
 						authorized = true
 					}
@@ -343,7 +440,7 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 				samplesToBump = v1alpha1.DefaultMaxSamplesPerTask
 			}
 			totalExtraBump += samplesToBump
-			outcome = "applied"
+			terminalOutcome = "applied"
 
 			// Acknowledge via GitHub reaction (eyes) or fallback comment
 			if ghClient != nil && comp.Spec.PullRequest != nil {
@@ -360,17 +457,61 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 					}
 				}
 			}
-		}
 
-		handled := v1alpha1.ComparisonHandledCommand{
-			CommentID:  cmd.CommentID,
-			Login:      cmd.Login,
-			Requested:  cmd.Requested,
-			ReceivedAt: cmd.ReceivedAt,
-			HandledAt:  &metav1.Time{Time: r.now()},
-			Outcome:    outcome,
+			handled := v1alpha1.ComparisonHandledCommand{
+				CommentID:  cmd.CommentID,
+				Login:      cmd.Login,
+				Requested:  cmd.Requested,
+				ReceivedAt: cmd.ReceivedAt,
+				HandledAt:  &metav1.Time{Time: r.now()},
+				Outcome:    terminalOutcome,
+			}
+			newHandled = append(newHandled, handled)
+		} else if isTransient {
+			attempts := cmd.Attempts + 1
+			if attempts < v1alpha1.MaxCommandAttempts {
+				delay := r.commandBackoff(attempts, transientErr)
+				nextTime := metav1.NewTime(now.Add(delay))
+				cmd.Attempts = attempts
+				cmd.NextAttemptAt = &nextTime
+				updatedPending[cmd.CommentID] = cmd
+				logger.Info("transient error verifying permissions, retrying", "commentId", cmd.CommentID, "user", cmd.Login, "attempt", attempts, "nextAttemptAt", nextTime.Time, "maxAttempts", v1alpha1.MaxCommandAttempts, "err", transientErr)
+			} else {
+				var outcome string
+				if ghClient == nil && ghErr != nil {
+					outcome = fmt.Sprintf("error: github credentials unavailable: %v", ghErr)
+				} else {
+					outcome = fmt.Sprintf("error: failed to verify permissions: %v", transientErr)
+				}
+				logger.Info("transient error retries exhausted, marking terminal", "commentId", cmd.CommentID, "user", cmd.Login, "attempts", attempts, "outcome", outcome)
+
+				r.reactToDeniedOrErroredCommand(ctx, ghClient, comp.Spec.PullRequest, cmd.CommentID)
+
+				handled := v1alpha1.ComparisonHandledCommand{
+					CommentID:  cmd.CommentID,
+					Login:      cmd.Login,
+					Requested:  cmd.Requested,
+					ReceivedAt: cmd.ReceivedAt,
+					HandledAt:  &metav1.Time{Time: r.now()},
+					Outcome:    outcome,
+				}
+				newHandled = append(newHandled, handled)
+			}
+		} else {
+			logger.Info("command denied or terminal error", "commentId", cmd.CommentID, "user", cmd.Login, "outcome", terminalOutcome)
+
+			r.reactToDeniedOrErroredCommand(ctx, ghClient, comp.Spec.PullRequest, cmd.CommentID)
+
+			handled := v1alpha1.ComparisonHandledCommand{
+				CommentID:  cmd.CommentID,
+				Login:      cmd.Login,
+				Requested:  cmd.Requested,
+				ReceivedAt: cmd.ReceivedAt,
+				HandledAt:  &metav1.Time{Time: r.now()},
+				Outcome:    terminalOutcome,
+			}
+			newHandled = append(newHandled, handled)
 		}
-		newHandled = append(newHandled, handled)
 	}
 
 	key := types.NamespacedName{Namespace: comp.Namespace, Name: comp.Name}
@@ -395,14 +536,21 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 			specBumped = true
 		}
 
-		latest.Status.HandledCommands = append(latest.Status.HandledCommands, newHandled...)
-		if len(latest.Status.HandledCommands) > v1alpha1.MaxHandledCommands {
-			latest.Status.HandledCommands = latest.Status.HandledCommands[len(latest.Status.HandledCommands)-v1alpha1.MaxHandledCommands:]
+		if len(newHandled) > 0 {
+			latest.Status.HandledCommands = append(latest.Status.HandledCommands, newHandled...)
+			if len(latest.Status.HandledCommands) > v1alpha1.MaxHandledCommands {
+				latest.Status.HandledCommands = latest.Status.HandledCommands[len(latest.Status.HandledCommands)-v1alpha1.MaxHandledCommands:]
+			}
 		}
 
 		var remainingPending []v1alpha1.ComparisonPendingCommand
 		for _, p := range latest.Status.PendingCommands {
-			if !handledIDs[p.CommentID] {
+			if handledIDs[p.CommentID] {
+				continue
+			}
+			if up, ok := updatedPending[p.CommentID]; ok {
+				remainingPending = append(remainingPending, up)
+			} else {
 				remainingPending = append(remainingPending, p)
 			}
 		}
@@ -418,10 +566,10 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 	})
 
 	if err != nil {
-		return false, fmt.Errorf("failed persisting pending command outcome: %w", err)
+		return fmt.Errorf("failed persisting pending command outcome: %w", err)
 	}
 
-	return true, nil
+	return nil
 }
 
 func (r *ComparisonReconciler) reportToGitHub(
@@ -857,13 +1005,13 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 
 	// Process pending review comment commands (e.g. /eval more <n>)
 	if len(comp.Status.PendingCommands) > 0 {
-		if _, err := r.processPendingCommands(ctx, &comp); err != nil {
+		if err := r.processPendingCommands(ctx, &comp); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed processing pending commands on comparison %s: %w", comp.Name, err)
 		}
 	}
 
 	// Check TTL expiration for completed comparisons
-	if r.ComparisonTTL > 0 && comp.Status.Phase == v1alpha1.ComparisonPhaseCompleted && comp.Spec.ExtraSamples <= comp.Status.ExtraSamplesApplied {
+	if r.ComparisonTTL > 0 && comp.Status.Phase == v1alpha1.ComparisonPhaseCompleted && comp.Spec.ExtraSamples <= comp.Status.ExtraSamplesApplied && len(comp.Status.PendingCommands) == 0 {
 		if !comp.CreationTimestamp.IsZero() {
 			age := r.now().Sub(comp.CreationTimestamp.Time)
 			if age >= r.ComparisonTTL {
@@ -2143,7 +2291,7 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		return ctrl.Result{}, err
 	}
 
-	if r.ComparisonTTL > 0 && phase == v1alpha1.ComparisonPhaseCompleted && comp.Spec.ExtraSamples <= comp.Status.ExtraSamplesApplied && !comp.CreationTimestamp.IsZero() {
+	if r.ComparisonTTL > 0 && phase == v1alpha1.ComparisonPhaseCompleted && comp.Spec.ExtraSamples <= comp.Status.ExtraSamplesApplied && len(comp.Status.PendingCommands) == 0 && !comp.CreationTimestamp.IsZero() {
 		age := r.now().Sub(comp.CreationTimestamp.Time)
 		if age >= r.ComparisonTTL {
 			logger.Info("deleting completed comparison past TTL", "comparison", comp.Name, "age", age, "ttl", r.ComparisonTTL)
@@ -2155,6 +2303,12 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		remaining := r.ComparisonTTL - age
 		if result.RequeueAfter == 0 || remaining < result.RequeueAfter {
 			result.RequeueAfter = remaining
+		}
+	}
+
+	if wait, hasPending := r.earliestPendingCommandWait(&comp); hasPending {
+		if result.RequeueAfter == 0 || wait < result.RequeueAfter {
+			result.RequeueAfter = wait
 		}
 	}
 
@@ -2202,6 +2356,9 @@ func (r *ComparisonReconciler) updateComparisonStatus(
 	}
 	if reportErr != nil {
 		return ctrl.Result{}, reportErr
+	}
+	if wait, hasPending := r.earliestPendingCommandWait(&latest); hasPending {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 	return ctrl.Result{}, nil
 }

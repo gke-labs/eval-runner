@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,7 @@ func HasWriteAccess(permission string) bool {
 // RateLimitError represents a rate limit error (429 or 403 with rate limit headers).
 type RateLimitError struct {
 	StatusCode int
+	RetryAfter time.Duration
 	Message    string
 }
 
@@ -217,13 +219,20 @@ func (c *HTTPClient) classifyError(status int, headers http.Header, body string)
 		cleanBody = cleanBody[:256] + "..."
 	}
 
+	var retryAfter time.Duration
+	if raw := headers.Get("Retry-After"); raw != "" {
+		if seconds, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && seconds > 0 {
+			retryAfter = time.Duration(seconds) * time.Second
+		}
+	}
+
 	if status == http.StatusTooManyRequests {
-		return &RateLimitError{StatusCode: status, Message: fmt.Sprintf("github rate limit exceeded (429): %s", cleanBody)}
+		return &RateLimitError{StatusCode: status, RetryAfter: retryAfter, Message: fmt.Sprintf("github rate limit exceeded (429): %s", cleanBody)}
 	}
 
 	if status == http.StatusForbidden {
 		if headers.Get("X-RateLimit-Remaining") == "0" || strings.Contains(strings.ToLower(body), "rate limit") {
-			return &RateLimitError{StatusCode: status, Message: fmt.Sprintf("github rate limit reached (403): %s", cleanBody)}
+			return &RateLimitError{StatusCode: status, RetryAfter: retryAfter, Message: fmt.Sprintf("github rate limit reached (403): %s", cleanBody)}
 		}
 		return &PermanentError{StatusCode: status, Message: fmt.Sprintf("github forbidden (403): %s", cleanBody)}
 	}

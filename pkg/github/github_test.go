@@ -2137,3 +2137,29 @@ func TestRenderComparisonMarkdown_3Tasks_ByteIdenticalToGolden(t *testing.T) {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
 	}
 }
+
+func TestCreateCommentReaction(t *testing.T) {
+	server := NewFakeGitHubServer()
+	defer server.Close()
+
+	client := server.Client("test-token")
+	ctx := t.Context()
+
+	// Create reactions on a comment
+	if err := client.CreateCommentReaction(ctx, "gke-labs", "eval-runner", 101, "eyes"); err != nil {
+		t.Fatalf("failed to create eyes reaction: %v", err)
+	}
+	if err := client.CreateCommentReaction(ctx, "gke-labs", "eval-runner", 102, "confused"); err != nil {
+		t.Fatalf("failed to create confused reaction: %v", err)
+	}
+
+	reactions101 := server.CommentReactions(101)
+	if len(reactions101) != 1 || reactions101[0] != "eyes" {
+		t.Errorf("expected [eyes] on comment 101, got %v", reactions101)
+	}
+
+	reactions102 := server.CommentReactions(102)
+	if len(reactions102) != 1 || reactions102[0] != "confused" {
+		t.Errorf("expected [confused] on comment 102, got %v", reactions102)
+	}
+}
