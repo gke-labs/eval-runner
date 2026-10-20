@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Provision a GKE cluster for eval-runner and deploy to it.
+
+This wraps the one-time cloud setup that ./dev/tasks/deploy does not do:
+
+  1. Fetch cluster credentials into a dedicated kubeconfig (never ~/.kube/config).
+  2. Create the artifact bucket if it does not exist.
+  3. Grant the controller and UI Kubernetes ServiceAccounts access to the bucket
+     through Workload Identity Federation principals (no Google service
+     accounts, no KSA annotations).
+  4. Write the eval-runner-config ConfigMap (artifactBucket plus any --set keys).
+  5. Run ./dev/tasks/deploy with IMAGE_PREFIX pointing at the project's registry
+     and wait for the rollouts.
+  6. Check for the model credentials Secret and print what is still missing.
+
+Every step is idempotent, so re-running after fixing a permission problem is
+safe. Use --dry-run to print the commands without running them.
+
+Example:
+
+  ./dev/tasks/deploy-to-gke \
+      --cluster projects/my-project/locations/us-west1/clusters/my-cluster
+
+Only the Python standard library is used.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+NAMESPACE = "eval-runner"
+SANDBOX_NAMESPACE = "eval-runner-sandbox"
+CONFIGMAP = "eval-runner-config"
+CONTROLLER_KSA = "eval-runner-controller"
+UI_KSA = "eval-runner-ui"
+DEPLOYMENTS = ["eval-runner-controller", "eval-runner-ui", "eval-runner-webhook"]
+MODEL_SECRET = "model-credentials"
+
+CLUSTER_PATH_RE = re.compile(
+    r"^projects/(?P<project>[^/]+)/locations/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)$"
+)
+# A zone looks like us-central1-b; the matching region is us-central1.
+ZONE_RE = re.compile(r"^(?P<region>[a-z]+-[a-z]+\d+)-[a-z]$")
+
+
+class Step:
+    """Prints a numbered heading for each step."""
+
+    count = 0
+
+    def __init__(self, title: str):
+        Step.count += 1
+        print(f"\n==> [{Step.count}] {title}", flush=True)
+
+
+class Runner:
+    """Runs external commands, honouring --dry-run and a dedicated KUBECONFIG."""
+
+    def __init__(self, dry_run: bool, kubeconfig: Path):
+        self.dry_run = dry_run
+        self.env = dict(os.environ)
+        self.env["KUBECONFIG"] = str(kubeconfig)
+        # The deploy task pins ap via go run; it needs the toolchain to be free to download.
+        self.env.setdefault("GOTOOLCHAIN", "auto")
+
+    def show(self, cmd: List[str], env_overrides: Optional[Dict[str, str]] = None) -> None:
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env_overrides or {}).items())
+        print(f"    $ {prefix}{shlex.join(cmd)}", flush=True)
+
+    def run(
+        self,
+        cmd: List[str],
+        *,
+        check: bool = True,
+        capture: bool = False,
+        quiet: bool = False,
+        mutating: bool = True,
+        env_overrides: Optional[Dict[str, str]] = None,
+        stdin: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        """Run cmd. In dry-run mode, mutating commands are printed but not run."""
+        if not quiet:
+            self.show(cmd, env_overrides)
+        if self.dry_run and mutating:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        env = dict(self.env)
+        env.update(env_overrides or {})
+        result = subprocess.run(
+            cmd,
+            env=env,
+            input=stdin,
+            text=True,
+            capture_output=capture,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            if capture:
+                sys.stderr.write(result.stderr)
+            raise SystemExit(f"error: command failed with exit code {result.returncode}: {shlex.join(cmd)}")
+        return result
+
+    def output(self, cmd: List[str], *, quiet: bool = True) -> str:
+        """Run a read-only command and return stdout (also in dry-run mode)."""
+        return self.run(cmd, capture=True, quiet=quiet, mutating=False).stdout.strip()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("Example:", 1)[1] if "Example:" in __doc__ else None,
+    )
+    p.add_argument(
+        "--cluster",
+        required=True,
+        help="cluster name, or the full resource path projects/P/locations/L/clusters/C",
+    )
+    p.add_argument("--project", help="GCP project (required unless --cluster is a resource path)")
+    p.add_argument("--location", help="cluster region or zone (required unless --cluster is a resource path)")
+    p.add_argument("--bucket", help="artifact bucket name (default: <project>-eval-runner)")
+    p.add_argument("--bucket-location", help="bucket location (default: the cluster's region)")
+    p.add_argument("--image-prefix", help="container registry prefix (default: gcr.io/<project>)")
+    p.add_argument(
+        "--kubeconfig",
+        help="kubeconfig file to write credentials into "
+        "(default: ~/.kube/eval-runner-<project>-<cluster>.kubeconfig; never ~/.kube/config)",
+    )
+    p.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra eval-runner-config ConfigMap entries, e.g. --set sandboxdImage=gcr.io/p/sandboxd:tag "
+        "(repeatable)",
+    )
+    p.add_argument("--skip-deploy", action="store_true", help="provision only; do not run ./dev/tasks/deploy")
+    p.add_argument("--skip-bucket", action="store_true", help="do not create the bucket or grant access to it")
+    p.add_argument("--dry-run", action="store_true", help="print the commands that would run")
+    args = p.parse_args()
+
+    m = CLUSTER_PATH_RE.match(args.cluster)
+    if m:
+        for key in ("project", "location", "cluster"):
+            if getattr(args, key) not in (None, args.cluster) and getattr(args, key) != m.group(key):
+                p.error(f"--{key} conflicts with the value in --cluster")
+        args.project, args.location, args.cluster = m.group("project"), m.group("location"), m.group("cluster")
+    if not args.project or not args.location:
+        p.error("--project and --location are required unless --cluster is a full resource path")
+
+    args.bucket = args.bucket or f"{args.project}-eval-runner"
+    args.bucket = args.bucket.removeprefix("gs://").rstrip("/")
+    if not args.bucket_location:
+        zm = ZONE_RE.match(args.location)
+        args.bucket_location = zm.group("region") if zm else args.location
+    args.image_prefix = args.image_prefix or f"gcr.io/{args.project}"
+    args.kubeconfig = Path(
+        args.kubeconfig or Path.home() / ".kube" / f"eval-runner-{args.project}-{args.cluster}.kubeconfig"
+    ).expanduser()
+    for item in args.set:
+        if "=" not in item:
+            p.error(f"--set expects KEY=VALUE, got {item!r}")
+    return args
+
+
+def repo_root() -> Path:
+    out = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True)
+    return Path(out.stdout.strip())
+
+
+def gcloud_json(r: Runner, cmd: List[str]):
+    out = r.output(cmd + ["--format=json"])
+    return json.loads(out) if out else None
+
+
+def whoami(r: Runner, project: str) -> str:
+    """Return the active gcloud account, or exit with instructions."""
+    account = r.output(["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"])
+    if not account:
+        raise SystemExit(
+            "error: no active gcloud account. Run `gcloud auth login` (and `gcloud auth application-default login` "
+            "if you also plan to run the e2e tests), then re-run this script."
+        )
+    account = account.splitlines()[0].strip()
+    print(f"    authenticated as {account}")
+    print(f"    project        {project}")
+    return account
+
+
+def ensure_kubeconfig(r: Runner, args: argparse.Namespace) -> None:
+    args.kubeconfig.parent.mkdir(parents=True, exist_ok=True)
+    r.run(
+        [
+            "gcloud", "container", "clusters", "get-credentials", args.cluster,
+            f"--location={args.location}", f"--project={args.project}",
+        ]
+    )
+    print(f"    kubeconfig: {args.kubeconfig}")
+    print(f"    use it with: export KUBECONFIG={args.kubeconfig}")
+
+
+def workload_identity_pool(r: Runner, args: argparse.Namespace) -> str:
+    info = gcloud_json(
+        r,
+        [
+            "gcloud", "container", "clusters", "describe", args.cluster,
+            f"--location={args.location}", f"--project={args.project}",
+        ],
+    ) or {}
+    pool = (info.get("workloadIdentityConfig") or {}).get("workloadPool", "")
+    if not pool:
+        raise SystemExit(
+            f"error: cluster {args.cluster} has no Workload Identity pool. Enable it with\n"
+            f"  gcloud container clusters update {args.cluster} --location={args.location} "
+            f"--project={args.project} --workload-pool={args.project}.svc.id.goog\n"
+            "or pass --skip-bucket to deploy without artifact storage."
+        )
+    return pool
+
+
+def project_number(r: Runner, project: str) -> str:
+    return r.output(["gcloud", "projects", "describe", project, "--format=value(projectNumber)"])
+
+
+def permission_hint(account: str, project: str, err: str) -> str:
+    return (
+        f"\n    Permission denied while changing bucket IAM as {account}.\n"
+        f"    If you can administer this project, you may want to run\n"
+        f"      gcloud projects add-iam-policy-binding {project} \\\n"
+        f"        --member=\"user:{account}\" --role=\"roles/storage.admin\"\n"
+        f"    then re-run this script. Otherwise ask a project owner to run the command above\n"
+        f"    or the failing command. gcloud said:\n      {err.strip().splitlines()[-1] if err.strip() else '(no detail)'}\n"
+    )
+
+
+def ensure_bucket(r: Runner, args: argparse.Namespace, account: str) -> None:
+    uri = f"gs://{args.bucket}"
+    exists = r.run(
+        ["gcloud", "storage", "buckets", "describe", uri, f"--project={args.project}", "--format=value(name)"],
+        check=False, capture=True, mutating=False,
+    )
+    if exists.returncode == 0:
+        print(f"    bucket {uri} exists")
+    else:
+        res = r.run(
+            [
+                "gcloud", "storage", "buckets", "create", uri, f"--project={args.project}",
+                f"--location={args.bucket_location}", "--uniform-bucket-level-access",
+            ],
+            check=False, capture=True,
+        )
+        if res.returncode != 0:
+            sys.stderr.write(res.stderr)
+            if "denied" in res.stderr.lower() or "403" in res.stderr:
+                sys.stderr.write(permission_hint(account, args.project, res.stderr))
+            raise SystemExit("error: could not create the artifact bucket")
+        print(f"    created {uri} in {args.bucket_location}")
+
+    pool = workload_identity_pool(r, args)
+    number = project_number(r, args.project)
+    base = f"principal://iam.googleapis.com/projects/{number}/locations/global/workloadIdentityPools/{pool}/subject"
+    grants = [
+        (f"ns/{NAMESPACE}/sa/{CONTROLLER_KSA}", "roles/storage.objectAdmin"),
+        (f"ns/{NAMESPACE}/sa/{UI_KSA}", "roles/storage.objectViewer"),
+    ]
+    for subject, role in grants:
+        res = r.run(
+            [
+                "gcloud", "storage", "buckets", "add-iam-policy-binding", uri, f"--project={args.project}",
+                f"--member={base}/{subject}", f"--role={role}", "--format=none",
+            ],
+            check=False, capture=True,
+        )
+        if res.returncode != 0:
+            sys.stderr.write(res.stderr)
+            if "denied" in res.stderr.lower() or "403" in res.stderr:
+                sys.stderr.write(permission_hint(account, args.project, res.stderr))
+            raise SystemExit("error: could not grant bucket access")
+        print(f"    {role} -> {subject}")
+
+
+def ensure_configmap(r: Runner, args: argparse.Namespace, desired: Dict[str, str]) -> bool:
+    """Merge desired keys into the ConfigMap. Returns True when something changed."""
+    ns_manifest = json.dumps({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}})
+    r.run(["kubectl", "apply", "-f", "-"], stdin=ns_manifest, capture=True, quiet=True)
+    print(f"    namespace {NAMESPACE} ensured")
+
+    existing = r.run(
+        ["kubectl", "-n", NAMESPACE, "get", "configmap", CONFIGMAP, "-o", "json"],
+        check=False, capture=True, mutating=False, quiet=True,
+    )
+    data: Dict[str, str] = {}
+    if existing.returncode == 0 and existing.stdout.strip():
+        data = json.loads(existing.stdout).get("data") or {}
+    merged = dict(data)
+    merged.update(desired)
+    if merged == data:
+        print(f"    configmap {NAMESPACE}/{CONFIGMAP} already up to date")
+        return False
+    manifest = json.dumps(
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": CONFIGMAP, "namespace": NAMESPACE}, "data": merged}
+    )
+    r.run(["kubectl", "apply", "-f", "-"], stdin=manifest)
+    for k, v in sorted(desired.items()):
+        print(f"    {k}: {v}")
+    return True
+
+
+def deploy(r: Runner, args: argparse.Namespace, root: Path, restart: bool) -> None:
+    r.run([str(root / "dev" / "tasks" / "deploy")], env_overrides={"IMAGE_PREFIX": args.image_prefix})
+    if restart:
+        # The controller and UI read the ConfigMap at start-up only.
+        for d in DEPLOYMENTS:
+            r.run(["kubectl", "-n", NAMESPACE, "rollout", "restart", f"deployment/{d}"])
+    for d in DEPLOYMENTS:
+        r.run(["kubectl", "-n", NAMESPACE, "rollout", "status", f"deployment/{d}", "--timeout=300s"])
+
+
+def check_model_secret(r: Runner) -> None:
+    res = r.run(
+        ["kubectl", "-n", SANDBOX_NAMESPACE, "get", "secret", MODEL_SECRET, "-o", "name"],
+        check=False, capture=True, mutating=False, quiet=True,
+    )
+    if res.returncode == 0:
+        print(f"    secret {SANDBOX_NAMESPACE}/{MODEL_SECRET} present")
+        return
+    print(
+        f"    secret {SANDBOX_NAMESPACE}/{MODEL_SECRET} is MISSING. Sandboxes read model API keys from it.\n"
+        f"    Create it with the keys your evals need, for example:\n"
+        f"      kubectl -n {SANDBOX_NAMESPACE} create secret generic {MODEL_SECRET} \\\n"
+        f"        --from-literal=GOOGLE_API_KEY=<key>\n"
+        f"    (see docs/development.md, 'Running Sample Evaluations with a Real Model')."
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    root = repo_root()
+    r = Runner(args.dry_run, args.kubeconfig)
+    if args.dry_run:
+        print("dry run: mutating commands are printed, not executed")
+
+    Step("Who am I")
+    account = whoami(r, args.project)
+
+    Step(f"Cluster credentials for {args.cluster} ({args.location})")
+    ensure_kubeconfig(r, args)
+
+    desired: Dict[str, str] = {}
+    if args.skip_bucket:
+        Step("Artifact bucket (skipped)")
+        print("    --skip-bucket: sample trajectories will not be viewable in the UI")
+    else:
+        Step(f"Artifact bucket gs://{args.bucket}")
+        ensure_bucket(r, args, account)
+        desired["artifactBucket"] = args.bucket
+        # A leftover local-directory sink would shadow the bucket for the UI.
+        desired["artifactDir"] = "none"
+    for item in args.set:
+        k, v = item.split("=", 1)
+        desired[k.strip()] = v
+
+    Step(f"ConfigMap {NAMESPACE}/{CONFIGMAP}")
+    changed = ensure_configmap(r, args, desired)
+
+    if args.skip_deploy:
+        Step("Deploy (skipped)")
+        print(f"    run later: KUBECONFIG={args.kubeconfig} IMAGE_PREFIX={args.image_prefix} ./dev/tasks/deploy")
+    else:
+        Step(f"Deploy images {args.image_prefix}/*:<git sha> and manifests")
+        deploy(r, args, root, restart=changed)
+
+    Step("Model credentials")
+    check_model_secret(r)
+
+    Step("Done")
+    print(f"    export KUBECONFIG={args.kubeconfig}")
+    print(f"    kubectl -n {NAMESPACE} get runs,comparisons")
+    print(f"    kubectl -n {NAMESPACE} port-forward svc/eval-runner-ui 8080:80   # then open http://localhost:8080/")
+    print("    Next: expose the UI behind your own ingress or gateway, and set uiBaseURL in the ConfigMap")
+    print("    (--set uiBaseURL=https://...) so PR comments link back to it.")
+
+
+if __name__ == "__main__":
+    main()

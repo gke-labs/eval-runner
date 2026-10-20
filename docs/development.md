@@ -142,6 +142,22 @@ For example, on Google Kubernetes Engine (GKE):
 IMAGE_PREFIX=gcr.io/my-gke-project ./dev/tasks/deploy
 ```
 
+### Deploying to GKE in one step (`dev/tasks/deploy-to-gke`)
+
+For a fresh GKE cluster, `./dev/tasks/deploy-to-gke` (Python, standard library only) does the one-time cloud setup and then runs `./dev/tasks/deploy`:
+
+```bash
+./dev/tasks/deploy-to-gke --cluster projects/<project>/locations/<region>/clusters/<cluster>
+```
+
+It fetches cluster credentials into a dedicated kubeconfig (`~/.kube/eval-runner-<project>-<cluster>.kubeconfig`, never `~/.kube/config`, so your default context is untouched), creates the artifact bucket `<project>-eval-runner` if needed, grants the controller and UI Kubernetes ServiceAccounts access to it through Workload Identity Federation principals (no Google service accounts or annotations needed), writes `artifactBucket` into the `eval-runner-config` ConfigMap, deploys with `IMAGE_PREFIX=gcr.io/<project>`, waits for the rollouts, and reports whether the `model-credentials` Secret exists. Every step is idempotent; `--dry-run` prints the commands instead of running them. Use `--set key=value` for extra ConfigMap entries (for example `--set sandboxdImage=...`), `--bucket`, `--image-prefix` and `--kubeconfig` to override defaults, and `--skip-bucket` or `--skip-deploy` to run only part of it.
+
+Granting bucket access needs `storage.buckets.setIamPolicy`. If that step is denied, the script prints the account you are authenticated as and suggests the project-level grant to ask for (or to give yourself, if you administer the project):
+
+```bash
+gcloud projects add-iam-policy-binding <project> --member="user:<you>" --role="roles/storage.admin"
+```
+
 Alternatively, invoke `ap deploy` directly by setting a unique tag:
 
 ```bash
@@ -347,7 +363,7 @@ Writes happen exclusively from the controller pod using Application Default Cred
 
 ### One-Time Cloud Setup
 
-To grant the controller permissions to write artifacts to a GCS bucket using GKE Workload Identity:
+`./dev/tasks/deploy-to-gke` performs this setup automatically using Workload Identity Federation principals (`principal://iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<project>.svc.id.goog/subject/ns/eval-runner/sa/eval-runner-controller`) bound directly on the bucket. The steps below are the manual alternative using a Google Service Account:
 
 1. **Create the Google Service Account (GSA):**
 
