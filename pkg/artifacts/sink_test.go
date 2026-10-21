@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
@@ -507,6 +508,9 @@ func TestLocalDirSink_SummaryJSON_RoundTripAndTruncation(t *testing.T) {
 	if summary.SamplesTruncated {
 		t.Errorf("Expected SamplesTruncated=false for 2 samples, got true")
 	}
+	if summary.SampleCount != 2 {
+		t.Errorf("Expected SampleCount=2, got %d", summary.SampleCount)
+	}
 
 	// Verify truncation at MaxSummarySamples (10,000)
 	largeSamples := make([]artifacts.TaskSampleSummary, 10005)
@@ -514,6 +518,7 @@ func TestLocalDirSink_SummaryJSON_RoundTripAndTruncation(t *testing.T) {
 		largeSamples[i] = artifacts.TaskSampleSummary{ID: fmt.Sprintf("sample-%d", i+1)}
 	}
 	meta.Samples = largeSamples
+	meta.SampleCount = len(largeSamples)
 	savedLargePath, err := sink.StoreArtifact(t.Context(), meta, "result-large.json", []byte(`{}`))
 	if err != nil {
 		t.Fatalf("StoreArtifact failed: %v", err)
@@ -524,6 +529,9 @@ func TestLocalDirSink_SummaryJSON_RoundTripAndTruncation(t *testing.T) {
 	}
 	if !largeSummary.SamplesTruncated {
 		t.Errorf("Expected SamplesTruncated=true for 10005 samples, got false")
+	}
+	if largeSummary.SampleCount != 10005 {
+		t.Errorf("Expected SampleCount=10005, got %d", largeSummary.SampleCount)
 	}
 	if len(largeSummary.Samples) != artifacts.MaxSummarySamples {
 		t.Errorf("Expected %d samples, got %d", artifacts.MaxSummarySamples, len(largeSummary.Samples))
@@ -582,7 +590,74 @@ func TestInMemorySink_SummaryJSON_RoundTripAndTruncation(t *testing.T) {
 	if summary.SuccessRateCI == nil || summary.SuccessRateCI.Method != "t" {
 		t.Errorf("Expected SuccessRateCI.Method=t, got %+v", summary.SuccessRateCI)
 	}
+	if summary.SampleCount != 1 {
+		t.Errorf("Expected SampleCount=1, got %d", summary.SampleCount)
+	}
 	if len(summary.Samples) != 1 {
 		t.Fatalf("Expected 1 sample, got %d", len(summary.Samples))
+	}
+}
+
+func TestReadTaskSummary_ValidationAndLegacyShape(t *testing.T) {
+	tempDir := t.TempDir()
+	sink := &artifacts.LocalDirSink{BaseDir: tempDir}
+
+	// 1. Unsupported schemaVersion (e.g. 2) rejected by ReadTaskSummary
+	badSchemaJSON := []byte(`{
+		"schemaVersion": 2,
+		"taskId": "docs/readme_comprehension"
+	}`)
+	badPath := filepath.Join(tempDir, "runs", "commit1", "docs%2Freadme_comprehension", "summary.json")
+	if err := os.MkdirAll(filepath.Dir(badPath), 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(badPath, badSchemaJSON, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	_, err := artifacts.ReadTaskSummary(t.Context(), sink, badPath)
+	if err == nil {
+		t.Fatalf("Expected error reading schemaVersion 2, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported schemaVersion") {
+		t.Errorf("Expected unsupported schemaVersion error, got: %v", err)
+	}
+
+	// 2. Legacy unversioned shape: "samples" is integer 10, no schemaVersion
+	legacyJSON := []byte(`{
+		"taskId": "docs/readme_comprehension",
+		"model": "google/gemini-3.5-flash-lite",
+		"commit": "abcdef123456",
+		"samples": 10,
+		"successes": 8,
+		"meanScore": 0.8,
+		"capped": false
+	}`)
+	legacyPath := filepath.Join(tempDir, "runs", "commit2", "docs%2Freadme_comprehension", "summary.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, legacyJSON, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	legacySummary, err := artifacts.ReadTaskSummary(t.Context(), sink, legacyPath)
+	if err != nil {
+		t.Fatalf("Expected legacy summary to load successfully, got: %v", err)
+	}
+	if legacySummary.SchemaVersion != 0 {
+		t.Errorf("Expected SchemaVersion=0 for legacy summary, got %d", legacySummary.SchemaVersion)
+	}
+	if legacySummary.SampleCount != 10 {
+		t.Errorf("Expected SampleCount=10 mapped from legacy samples int, got %d", legacySummary.SampleCount)
+	}
+	if legacySummary.Successes != 8 {
+		t.Errorf("Expected Successes=8, got %d", legacySummary.Successes)
+	}
+	if legacySummary.MeanScore == nil || *legacySummary.MeanScore != 0.8 {
+		t.Errorf("Expected MeanScore=0.8, got %v", legacySummary.MeanScore)
+	}
+	if len(legacySummary.Samples) != 0 {
+		t.Errorf("Expected empty Samples slice for legacy summary, got %d items", len(legacySummary.Samples))
 	}
 }

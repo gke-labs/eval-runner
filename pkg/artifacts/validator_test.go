@@ -115,6 +115,7 @@ func TestValidateTaskSummary(t *testing.T) {
 		RunNamespace:      "eval-runner",
 		ControllerVersion: "v1.0.0",
 		Scorer:            "choice",
+		SampleCount:       1,
 		SuccessRate:       &rate,
 		SuccessRateCI: &v1alpha1.ConfidenceInterval{
 			Lower:      0.6,
@@ -225,5 +226,12 @@ func TestValidateTaskSummary(t *testing.T) {
 	badSampleScore.Samples = []TaskSampleSummary{{ID: "s1", Score: &badScoreVal}}
 	if err := ValidateTaskSummary(badSampleScore); err == nil {
 		t.Errorf("Expected error for sample with score=2.5, got nil")
+	}
+
+	// Negative SampleCount
+	negativeCount := valid
+	negativeCount.SampleCount = -5
+	if err := ValidateTaskSummary(negativeCount); err == nil {
+		t.Errorf("Expected error for negative sampleCount, got nil")
 	}
 }

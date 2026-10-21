@@ -58,5 +58,9 @@ func ReadTaskSummary(ctx context.Context, sink ArtifactSink, uri string) (*TaskS
 		return nil, fmt.Errorf("failed to parse summary.json from %s: %w", summaryURI, err)
 	}
 
+	if err := ValidateTaskSummary(summary); err != nil {
+		return nil, fmt.Errorf("invalid summary.json at %s: %w", summaryURI, err)
+	}
+
 	return &summary, nil
 }

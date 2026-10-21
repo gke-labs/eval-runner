@@ -658,6 +658,9 @@ func TestGCSSink_SummaryJSON_NewFieldsAndTruncation(t *testing.T) {
 	if len(summary.Samples) != 1 {
 		t.Fatalf("Expected 1 sample, got %d", len(summary.Samples))
 	}
+	if summary.SampleCount != 1 {
+		t.Errorf("Expected SampleCount=1, got %d", summary.SampleCount)
+	}
 	if summary.SamplesTruncated {
 		t.Errorf("Expected SamplesTruncated=false, got true")
 	}
@@ -668,6 +671,7 @@ func TestGCSSink_SummaryJSON_NewFieldsAndTruncation(t *testing.T) {
 		largeSamples[i] = artifacts.TaskSampleSummary{ID: fmt.Sprintf("sample-%d", i+1)}
 	}
 	meta.Samples = largeSamples
+	meta.SampleCount = len(largeSamples)
 	uriLarge, err := sink.StoreArtifact(t.Context(), meta, "inspect-large.json", []byte(`{}`))
 	if err != nil {
 		t.Fatalf("StoreArtifact failed: %v", err)
@@ -678,6 +682,9 @@ func TestGCSSink_SummaryJSON_NewFieldsAndTruncation(t *testing.T) {
 	}
 	if !summaryLarge.SamplesTruncated {
 		t.Errorf("Expected SamplesTruncated=true for 10002 samples, got false")
+	}
+	if summaryLarge.SampleCount != 10002 {
+		t.Errorf("Expected SampleCount=10002, got %d", summaryLarge.SampleCount)
 	}
 	if len(summaryLarge.Samples) != artifacts.MaxSummarySamples {
 		t.Errorf("Expected %d samples, got %d", artifacts.MaxSummarySamples, len(summaryLarge.Samples))

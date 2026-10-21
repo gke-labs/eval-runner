@@ -256,6 +256,10 @@ func (s *LocalDirSink) StoreArtifact(ctx context.Context, meta RunMetadata, file
 		sampleList = sampleList[:MaxSummarySamples]
 		samplesTruncated = true
 	}
+	sampleCount := meta.SampleCount
+	if sampleCount == 0 {
+		sampleCount = len(meta.Samples)
+	}
 
 	summary := TaskSummary{
 		SchemaVersion:     1,
@@ -266,6 +270,7 @@ func (s *LocalDirSink) StoreArtifact(ctx context.Context, meta RunMetadata, file
 		RunNamespace:      meta.RunNamespace,
 		ControllerVersion: meta.ControllerVersion,
 		Scorer:            meta.Scorer,
+		SampleCount:       sampleCount,
 		Samples:           sampleList,
 		SamplesTruncated:  samplesTruncated,
 		Successes:         meta.Successes,

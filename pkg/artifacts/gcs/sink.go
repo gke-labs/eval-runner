@@ -338,6 +338,10 @@ func (s *GCSSink) StoreArtifact(ctx context.Context, meta artifacts.RunMetadata,
 		sampleList = sampleList[:artifacts.MaxSummarySamples]
 		samplesTruncated = true
 	}
+	sampleCount := meta.SampleCount
+	if sampleCount == 0 {
+		sampleCount = len(meta.Samples)
+	}
 
 	summary := artifacts.TaskSummary{
 		SchemaVersion:     1,
@@ -348,6 +352,7 @@ func (s *GCSSink) StoreArtifact(ctx context.Context, meta artifacts.RunMetadata,
 		RunNamespace:      meta.RunNamespace,
 		ControllerVersion: meta.ControllerVersion,
 		Scorer:            meta.Scorer,
+		SampleCount:       sampleCount,
 		Samples:           sampleList,
 		SamplesTruncated:  samplesTruncated,
 		Successes:         meta.Successes,

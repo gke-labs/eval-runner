@@ -156,6 +156,9 @@ func ValidateTaskSummary(s TaskSummary) error {
 			return fmt.Errorf("invalid sample range [%d, %d]", s.SampleRange.Start, s.SampleRange.End)
 		}
 	}
+	if s.SampleCount < 0 {
+		return fmt.Errorf("sampleCount %d cannot be negative", s.SampleCount)
+	}
 	if len(s.Samples) > MaxSummarySamples {
 		return fmt.Errorf("samples count %d exceeds maximum allowed %d", len(s.Samples), MaxSummarySamples)
 	}

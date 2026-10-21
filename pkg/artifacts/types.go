@@ -39,8 +39,8 @@ func IsNotFound(err error) bool {
 
 // TaskSampleTokens records token usage for an individual evaluated sample in summary.json.
 type TaskSampleTokens struct {
-	Input  int `json:"input,omitempty"`
-	Output int `json:"output,omitempty"`
+	Input  int `json:"input"`
+	Output int `json:"output"`
 }
 
 // TaskSampleSummary records outcome and metrics for an individual evaluated sample in summary.json.
@@ -68,6 +68,7 @@ type RunMetadata struct {
 
 	// Task execution aggregates and timestamps for summary.json
 	Samples          []TaskSampleSummary
+	SampleCount      int
 	SamplesTruncated bool
 	Successes        int
 	MeanScore        *float64
@@ -113,6 +114,7 @@ type TaskSummary struct {
 	RunNamespace      string                       `json:"runNamespace,omitempty"`
 	ControllerVersion string                       `json:"controllerVersion,omitempty"`
 	Scorer            string                       `json:"scorer,omitempty"`
+	SampleCount       int                          `json:"sampleCount"`
 	Samples           []TaskSampleSummary          `json:"samples,omitempty"`
 	SamplesTruncated  bool                         `json:"samplesTruncated,omitempty"`
 	Successes         int                          `json:"successes"`
@@ -146,12 +148,22 @@ func (s *TaskSummary) UnmarshalJSON(data []byte) error {
 	}
 	*s = TaskSummary(raw.taskSummaryAlias)
 	trimmed := bytes.TrimSpace(raw.RawSamples)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var sampleList []TaskSampleSummary
-		if err := json.Unmarshal(trimmed, &sampleList); err != nil {
-			return fmt.Errorf("failed to unmarshal samples array: %w", err)
+	if len(trimmed) > 0 {
+		if trimmed[0] == '[' {
+			var sampleList []TaskSampleSummary
+			if err := json.Unmarshal(trimmed, &sampleList); err != nil {
+				return fmt.Errorf("failed to unmarshal samples array: %w", err)
+			}
+			s.Samples = sampleList
+			if s.SampleCount == 0 && !s.SamplesTruncated {
+				s.SampleCount = len(sampleList)
+			}
+		} else {
+			var count int
+			if err := json.Unmarshal(trimmed, &count); err == nil && s.SampleCount == 0 {
+				s.SampleCount = count
+			}
 		}
-		s.Samples = sampleList
 	}
 	return nil
 }
