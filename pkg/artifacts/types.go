@@ -15,13 +15,19 @@
 package artifacts
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/pkg/stats"
 )
+
+// MaxSummarySamples is the maximum number of sample entries persisted in summary.json before truncation.
+const MaxSummarySamples = 10000
 
 // ErrNotFound indicates that an artifact was not found in the sink.
 var ErrNotFound = errors.New("artifact not found")
@@ -31,26 +37,47 @@ func IsNotFound(err error) bool {
 	return errors.Is(err, ErrNotFound)
 }
 
+// TaskSampleTokens records token usage for an individual evaluated sample in summary.json.
+type TaskSampleTokens struct {
+	Input  int `json:"input,omitempty"`
+	Output int `json:"output,omitempty"`
+}
+
+// TaskSampleSummary records outcome and metrics for an individual evaluated sample in summary.json.
+type TaskSampleSummary struct {
+	ID             string            `json:"id"`
+	Epoch          int               `json:"epoch,omitempty"`
+	Score          *float64          `json:"score,omitempty"`
+	Status         string            `json:"status,omitempty"`
+	LatencySeconds *float64          `json:"latencySeconds,omitempty"`
+	Tokens         *TaskSampleTokens `json:"tokens,omitempty"`
+}
+
 // RunMetadata provides metadata about the Run and Task for artifact storage.
 type RunMetadata struct {
-	RunName      string
-	RunNamespace string
-	TaskID       string
-	Model        string
-	Commit       string
-	TaskCount    int
+	RunName           string
+	RunNamespace      string
+	TaskID            string
+	Model             string
+	Commit            string
+	TaskCount         int
+	ControllerVersion string
+	Scorer            string
+	SuccessRate       *float64
+	SuccessRateCI     *v1alpha1.ConfidenceInterval
 
 	// Task execution aggregates and timestamps for summary.json
-	Samples         int
-	Successes       int
-	MeanScore       *float64
-	StartedAt       *time.Time
-	FinishedAt      *time.Time
-	SampleRange     *SampleRange
-	Tokens          *TaskTokens
-	Latency         *TaskLatency
-	CostUSD         *float64
-	PossibleSamples int
+	Samples          []TaskSampleSummary
+	SamplesTruncated bool
+	Successes        int
+	MeanScore        *float64
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	SampleRange      *SampleRange
+	Tokens           *TaskTokens
+	Latency          *TaskLatency
+	CostUSD          *float64
+	PossibleSamples  int
 }
 
 // TaskLatency records latency percentiles aggregated across evaluated samples.
@@ -78,21 +105,55 @@ type SampleRange struct {
 
 // TaskSummary records per-task aggregates and execution metadata written alongside the Inspect log.
 type TaskSummary struct {
-	TaskID          string       `json:"taskId"`
-	Model           string       `json:"model"`
-	Commit          string       `json:"commit"`
-	Samples         int          `json:"samples"`
-	Successes       int          `json:"successes"`
-	MeanScore       *float64     `json:"meanScore"`
-	StartedAt       *time.Time   `json:"startedAt,omitempty"`
-	FinishedAt      *time.Time   `json:"finishedAt,omitempty"`
-	Capped          bool         `json:"capped"`
-	CapBytes        int64        `json:"capBytes,omitempty"`
-	SampleRange     *SampleRange `json:"sampleRange,omitempty"`
-	Tokens          *TaskTokens  `json:"tokens,omitempty"`
-	Latency         *TaskLatency `json:"latency,omitempty"`
-	CostUSD         *float64     `json:"costUSD,omitempty"`
-	PossibleSamples int          `json:"possibleSamples,omitempty"`
+	SchemaVersion     int                          `json:"schemaVersion,omitempty"`
+	TaskID            string                       `json:"taskId"`
+	Model             string                       `json:"model"`
+	Commit            string                       `json:"commit"`
+	RunName           string                       `json:"runName,omitempty"`
+	RunNamespace      string                       `json:"runNamespace,omitempty"`
+	ControllerVersion string                       `json:"controllerVersion,omitempty"`
+	Scorer            string                       `json:"scorer,omitempty"`
+	Samples           []TaskSampleSummary          `json:"samples,omitempty"`
+	SamplesTruncated  bool                         `json:"samplesTruncated,omitempty"`
+	Successes         int                          `json:"successes"`
+	MeanScore         *float64                     `json:"meanScore"`
+	SuccessRate       *float64                     `json:"successRate,omitempty"`
+	SuccessRateCI     *v1alpha1.ConfidenceInterval `json:"successRateCI,omitempty"`
+	StartedAt         *time.Time                   `json:"startedAt,omitempty"`
+	FinishedAt        *time.Time                   `json:"finishedAt,omitempty"`
+	Capped            bool                         `json:"capped"`
+	CapBytes          int64                        `json:"capBytes,omitempty"`
+	SampleRange       *SampleRange                 `json:"sampleRange,omitempty"`
+	Tokens            *TaskTokens                  `json:"tokens,omitempty"`
+	Latency           *TaskLatency                 `json:"latency,omitempty"`
+	CostUSD           *float64                     `json:"costUSD,omitempty"`
+	PossibleSamples   int                          `json:"possibleSamples,omitempty"`
+}
+
+type taskSummaryAlias TaskSummary
+
+type rawTaskSummary struct {
+	taskSummaryAlias
+	RawSamples json.RawMessage `json:"samples"`
+}
+
+// UnmarshalJSON unmarshals summary.json, supporting schemaVersion 1 (samples array)
+// and backward-compatibility with unversioned legacy summaries where samples was an integer count.
+func (s *TaskSummary) UnmarshalJSON(data []byte) error {
+	var raw rawTaskSummary
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*s = TaskSummary(raw.taskSummaryAlias)
+	trimmed := bytes.TrimSpace(raw.RawSamples)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var sampleList []TaskSampleSummary
+		if err := json.Unmarshal(trimmed, &sampleList); err != nil {
+			return fmt.Errorf("failed to unmarshal samples array: %w", err)
+		}
+		s.Samples = sampleList
+	}
+	return nil
 }
 
 // ComparisonTaskArtifact records paired comparison details for a single task in the artifact JSON.

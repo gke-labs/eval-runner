@@ -15,8 +15,11 @@
 package artifacts
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/eval-runner/api/v1alpha1"
 )
 
 func TestValidateSafeComponent(t *testing.T) {
@@ -97,5 +100,130 @@ func TestValidateArtifact_Valid(t *testing.T) {
 	}
 	if err := ValidateArtifact(meta, "log.json"); err != nil {
 		t.Fatalf("Expected valid artifact to pass validation, got: %v", err)
+	}
+}
+
+func TestValidateTaskSummary(t *testing.T) {
+	rate := 0.8
+	score := 1.0
+	valid := TaskSummary{
+		SchemaVersion:     1,
+		TaskID:            "docs/readme_comprehension",
+		Model:             "gemini-2.5-flash",
+		Commit:            "1234567890ab",
+		RunName:           "run-1",
+		RunNamespace:      "eval-runner",
+		ControllerVersion: "v1.0.0",
+		Scorer:            "choice",
+		SuccessRate:       &rate,
+		SuccessRateCI: &v1alpha1.ConfidenceInterval{
+			Lower:      0.6,
+			Upper:      0.9,
+			Confidence: 0.95,
+			Method:     "wilson",
+		},
+		Samples: []TaskSampleSummary{
+			{
+				ID:    "s1",
+				Score: &score,
+			},
+		},
+	}
+
+	if err := ValidateTaskSummary(valid); err != nil {
+		t.Fatalf("Expected valid TaskSummary to pass, got: %v", err)
+	}
+
+	// Unsupported schema version
+	invalidSchema := valid
+	invalidSchema.SchemaVersion = 2
+	if err := ValidateTaskSummary(invalidSchema); err == nil {
+		t.Errorf("Expected error for schemaVersion=2, got nil")
+	}
+
+	// Invalid TaskID
+	invalidTaskID := valid
+	invalidTaskID.TaskID = "/invalid"
+	if err := ValidateTaskSummary(invalidTaskID); err == nil {
+		t.Errorf("Expected error for invalid TaskID, got nil")
+	}
+
+	// Invalid commit
+	invalidCommit := valid
+	invalidCommit.Commit = "../escape"
+	if err := ValidateTaskSummary(invalidCommit); err == nil {
+		t.Errorf("Expected error for invalid commit, got nil")
+	}
+
+	// Invalid runName
+	invalidRunName := valid
+	invalidRunName.RunName = "foo/bar"
+	if err := ValidateTaskSummary(invalidRunName); err == nil {
+		t.Errorf("Expected error for invalid runName, got nil")
+	}
+
+	// Invalid runNamespace
+	invalidRunNamespace := valid
+	invalidRunNamespace.RunNamespace = "foo\x00bar"
+	if err := ValidateTaskSummary(invalidRunNamespace); err == nil {
+		t.Errorf("Expected error for invalid runNamespace, got nil")
+	}
+
+	// Invalid successRate (< 0 or > 1)
+	invalidRate := valid
+	badRate := 1.5
+	invalidRate.SuccessRate = &badRate
+	if err := ValidateTaskSummary(invalidRate); err == nil {
+		t.Errorf("Expected error for successRate=1.5, got nil")
+	}
+
+	// Invalid confidence interval (lower > upper)
+	invalidCI := valid
+	invalidCI.SuccessRateCI = &v1alpha1.ConfidenceInterval{
+		Lower:      0.9,
+		Upper:      0.5,
+		Confidence: 0.95,
+		Method:     "wilson",
+	}
+	if err := ValidateTaskSummary(invalidCI); err == nil {
+		t.Errorf("Expected error for lower > upper in CI, got nil")
+	}
+
+	// Empty CI method
+	emptyMethodCI := valid
+	emptyMethodCI.SuccessRateCI = &v1alpha1.ConfidenceInterval{
+		Lower:      0.5,
+		Upper:      0.9,
+		Confidence: 0.95,
+		Method:     "",
+	}
+	if err := ValidateTaskSummary(emptyMethodCI); err == nil {
+		t.Errorf("Expected error for empty CI method, got nil")
+	}
+
+	// Samples count exceeds MaxSummarySamples
+	oversizedSamples := valid
+	oversizedList := make([]TaskSampleSummary, MaxSummarySamples+1)
+	for i := range oversizedList {
+		oversizedList[i] = TaskSampleSummary{ID: fmt.Sprintf("sample-%d", i+1)}
+	}
+	oversizedSamples.Samples = oversizedList
+	if err := ValidateTaskSummary(oversizedSamples); err == nil {
+		t.Errorf("Expected error for samples exceeding MaxSummarySamples, got nil")
+	}
+
+	// Sample with empty ID
+	emptySampleID := valid
+	emptySampleID.Samples = []TaskSampleSummary{{ID: "   "}}
+	if err := ValidateTaskSummary(emptySampleID); err == nil {
+		t.Errorf("Expected error for sample with empty ID, got nil")
+	}
+
+	// Sample with invalid score
+	badSampleScore := valid
+	badScoreVal := 2.5
+	badSampleScore.Samples = []TaskSampleSummary{{ID: "s1", Score: &badScoreVal}}
+	if err := ValidateTaskSummary(badSampleScore); err == nil {
+		t.Errorf("Expected error for sample with score=2.5, got nil")
 	}
 }

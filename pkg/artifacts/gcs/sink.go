@@ -332,21 +332,36 @@ func (s *GCSSink) StoreArtifact(ctx context.Context, meta artifacts.RunMetadata,
 		return "", fmt.Errorf("failed to upload inspect log to gs://%s/%s: %w", s.bucket, logObject, err)
 	}
 
+	sampleList := meta.Samples
+	samplesTruncated := meta.SamplesTruncated
+	if len(sampleList) > artifacts.MaxSummarySamples {
+		sampleList = sampleList[:artifacts.MaxSummarySamples]
+		samplesTruncated = true
+	}
+
 	summary := artifacts.TaskSummary{
-		TaskID:          meta.TaskID,
-		Model:           meta.Model,
-		Commit:          meta.Commit,
-		Samples:         meta.Samples,
-		Successes:       meta.Successes,
-		MeanScore:       meta.MeanScore,
-		StartedAt:       meta.StartedAt,
-		FinishedAt:      meta.FinishedAt,
-		Capped:          capped,
-		SampleRange:     meta.SampleRange,
-		Tokens:          meta.Tokens,
-		Latency:         meta.Latency,
-		CostUSD:         meta.CostUSD,
-		PossibleSamples: meta.PossibleSamples,
+		SchemaVersion:     1,
+		TaskID:            meta.TaskID,
+		Model:             meta.Model,
+		Commit:            meta.Commit,
+		RunName:           meta.RunName,
+		RunNamespace:      meta.RunNamespace,
+		ControllerVersion: meta.ControllerVersion,
+		Scorer:            meta.Scorer,
+		Samples:           sampleList,
+		SamplesTruncated:  samplesTruncated,
+		Successes:         meta.Successes,
+		MeanScore:         meta.MeanScore,
+		SuccessRate:       meta.SuccessRate,
+		SuccessRateCI:     meta.SuccessRateCI,
+		StartedAt:         meta.StartedAt,
+		FinishedAt:        meta.FinishedAt,
+		Capped:            capped,
+		SampleRange:       meta.SampleRange,
+		Tokens:            meta.Tokens,
+		Latency:           meta.Latency,
+		CostUSD:           meta.CostUSD,
+		PossibleSamples:   meta.PossibleSamples,
 	}
 	if capped {
 		summary.CapBytes = capLimit

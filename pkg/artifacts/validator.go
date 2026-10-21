@@ -106,3 +106,66 @@ func ValidateArtifact(meta RunMetadata, filename string) error {
 	}
 	return nil
 }
+
+// ValidateTaskSummary validates the structural and semantic constraints of a TaskSummary.
+func ValidateTaskSummary(s TaskSummary) error {
+	if s.SchemaVersion != 0 && s.SchemaVersion != 1 {
+		return fmt.Errorf("unsupported schemaVersion %d: must be 0 or 1", s.SchemaVersion)
+	}
+	if err := ValidateTaskID(s.TaskID); err != nil {
+		return err
+	}
+	if s.Commit != "" {
+		if err := ValidateSafeComponent("commit", s.Commit); err != nil {
+			return err
+		}
+	}
+	if s.RunName != "" {
+		if err := ValidateSafeComponent("runName", s.RunName); err != nil {
+			return err
+		}
+	}
+	if s.RunNamespace != "" {
+		if err := ValidateSafeComponent("runNamespace", s.RunNamespace); err != nil {
+			return err
+		}
+	}
+	if s.MeanScore != nil {
+		if *s.MeanScore < 0.0 || *s.MeanScore > 1.0 {
+			return fmt.Errorf("meanScore %f out of range [0, 1]", *s.MeanScore)
+		}
+	}
+	if s.SuccessRate != nil {
+		if *s.SuccessRate < 0.0 || *s.SuccessRate > 1.0 {
+			return fmt.Errorf("successRate %f out of range [0, 1]", *s.SuccessRate)
+		}
+	}
+	if s.SuccessRateCI != nil {
+		if s.SuccessRateCI.Confidence <= 0 || s.SuccessRateCI.Confidence > 1 {
+			return fmt.Errorf("confidence %f out of range (0, 1]", s.SuccessRateCI.Confidence)
+		}
+		if s.SuccessRateCI.Lower < 0 || s.SuccessRateCI.Upper > 1 || s.SuccessRateCI.Lower > s.SuccessRateCI.Upper {
+			return fmt.Errorf("invalid confidence interval [%f, %f]", s.SuccessRateCI.Lower, s.SuccessRateCI.Upper)
+		}
+		if strings.TrimSpace(s.SuccessRateCI.Method) == "" {
+			return fmt.Errorf("successRateCI method must not be empty")
+		}
+	}
+	if s.SampleRange != nil {
+		if s.SampleRange.Start <= 0 || s.SampleRange.End < s.SampleRange.Start {
+			return fmt.Errorf("invalid sample range [%d, %d]", s.SampleRange.Start, s.SampleRange.End)
+		}
+	}
+	if len(s.Samples) > MaxSummarySamples {
+		return fmt.Errorf("samples count %d exceeds maximum allowed %d", len(s.Samples), MaxSummarySamples)
+	}
+	for i, sample := range s.Samples {
+		if strings.TrimSpace(sample.ID) == "" {
+			return fmt.Errorf("sample at index %d has empty id", i)
+		}
+		if sample.Score != nil && (*sample.Score < 0.0 || *sample.Score > 1.0) {
+			return fmt.Errorf("sample %q score %f out of range [0, 1]", sample.ID, *sample.Score)
+		}
+	}
+	return nil
+}

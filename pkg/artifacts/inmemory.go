@@ -17,6 +17,7 @@ package artifacts
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -121,6 +122,49 @@ func (s *InMemorySink) StoreArtifact(ctx context.Context, meta RunMetadata, file
 	copied := make([]byte, len(data))
 	copy(copied, data)
 	s.objects[objKey] = copied
+
+	sampleList := meta.Samples
+	samplesTruncated := meta.SamplesTruncated
+	if len(sampleList) > MaxSummarySamples {
+		sampleList = sampleList[:MaxSummarySamples]
+		samplesTruncated = true
+	}
+
+	summary := TaskSummary{
+		SchemaVersion:     1,
+		TaskID:            meta.TaskID,
+		Model:             meta.Model,
+		Commit:            meta.Commit,
+		RunName:           meta.RunName,
+		RunNamespace:      meta.RunNamespace,
+		ControllerVersion: meta.ControllerVersion,
+		Scorer:            meta.Scorer,
+		Samples:           sampleList,
+		SamplesTruncated:  samplesTruncated,
+		Successes:         meta.Successes,
+		MeanScore:         meta.MeanScore,
+		SuccessRate:       meta.SuccessRate,
+		SuccessRateCI:     meta.SuccessRateCI,
+		StartedAt:         meta.StartedAt,
+		FinishedAt:        meta.FinishedAt,
+		SampleRange:       meta.SampleRange,
+		Tokens:            meta.Tokens,
+		Latency:           meta.Latency,
+		CostUSD:           meta.CostUSD,
+		PossibleSamples:   meta.PossibleSamples,
+	}
+	summaryBytes, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal summary.json: %w", err)
+	}
+	summaryBytes = append(summaryBytes, '\n')
+	var summaryKey string
+	if meta.Commit != "" {
+		summaryKey = fmt.Sprintf("runs/%s/%s/summary.json", meta.Commit, meta.TaskID)
+	} else {
+		summaryKey = fmt.Sprintf("runs/%s/%s/%s/summary.json", meta.RunNamespace, meta.RunName, meta.TaskID)
+	}
+	s.objects[summaryKey] = summaryBytes
 
 	return uri, nil
 }
