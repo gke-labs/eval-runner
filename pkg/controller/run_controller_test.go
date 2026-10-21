@@ -4486,11 +4486,23 @@ func TestReconcileArtifactSink_GCSArtifactsAndLogPathRecorded(t *testing.T) {
 	if err := json.Unmarshal(summaryObj.Data, &summary); err != nil {
 		t.Fatalf("Failed to parse summary.json: %v", err)
 	}
+	if summary.SchemaVersion != 1 {
+		t.Errorf("Expected SchemaVersion 1, got %d", summary.SchemaVersion)
+	}
 	if summary.TaskID != "docs/readme_comprehension" {
 		t.Errorf("Expected TaskID docs/readme_comprehension, got %s", summary.TaskID)
 	}
-	if summary.Samples != 2 {
-		t.Errorf("Expected 2 samples, got %d", summary.Samples)
+	if summary.RunName != "test-run-gcs" {
+		t.Errorf("Expected RunName test-run-gcs, got %s", summary.RunName)
+	}
+	if summary.RunNamespace != "eval-runner" {
+		t.Errorf("Expected RunNamespace eval-runner, got %s", summary.RunNamespace)
+	}
+	if summary.Scorer != "accuracy" {
+		t.Errorf("Expected Scorer accuracy, got %s", summary.Scorer)
+	}
+	if len(summary.Samples) != 2 {
+		t.Errorf("Expected 2 samples, got %d", len(summary.Samples))
 	}
 	if summary.Successes != 1 {
 		t.Errorf("Expected 1 success, got %d", summary.Successes)
@@ -4498,8 +4510,162 @@ func TestReconcileArtifactSink_GCSArtifactsAndLogPathRecorded(t *testing.T) {
 	if summary.MeanScore == nil || *summary.MeanScore != 0.5 {
 		t.Errorf("Expected meanScore 0.5, got %v", summary.MeanScore)
 	}
+	if summary.SuccessRate == nil || *summary.SuccessRate != 0.5 {
+		t.Errorf("Expected successRate 0.5, got %v", summary.SuccessRate)
+	}
+	if summary.SuccessRateCI == nil || summary.SuccessRateCI.Method != "wilson" {
+		t.Errorf("Expected SuccessRateCI.Method wilson for binary scores, got %+v", summary.SuccessRateCI)
+	}
 	if summary.StartedAt == nil || summary.FinishedAt == nil {
 		t.Errorf("Expected StartedAt and FinishedAt to be populated")
+	}
+}
+
+func TestReconcileArtifactSink_StoresSummaryJSON_ContinuousScorerMethodT(t *testing.T) {
+	scheme := setupScheme(t)
+
+	manifest := &v1alpha1.Manifest{
+		Tasks: []v1alpha1.ManifestTask{
+			{ID: "continuous/partial_credit", Spec: "eval.py@task"},
+		},
+	}
+
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-run-partial",
+			Namespace: "eval-runner",
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "git://git-server/repo.git",
+				Commit: "fedcba654321",
+			},
+			Model: "mockllm/model",
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseRunning,
+			Discovery: &v1alpha1.RunDiscoveryStatus{
+				TaskCount:         1,
+				EligibleTaskCount: 1,
+				TaskIDs:           []string{"continuous/partial_credit"},
+			},
+			Tasks: []v1alpha1.TaskStatus{
+				{ID: "continuous/partial_credit", Phase: v1alpha1.TaskPhasePending},
+			},
+		},
+	}
+
+	inspectLog := `{
+		"version": 2,
+		"status": "success",
+		"eval": {"task": "continuous/partial_credit", "model": "mockllm/model"},
+		"samples": [
+			{"id": 1, "scores": {"f1": {"value": 0.5}}},
+			{"id": 2, "scores": {"f1": {"value": 0.75}}}
+		]
+	}`
+
+	executor := &sandboxclient.FakeClient{
+		ExecFn: func(call int, ctx context.Context, cfg sandboxclient.ProcessConfig) (*sandboxclient.ExecuteResult, error) {
+			if len(cfg.Command) > 0 && cfg.Command[0] == "ls" {
+				return &sandboxclient.ExecuteResult{ExitCode: 0, Stdout: "partial_eval.json\n"}, nil
+			}
+			return &sandboxclient.ExecuteResult{ExitCode: 0}, nil
+		},
+		ReadFileFn: func(ctx context.Context, path string) ([]byte, error) {
+			return []byte(inspectLog), nil
+		},
+	}
+
+	fakeGCSClient := fakes.NewFakeStorageClient()
+	gcsSink, err := gcs.New(t.Context(), "gs://test-bucket", gcs.WithStorageClient(fakeGCSClient))
+	if err != nil {
+		t.Fatalf("Failed to create GCS sink: %v", err)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(run).
+		WithStatusSubresource(run).
+		Build()
+
+	reconciler := &RunReconciler{
+		Client:            cl,
+		Scheme:            scheme,
+		SandboxClient:     executor,
+		SandboxNamespace:  "eval-runner-sandbox",
+		ArtifactSink:      gcsSink,
+		SampleRunnerImage: "runner:test",
+		ControllerVersion: "v1.5.0",
+		Now: func() time.Time {
+			return time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+		},
+	}
+	reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "eval-runner",
+			Name:      "test-run-partial",
+		},
+	}
+
+	// Turn 1: Creates sandbox
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile turn 1 error: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      discovery.TaskSandboxNameForRun("test-run-partial", "continuous/partial_credit"),
+			Namespace: "eval-runner-sandbox",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.244.0.51",
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	if err := cl.Create(t.Context(), pod); err != nil {
+		t.Fatalf("Failed to create pod: %v", err)
+	}
+
+	// Turn 2: Executes task and writes artifacts to GCS
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile turn 2 error: %v", err)
+	}
+
+	summaryObj, exists := fakeGCSClient.GetObject("test-bucket", "runs/fedcba654321/continuous/partial_credit/summary.json")
+	if !exists {
+		t.Fatalf("summary.json was not uploaded to GCS")
+	}
+
+	var summary artifacts.TaskSummary
+	if err := json.Unmarshal(summaryObj.Data, &summary); err != nil {
+		t.Fatalf("Failed to parse summary.json: %v", err)
+	}
+
+	if summary.SchemaVersion != 1 {
+		t.Errorf("Expected SchemaVersion=1, got %d", summary.SchemaVersion)
+	}
+	if summary.ControllerVersion != "v1.5.0" {
+		t.Errorf("Expected ControllerVersion=v1.5.0, got %s", summary.ControllerVersion)
+	}
+	if summary.Scorer != "f1" {
+		t.Errorf("Expected Scorer=f1, got %s", summary.Scorer)
+	}
+	if summary.SuccessRateCI == nil || summary.SuccessRateCI.Method != "t" {
+		t.Errorf("Expected SuccessRateCI.Method=t for partial credit, got %+v", summary.SuccessRateCI)
+	}
+	if len(summary.Samples) != 2 {
+		t.Fatalf("Expected 2 samples, got %d", len(summary.Samples))
 	}
 }
 
