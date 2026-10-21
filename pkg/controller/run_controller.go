@@ -37,6 +37,7 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/pki"
 	"github.com/gke-labs/eval-runner/pkg/sandboxclient"
 	"github.com/gke-labs/eval-runner/pkg/stats"
+	"github.com/gke-labs/eval-runner/pkg/version"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -229,16 +230,11 @@ func (r *RunReconciler) controllerNamespace() string {
 	return discovery.DefaultControllerNamespace
 }
 
-// DefaultControllerVersion is used if RunReconciler.ControllerVersion is not configured.
-const DefaultControllerVersion = "devel"
-
 func (r *RunReconciler) controllerVersion() string {
-	r.cfgMu.RLock()
-	defer r.cfgMu.RUnlock()
 	if r.ControllerVersion != "" {
 		return r.ControllerVersion
 	}
-	return DefaultControllerVersion
+	return version.Get()
 }
 
 func (r *RunReconciler) sandboxdImage() string {
@@ -2386,27 +2382,25 @@ func (r *RunReconciler) executeTask(ctx context.Context, run *v1alpha1.Run, task
 	var successRate *float64
 	var successRateCI *v1alpha1.ConfidenceInterval
 
-	if agg.Samples > 0 {
-		if agg.IsBinary() {
-			est := stats.Proportion(agg.Successes, agg.Samples, 0.95)
-			rate := est.Point
-			successRate = &rate
-			successRateCI = &v1alpha1.ConfidenceInterval{
-				Lower:      est.CI.Lower,
-				Upper:      est.CI.Upper,
-				Confidence: 0.95,
-				Method:     "wilson",
-			}
-		} else {
-			est := stats.Mean(agg.Scores, 0.95)
-			rate := est.Point
-			successRate = &rate
-			successRateCI = &v1alpha1.ConfidenceInterval{
-				Lower:      est.CI.Lower,
-				Upper:      est.CI.Upper,
-				Confidence: 0.95,
-				Method:     "t",
-			}
+	if agg.IsBinary() {
+		est := stats.Proportion(agg.Successes, agg.Samples, 0.95)
+		rate := est.Point
+		successRate = &rate
+		successRateCI = &v1alpha1.ConfidenceInterval{
+			Lower:      est.CI.Lower,
+			Upper:      est.CI.Upper,
+			Confidence: 0.95,
+			Method:     "wilson",
+		}
+	} else {
+		est := stats.Mean(agg.Scores, 0.95)
+		rate := est.Point
+		successRate = &rate
+		successRateCI = &v1alpha1.ConfidenceInterval{
+			Lower:      est.CI.Lower,
+			Upper:      est.CI.Upper,
+			Confidence: 0.95,
+			Method:     "t",
 		}
 	}
 
@@ -2428,6 +2422,7 @@ func (r *RunReconciler) executeTask(ctx context.Context, run *v1alpha1.Run, task
 		Model:             run.Spec.Model,
 		Commit:            run.Spec.Repo.Commit,
 		Scorer:            primaryScorer,
+		SampleCount:       agg.Samples,
 		Samples:           sampleSummaries,
 		Successes:         agg.Successes,
 		MeanScore:         agg.MeanScore,

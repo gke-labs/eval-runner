@@ -4519,6 +4519,26 @@ func TestReconcileArtifactSink_GCSArtifactsAndLogPathRecorded(t *testing.T) {
 	if summary.StartedAt == nil || summary.FinishedAt == nil {
 		t.Errorf("Expected StartedAt and FinishedAt to be populated")
 	}
+
+	// Pin the invariant that summary.json and status.tasks[] agree on rate, CI, and sample count
+	if t1.SuccessRate == nil || summary.SuccessRate == nil || *summary.SuccessRate != *t1.SuccessRate {
+		t.Errorf("SuccessRate mismatch: summary=%v, task=%v", summary.SuccessRate, t1.SuccessRate)
+	}
+	if t1.SuccessRateCI == nil || summary.SuccessRateCI == nil {
+		t.Fatalf("SuccessRateCI missing: summary=%+v, task=%+v", summary.SuccessRateCI, t1.SuccessRateCI)
+	}
+	if summary.SuccessRateCI.Lower != t1.SuccessRateCI.Lower ||
+		summary.SuccessRateCI.Upper != t1.SuccessRateCI.Upper ||
+		summary.SuccessRateCI.Confidence != t1.SuccessRateCI.Confidence ||
+		summary.SuccessRateCI.Method != t1.SuccessRateCI.Method {
+		t.Errorf("SuccessRateCI mismatch: summary=%+v, task=%+v", summary.SuccessRateCI, t1.SuccessRateCI)
+	}
+	if len(summary.Samples) != t1.Samples {
+		t.Errorf("Samples count mismatch: summary len=%d, task.Samples=%d", len(summary.Samples), t1.Samples)
+	}
+	if summary.SampleCount != t1.Samples {
+		t.Errorf("SampleCount mismatch: summary.SampleCount=%d, task.Samples=%d", summary.SampleCount, t1.Samples)
+	}
 }
 
 func TestReconcileArtifactSink_StoresSummaryJSON_ContinuousScorerMethodT(t *testing.T) {
@@ -4666,6 +4686,35 @@ func TestReconcileArtifactSink_StoresSummaryJSON_ContinuousScorerMethodT(t *test
 	}
 	if len(summary.Samples) != 2 {
 		t.Fatalf("Expected 2 samples, got %d", len(summary.Samples))
+	}
+
+	// Pin the invariant that summary.json and status.tasks[] agree on rate, CI, and sample count
+	var updatedRun v1alpha1.Run
+	if err := cl.Get(t.Context(), client.ObjectKeyFromObject(run), &updatedRun); err != nil {
+		t.Fatalf("Failed to fetch updated Run: %v", err)
+	}
+	if len(updatedRun.Status.Tasks) == 0 {
+		t.Fatalf("Expected at least 1 task in updated Run status")
+	}
+	t1 := updatedRun.Status.Tasks[0]
+
+	if t1.SuccessRate == nil || summary.SuccessRate == nil || *summary.SuccessRate != *t1.SuccessRate {
+		t.Errorf("SuccessRate mismatch: summary=%v, task=%v", summary.SuccessRate, t1.SuccessRate)
+	}
+	if t1.SuccessRateCI == nil || summary.SuccessRateCI == nil {
+		t.Fatalf("SuccessRateCI missing: summary=%+v, task=%+v", summary.SuccessRateCI, t1.SuccessRateCI)
+	}
+	if summary.SuccessRateCI.Lower != t1.SuccessRateCI.Lower ||
+		summary.SuccessRateCI.Upper != t1.SuccessRateCI.Upper ||
+		summary.SuccessRateCI.Confidence != t1.SuccessRateCI.Confidence ||
+		summary.SuccessRateCI.Method != t1.SuccessRateCI.Method {
+		t.Errorf("SuccessRateCI mismatch: summary=%+v, task=%+v", summary.SuccessRateCI, t1.SuccessRateCI)
+	}
+	if len(summary.Samples) != t1.Samples {
+		t.Errorf("Samples count mismatch: summary len=%d, task.Samples=%d", len(summary.Samples), t1.Samples)
+	}
+	if summary.SampleCount != t1.Samples {
+		t.Errorf("SampleCount mismatch: summary.SampleCount=%d, task.Samples=%d", summary.SampleCount, t1.Samples)
 	}
 }
 

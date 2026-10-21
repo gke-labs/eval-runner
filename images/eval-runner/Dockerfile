@@ -15,6 +15,7 @@
 FROM golang:1.27 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION
 
 WORKDIR /workspace
 COPY go.mod go.sum ./
@@ -27,7 +28,9 @@ COPY pkg/ pkg/
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o eval-runner cmd/eval-runner/main.go
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
+    -ldflags "-X github.com/gke-labs/eval-runner/pkg/version.Version=${VERSION}" \
+    -o eval-runner cmd/eval-runner/main.go
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /

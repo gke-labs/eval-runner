@@ -30,6 +30,7 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/discovery"
 	"github.com/gke-labs/eval-runner/pkg/pki"
 	"github.com/gke-labs/eval-runner/pkg/sandboxclient"
+	"github.com/gke-labs/eval-runner/pkg/version"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -322,6 +323,7 @@ func main() {
 		Scheme:               mgr.GetScheme(),
 		ClientFactory:        clientFactory,
 		ControllerNamespace:  evalRunnerNamespace,
+		ControllerVersion:    version.Get(),
 		SandboxNamespace:     sandboxNamespace,
 		PKIManager:           pkiManager,
 		SandboxdImage:        clusterConfig.SandboxdImage,
