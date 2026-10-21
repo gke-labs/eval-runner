@@ -830,6 +830,7 @@ The `summary.json` contains:
   "runNamespace": "eval-runner",
   "controllerVersion": "v1.0.0",
   "scorer": "choice",
+  "sampleCount": 10,
   "samples": [
     {
       "id": "1",

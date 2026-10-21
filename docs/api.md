@@ -242,41 +242,42 @@ Alongside raw Inspect evaluation logs, the controller writes a self-describing t
 
 | Field | Type | Description |
 |---|---|---|
-| `schemaVersion` | `int` | Schema version of the summary file (`1`). |
+| `schemaVersion` | `integer` | Schema version of the summary file (`1`). |
 | `taskId` | `string` | Unique task identifier matching the manifest (e.g. `docs/readme_comprehension`). |
 | `model` | `string` | Model identifier evaluated (from `Run.spec.model`). |
 | `commit` | `string` | Git commit SHA evaluated (from `Run.spec.repo.commit`). |
-| `runName` | `string` | Name of the Kubernetes `Run` resource that produced this task artifact. |
-| `runNamespace` | `string` | Namespace of the Kubernetes `Run` resource. |
-| `controllerVersion` | `string` | Version or build identifier of the eval-runner controller. |
-| `scorer` | `string` | Primary scorer used to score samples (e.g. `accuracy`, `choice`, `includes`). |
-| `successRate` | `*float64` | Point estimate of task success rate in $[0, 1]$ (point proportion or mean score). |
-| `successRateCI` | `*ConfidenceInterval` | 95% confidence interval for success rate (`lower`, `upper`, `confidence`, `method`). |
-| `successRateCI.lower` | `float64` | Lower confidence bound in $[0, 1]$. |
-| `successRateCI.upper` | `float64` | Upper confidence bound in $[0, 1]$. |
-| `successRateCI.confidence` | `float64` | Confidence level (typically `0.95`). |
+| `runName` | `string` | Name of the Kubernetes `Run` resource that produced this task artifact (omitted if empty). |
+| `runNamespace` | `string` | Namespace of the Kubernetes `Run` resource (omitted if empty). |
+| `controllerVersion` | `string` | Version or build identifier of the eval-runner controller (omitted if empty). |
+| `scorer` | `string` | Primary scorer used to score samples, e.g. `accuracy`, `choice`, `includes` (omitted if empty). |
+| `sampleCount` | `integer` | Total number of samples evaluated for this task (denominator N). |
+| `successRate` | `number` | Point estimate of task success rate in [0, 1] (point proportion or mean score; omitted if uncomputed). |
+| `successRateCI` | `object` | 95% confidence interval for success rate (omitted if uncomputed). |
+| `successRateCI.lower` | `number` | Lower confidence bound in [0, 1]. |
+| `successRateCI.upper` | `number` | Upper confidence bound in [0, 1]. |
+| `successRateCI.confidence` | `number` | Confidence level (typically `0.95`). |
 | `successRateCI.method` | `string` | Statistical interval method: `"wilson"` for binary scores, `"t"` for continuous scores. |
-| `samples` | `[]TaskSampleSummary` | Per-sample execution outcomes and metrics, capped at 10,000 entries. |
+| `samples` | `array` | Per-sample execution outcomes and metrics, capped at 10,000 entries (omitted if empty). |
 | `samples[].id` | `string` | Stable sample identifier (formatted with `#epoch` if epoch > 1). |
-| `samples[].epoch` | `int` | Sample epoch index (when present in Inspect log). |
-| `samples[].score` | `*float64` | Numeric score assigned by the primary scorer. |
-| `samples[].status` | `string` | Sample outcome: `"pass"` ($\text{score} \ge 1.0$), `"fail"` ($\text{score} < 1.0$), or `"unknown"`. |
-| `samples[].latencySeconds` | `*float64` | Execution duration in seconds for this sample. |
-| `samples[].tokens` | `*TaskSampleTokens` | Token usage breakdown for this sample (`input`, `output`). |
-| `samples[].tokens.input` | `int` | Input/prompt tokens consumed by models for this sample. |
-| `samples[].tokens.output` | `int` | Output/completion tokens consumed by models for this sample. |
-| `samplesTruncated` | `bool` | True if the task evaluated more than 10,000 samples and the `samples` array was capped. |
-| `successes` | `int` | Number of samples with score $\ge 1.0$. |
-| `meanScore` | `*float64` | Mean score across evaluated samples in $[0, 1]$. |
-| `sampleRange` | `*SampleRange` | Evaluated sample window (`start`, `end`). |
-| `startedAt` | `*time.Time` | Timestamp when the task began execution. |
-| `finishedAt` | `*time.Time` | Timestamp when the task completed. |
-| `capped` | `bool` | True if the raw Inspect log exceeded `artifactMaxUploadBytes` and was capped. |
-| `capBytes` | `int64` | Upload byte limit applied when `capped` is true. |
-| `tokens` | `*TaskTokens` | Aggregated token usage breakdown for the task (`input`, `output`, `total`, etc.). |
-| `latency` | `*TaskLatency` | Aggregated sample latency percentiles (`p50`, `p95`). |
-| `costUSD` | `*float64` | Estimated task evaluation cost in USD from model prices. |
-| `possibleSamples` | `int` | Total dataset size (possible samples) when known from the Inspect log. |
+| `samples[].epoch` | `integer` | Sample epoch index (omitted if empty). |
+| `samples[].score` | `number` | Numeric score assigned by the primary scorer (omitted if null). |
+| `samples[].status` | `string` | Sample outcome: `"pass"` (score >= 1.0), `"fail"` (score < 1.0), or `"unknown"` (omitted if empty). |
+| `samples[].latencySeconds` | `number` | Execution duration in seconds for this sample (omitted if empty). |
+| `samples[].tokens` | `object` | Token usage breakdown for this sample (omitted if empty). |
+| `samples[].tokens.input` | `integer` | Input/prompt tokens consumed by models for this sample. |
+| `samples[].tokens.output` | `integer` | Output/completion tokens consumed by models for this sample. |
+| `samplesTruncated` | `boolean` | True if the task evaluated more than 10,000 samples and the `samples` array was capped (omitted if false). |
+| `successes` | `integer` | Number of samples with score >= 1.0. |
+| `meanScore` | `number` | Mean score across evaluated samples in [0, 1] (omitted if null). |
+| `sampleRange` | `object` | Evaluated sample window (`start`, `end`; omitted if empty). |
+| `startedAt` | `string` | RFC 3339 timestamp when the task began execution (omitted if empty). |
+| `finishedAt` | `string` | RFC 3339 timestamp when the task completed (omitted if empty). |
+| `capped` | `boolean` | True if the raw Inspect log exceeded `artifactMaxUploadBytes` and was capped. |
+| `capBytes` | `integer` | Upload byte limit applied when `capped` is true (omitted if empty). |
+| `tokens` | `object` | Aggregated token usage breakdown for the task (`input`, `output`, `total`, etc.; omitted if empty). |
+| `latency` | `object` | Aggregated sample latency percentiles (`p50`, `p95`; omitted if empty). |
+| `costUSD` | `number` | Estimated task evaluation cost in USD from model prices (omitted if empty). |
+| `possibleSamples` | `integer` | Total dataset size (possible samples) when known from the Inspect log (omitted if empty). |
 
 ## Resource and Output Limits
 
