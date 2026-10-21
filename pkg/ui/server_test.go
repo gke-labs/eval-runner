@@ -2209,7 +2209,6 @@ func TestServerTaskSamplesAndTranscript(t *testing.T) {
 		TaskID:     taskID,
 		Commit:     commit,
 		Model:      "gemini-2.5-pro",
-		Samples:    2,
 		Successes:  1,
 		MeanScore:  &meanScore,
 		StartedAt:  &now,
@@ -2525,7 +2524,6 @@ func TestServerTaskSamplesAndTranscript(t *testing.T) {
 			TaskID:     "task/truncated",
 			Commit:     commit,
 			Model:      "gemini-2.5-pro",
-			Samples:    1,
 			StartedAt:  &now,
 			FinishedAt: &now,
 		}
@@ -2619,7 +2617,6 @@ func TestServerTaskSamplesAndTranscript(t *testing.T) {
 			TaskID:     "task/hostile",
 			Commit:     commit,
 			Model:      "gemini-2.5-pro",
-			Samples:    1,
 			StartedAt:  &now,
 			FinishedAt: &now,
 		}
@@ -2737,7 +2734,6 @@ func TestServerTaskSamples_InMemorySink_Drilldown(t *testing.T) {
 		TaskID:     taskID,
 		Commit:     commit,
 		Model:      "gemini-2.5-pro",
-		Samples:    2,
 		StartedAt:  &now,
 		FinishedAt: &now,
 	}
@@ -2885,6 +2881,102 @@ func TestServerTaskSamples_InMemorySink_Drilldown(t *testing.T) {
 			t.Errorf("expected 'artifacts: none' in body, got:\n%s", w.Body.String())
 		}
 	})
+}
+
+func TestServer_TaskSamplesFastPathWithSummaryJSON(t *testing.T) {
+	tempDir := t.TempDir()
+	sink := &artifacts.LocalDirSink{BaseDir: tempDir}
+	commit := "commitfast1234"
+	taskID := "task/fast"
+
+	scoreVal := 1.0
+	sampleSummaries := []artifacts.TaskSampleSummary{
+		{
+			ID:     "sample-fast-1",
+			Score:  &scoreVal,
+			Status: "pass",
+		},
+	}
+
+	meta := artifacts.RunMetadata{
+		RunName:           "fast-run",
+		RunNamespace:      "eval-runner",
+		TaskID:            taskID,
+		Commit:            commit,
+		Model:             "gemini-2.5-pro",
+		ControllerVersion: "v1.0.0",
+		Scorer:            "choice",
+		Samples:           sampleSummaries,
+	}
+
+	inspectLog := `{
+		"version": 2,
+		"status": "success",
+		"eval": {"task": "task/fast"},
+		"samples": [
+			{
+				"id": "sample-fast-1",
+				"scores": {"choice": {"value": 1.0}},
+				"messages": [
+					{"role": "user", "content": "Transcript prompt content"}
+				]
+			}
+		]
+	}`
+
+	logPath, err := sink.StoreArtifact(t.Context(), meta, "inspect.json", []byte(inspectLog))
+	if err != nil {
+		t.Fatalf("StoreArtifact failed: %v", err)
+	}
+
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fast-run",
+			Namespace: "eval-runner",
+		},
+		Spec: v1alpha1.RunSpec{
+			Model: "gemini-2.5-pro",
+			Repo:  v1alpha1.RepoSpec{Commit: commit},
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseCompleted,
+			Tasks: []v1alpha1.TaskStatus{
+				{
+					ID:      taskID,
+					Phase:   v1alpha1.TaskPhaseCompleted,
+					LogPath: logPath,
+				},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+
+	srv := NewServer(Config{Client: cl, ArtifactSink: sink})
+
+	// 1. Request sample list: uses fast path from summary.json
+	reqList := httptest.NewRequest(http.MethodGet, "/runs/eval-runner/fast-run/tasks/task%2Ffast/samples", nil)
+	wList := httptest.NewRecorder()
+	srv.ServeHTTP(wList, reqList)
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for sample list, got %d: %s", wList.Code, wList.Body.String())
+	}
+	if !strings.Contains(wList.Body.String(), "sample-fast-1") {
+		t.Errorf("expected sample-fast-1 in sample list HTML")
+	}
+
+	// 2. Request sample transcript: loads full log to get transcript content
+	reqTranscript := httptest.NewRequest(http.MethodGet, "/runs/eval-runner/fast-run/tasks/task%2Ffast/samples/sample-fast-1", nil)
+	wTranscript := httptest.NewRecorder()
+	srv.ServeHTTP(wTranscript, reqTranscript)
+	if wTranscript.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for sample transcript, got %d: %s", wTranscript.Code, wTranscript.Body.String())
+	}
+	if !strings.Contains(wTranscript.Body.String(), "Transcript prompt content") {
+		t.Errorf("expected transcript content in transcript page HTML")
+	}
 }
 
 func TestLogLRUCache(t *testing.T) {
@@ -3058,7 +3150,6 @@ func TestServerSampleTranscript_Truncation(t *testing.T) {
 		TaskID:     taskID,
 		Commit:     commit,
 		Model:      "gemini-2.5-pro",
-		Samples:    2,
 		Successes:  2,
 		MeanScore:  &meanScore,
 		StartedAt:  &now,
@@ -3192,7 +3283,6 @@ func TestServerTaskSamplesList_Truncation(t *testing.T) {
 		TaskID:     taskID,
 		Commit:     commit,
 		Model:      "gemini-2.5-pro",
-		Samples:    2,
 		Successes:  2,
 		MeanScore:  &meanScore,
 		StartedAt:  &now,

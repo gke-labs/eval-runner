@@ -1679,16 +1679,7 @@ func (s *Server) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) loadInspectSamples(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
-	if s.cache != nil {
-		if samples, parseErr, ok := s.cache.get(logPath); ok {
-			if parseErr != nil {
-				return nil, true, parseErr
-			}
-			return samples, false, nil
-		}
-	}
-
+func (s *Server) loadInspectSamplesFromStorage(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
 	data, err := s.reloadableSink.Load(ctx, logPath)
 	if err != nil {
 		if strings.Contains(err.Error(), "exceeds maximum") {
@@ -1709,6 +1700,79 @@ func (s *Server) loadInspectSamples(ctx context.Context, logPath string) ([]arti
 		s.cache.set(logPath, int64(len(data)), samples, nil)
 	}
 	return samples, false, nil
+}
+
+func (s *Server) loadInspectSamples(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
+	if s.cache != nil {
+		if samples, parseErr, ok := s.cache.get(logPath); ok {
+			if parseErr != nil {
+				return nil, true, parseErr
+			}
+			return samples, false, nil
+		}
+	}
+	return s.loadInspectSamplesFromStorage(ctx, logPath)
+}
+
+func (s *Server) loadTaskSamplesList(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
+	if s.cache != nil {
+		if samples, parseErr, ok := s.cache.get(logPath); ok {
+			if parseErr != nil {
+				return nil, true, parseErr
+			}
+			return samples, false, nil
+		}
+	}
+
+	// Fast path: try ReadTaskSummary before loading the full Inspect log.
+	sink := s.ArtifactSink()
+	if sink != nil {
+		if summary, err := artifacts.ReadTaskSummary(ctx, sink, logPath); err == nil && summary != nil && len(summary.Samples) > 0 {
+			samples := make([]artifacts.ParsedInspectSample, 0, len(summary.Samples))
+			for _, item := range summary.Samples {
+				scoreStr := "—"
+				hasScore := false
+				status := item.Status
+				if item.Score != nil {
+					hasScore = true
+					scoreStr = fmt.Sprintf("%.2f", *item.Score)
+					if status == "" {
+						if *item.Score >= 1.0 {
+							status = "pass"
+						} else {
+							status = "fail"
+						}
+					}
+				}
+				if status == "" {
+					status = "unknown"
+				}
+				var inTokens, outTokens int
+				if item.Tokens != nil {
+					inTokens = item.Tokens.Input
+					outTokens = item.Tokens.Output
+				}
+				samples = append(samples, artifacts.ParsedInspectSample{
+					ID:           item.ID,
+					Epoch:        item.Epoch,
+					Score:        item.Score,
+					HasScore:     hasScore,
+					ScoreStr:     scoreStr,
+					Status:       status,
+					Latency:      item.LatencySeconds,
+					InputTokens:  inTokens,
+					OutputTokens: outTokens,
+					TotalTokens:  inTokens + outTokens,
+				})
+			}
+			if s.cache != nil {
+				s.cache.set(logPath, int64(len(samples)*128), samples, nil)
+			}
+			return samples, false, nil
+		}
+	}
+
+	return s.loadInspectSamplesFromStorage(ctx, logPath)
 }
 
 func hasComparisonPrefix(path string) bool {
@@ -2153,7 +2217,7 @@ func (s *Server) renderTaskSamplesList(w http.ResponseWriter, r *http.Request, n
 		ArtifactFooter: FormatArtifactFooter(s.ArtifactSink()),
 	}
 
-	samples, isTruncated, err := s.loadInspectSamples(ctx, logPath)
+	samples, isTruncated, err := s.loadTaskSamplesList(ctx, logPath)
 	if isTruncated {
 		view.IsTruncatedLog = true
 		view.TruncatedMessage = "The evaluation log exceeded the size limit or was truncated during storage. Sample details cannot be displayed."
@@ -2298,6 +2362,21 @@ func (s *Server) renderSampleTranscript(w http.ResponseWriter, r *http.Request, 
 		if samples[i].ID == sampleID {
 			matchedSample = &samples[i]
 			break
+		}
+	}
+
+	if matchedSample != nil && len(matchedSample.Transcript) == 0 {
+		// If samples were loaded via the summary fast-path, load the full Inspect log for transcripts.
+		fullSamples, fullTruncated, fullErr := s.loadInspectSamplesFromStorage(ctx, logPath)
+		if fullErr == nil && !fullTruncated {
+			samples = fullSamples
+			matchedSample = nil
+			for i := range samples {
+				if samples[i].ID == sampleID {
+					matchedSample = &samples[i]
+					break
+				}
+			}
 		}
 	}
 
