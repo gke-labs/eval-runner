@@ -1679,7 +1679,16 @@ func (s *Server) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) loadInspectSamplesFromStorage(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
+func (s *Server) loadInspectSamples(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
+	if s.cache != nil {
+		if samples, parseErr, ok := s.cache.get(logPath); ok {
+			if parseErr != nil {
+				return nil, true, parseErr
+			}
+			return samples, false, nil
+		}
+	}
+
 	data, err := s.reloadableSink.Load(ctx, logPath)
 	if err != nil {
 		if strings.Contains(err.Error(), "exceeds maximum") {
@@ -1702,77 +1711,80 @@ func (s *Server) loadInspectSamplesFromStorage(ctx context.Context, logPath stri
 	return samples, false, nil
 }
 
-func (s *Server) loadInspectSamples(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
-	if s.cache != nil {
-		if samples, parseErr, ok := s.cache.get(logPath); ok {
-			if parseErr != nil {
-				return nil, true, parseErr
-			}
-			return samples, false, nil
-		}
-	}
-	return s.loadInspectSamplesFromStorage(ctx, logPath)
-}
-
-func (s *Server) loadTaskSamplesList(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
-	if s.cache != nil {
-		if samples, parseErr, ok := s.cache.get(logPath); ok {
-			if parseErr != nil {
-				return nil, true, parseErr
-			}
-			return samples, false, nil
-		}
-	}
-
-	// Fast path: try ReadTaskSummary before loading the full Inspect log.
+// loadTaskSamplesFromSummary loads sample outcomes from summary.json as a fallback
+// when the full Inspect log exceeds the load cap or cannot be parsed.
+// Caches entries under the summary URI so they never collide with full-log cache entries.
+func (s *Server) loadTaskSamplesFromSummary(ctx context.Context, logPath string) ([]artifacts.ParsedInspectSample, bool, error) {
 	sink := s.ArtifactSink()
-	if sink != nil {
-		if summary, err := artifacts.ReadTaskSummary(ctx, sink, logPath); err == nil && summary != nil && len(summary.Samples) > 0 {
-			samples := make([]artifacts.ParsedInspectSample, 0, len(summary.Samples))
-			for _, item := range summary.Samples {
-				scoreStr := "—"
-				hasScore := false
-				status := item.Status
-				if item.Score != nil {
-					hasScore = true
-					scoreStr = fmt.Sprintf("%.2f", *item.Score)
-					if status == "" {
-						if *item.Score >= 1.0 {
-							status = "pass"
-						} else {
-							status = "fail"
-						}
-					}
-				}
-				if status == "" {
-					status = "unknown"
-				}
-				var inTokens, outTokens int
-				if item.Tokens != nil {
-					inTokens = item.Tokens.Input
-					outTokens = item.Tokens.Output
-				}
-				samples = append(samples, artifacts.ParsedInspectSample{
-					ID:           item.ID,
-					Epoch:        item.Epoch,
-					Score:        item.Score,
-					HasScore:     hasScore,
-					ScoreStr:     scoreStr,
-					Status:       status,
-					Latency:      item.LatencySeconds,
-					InputTokens:  inTokens,
-					OutputTokens: outTokens,
-					TotalTokens:  inTokens + outTokens,
-				})
-			}
-			if s.cache != nil {
-				s.cache.set(logPath, int64(len(samples)*128), samples, nil)
+	if sink == nil {
+		return nil, false, fmt.Errorf("artifact sink not configured")
+	}
+
+	summaryURI := artifacts.TaskSummaryURI(logPath)
+	if s.cache != nil {
+		if samples, parseErr, ok := s.cache.get(summaryURI); ok {
+			if parseErr != nil {
+				return nil, false, parseErr
 			}
 			return samples, false, nil
 		}
 	}
 
-	return s.loadInspectSamplesFromStorage(ctx, logPath)
+	summary, err := artifacts.ReadTaskSummary(ctx, sink, summaryURI)
+	if err != nil {
+		if s.cache != nil {
+			s.cache.set(summaryURI, 0, nil, err)
+		}
+		return nil, false, err
+	}
+	if len(summary.Samples) == 0 {
+		return nil, false, fmt.Errorf("summary contains no samples")
+	}
+
+	samples := make([]artifacts.ParsedInspectSample, 0, len(summary.Samples))
+	for _, item := range summary.Samples {
+		scoreStr := "—"
+		hasScore := false
+		status := item.Status
+		if item.Score != nil {
+			hasScore = true
+			scoreStr = fmt.Sprintf("%.2f", *item.Score)
+			if status == "" {
+				if *item.Score >= 1.0 {
+					status = "pass"
+				} else {
+					status = "fail"
+				}
+			}
+		}
+		if status == "" {
+			status = "unknown"
+		}
+		var inTokens, outTokens int
+		if item.Tokens != nil {
+			inTokens = item.Tokens.Input
+			outTokens = item.Tokens.Output
+		}
+		samples = append(samples, artifacts.ParsedInspectSample{
+			ID:           item.ID,
+			Epoch:        item.Epoch,
+			Score:        item.Score,
+			HasScore:     hasScore,
+			ScoreStr:     scoreStr,
+			Status:       status,
+			Latency:      item.LatencySeconds,
+			InputTokens:  inTokens,
+			OutputTokens: outTokens,
+			TotalTokens:  inTokens + outTokens,
+		})
+	}
+
+	if s.cache != nil {
+		// Estimated size in cache: ~128 bytes per sample struct
+		s.cache.set(summaryURI, int64(len(samples)*128), samples, nil)
+	}
+
+	return samples, summary.SamplesTruncated, nil
 }
 
 func hasComparisonPrefix(path string) bool {
@@ -2217,7 +2229,19 @@ func (s *Server) renderTaskSamplesList(w http.ResponseWriter, r *http.Request, n
 		ArtifactFooter: FormatArtifactFooter(s.ArtifactSink()),
 	}
 
-	samples, isTruncated, err := s.loadTaskSamplesList(ctx, logPath)
+	samples, isTruncated, err := s.loadInspectSamples(ctx, logPath)
+	if isTruncated || err != nil {
+		// Fallback to summary.json when the full log exceeded the load cap or could not be parsed.
+		if summarySamples, samplesTruncated, summaryErr := s.loadTaskSamplesFromSummary(ctx, logPath); summaryErr == nil && len(summarySamples) > 0 {
+			samples = summarySamples
+			err = nil
+			isTruncated = false
+			if samplesTruncated {
+				view.IsTruncatedLog = true
+				view.TruncatedMessage = "This task evaluated more than 10,000 samples. Showing the first 10,000 samples from summary.json."
+			}
+		}
+	}
 	if isTruncated {
 		view.IsTruncatedLog = true
 		view.TruncatedMessage = "The evaluation log exceeded the size limit or was truncated during storage. Sample details cannot be displayed."
@@ -2362,21 +2386,6 @@ func (s *Server) renderSampleTranscript(w http.ResponseWriter, r *http.Request, 
 		if samples[i].ID == sampleID {
 			matchedSample = &samples[i]
 			break
-		}
-	}
-
-	if matchedSample != nil && len(matchedSample.Transcript) == 0 {
-		// If samples were loaded via the summary fast-path, load the full Inspect log for transcripts.
-		fullSamples, fullTruncated, fullErr := s.loadInspectSamplesFromStorage(ctx, logPath)
-		if fullErr == nil && !fullTruncated {
-			samples = fullSamples
-			matchedSample = nil
-			for i := range samples {
-				if samples[i].ID == sampleID {
-					matchedSample = &samples[i]
-					break
-				}
-			}
 		}
 	}
 
