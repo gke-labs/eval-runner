@@ -22,7 +22,9 @@ export GOTOOLCHAIN=auto
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+DOCKER="${DOCKER:-docker}"
+
+export PATH="${PATH}:${REPO_ROOT}/.build/bin"
 
 TAG="$(git rev-parse --short HEAD)"
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -52,7 +54,7 @@ verify_pushed_image() {
   local image="$1"
   echo "Verifying multi-platform index for ${image} contains linux/amd64..."
   local inspect_out
-  if ! inspect_out="$(docker buildx imagetools inspect "${image}" 2>&1)"; then
+  if ! inspect_out="$("${DOCKER}" buildx imagetools inspect "${image}" 2>&1)"; then
     echo "ERROR: Failed to inspect pushed image index '${image}':" >&2
     echo "${inspect_out}" >&2
     echo "Aborting deploy before applying manifests." >&2
