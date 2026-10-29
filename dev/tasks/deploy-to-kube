@@ -19,8 +19,8 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
 # Use tools from .build/bin if present
-if [[ -d "${REPO_ROOT}/.build/bin" ]]; then
-  export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+if [[ "${DEPLOY_TO_KUBE_USE_BUILD_BIN:-true}" == "true" && -d "${REPO_ROOT}/.build/bin" ]]; then
+  export PATH="${PATH}:${REPO_ROOT}/.build/bin"
 fi
 
 export GOTOOLCHAIN=auto

@@ -23,9 +23,16 @@ source "${REPO_ROOT}/dev/tasks/versions.sh"
 PINNED_COMMIT="${SANDBOXD_COMMIT}"
 FORK_URL="https://github.com/codebot-robot/agent-sandbox.git"
 
-export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+DOCKER="${DOCKER:-docker}"
+export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
+
+export PATH="${PATH}:${REPO_ROOT}/.build/bin"
 
 # Sibling checkout takes precedence if present; otherwise clone pinned commit into out-of-tree cache (~/.cache/eval-runner/agent-sandbox)
+AGENT_SANDBOX_DIR_EXPLICIT=false
+if [[ -n "${AGENT_SANDBOX_DIR:-}" ]]; then
+  AGENT_SANDBOX_DIR_EXPLICIT=true
+fi
 AGENT_SANDBOX_DIR="${AGENT_SANDBOX_DIR:-}"
 if [[ -z "${AGENT_SANDBOX_DIR}" ]]; then
   if [[ -d "${REPO_ROOT}/../agent-sandbox" ]]; then
@@ -58,7 +65,7 @@ if [[ ! -d "${AGENT_SANDBOX_DIR}" ]]; then
   git clone "${FORK_URL}" "${AGENT_SANDBOX_DIR}"
   git -C "${AGENT_SANDBOX_DIR}" checkout "${PINNED_COMMIT}"
   rm -rf "${AGENT_SANDBOX_DIR}/examples"
-elif [[ -d "${AGENT_SANDBOX_DIR}/.git" && "${AGENT_SANDBOX_DIR}" != "${REPO_ROOT}/../agent-sandbox" ]]; then
+elif [[ -d "${AGENT_SANDBOX_DIR}/.git" && "${AGENT_SANDBOX_DIR}" != "${REPO_ROOT}/../agent-sandbox" && "${AGENT_SANDBOX_DIR_EXPLICIT}" != "true" ]]; then
   CURRENT_COMMIT="$(git -C "${AGENT_SANDBOX_DIR}" rev-parse HEAD 2>/dev/null || true)"
   if [[ "${CURRENT_COMMIT}" != "${PINNED_COMMIT}"* ]]; then
     echo "Updating agent-sandbox checkout at ${AGENT_SANDBOX_DIR} to ${PINNED_COMMIT}..."
@@ -92,14 +99,14 @@ IMAGE_TAG="${IMAGE_TAG:-${SANDBOXD_TAG}}"
 IMAGE_NAME="${IMAGE_PREFIX}/sandboxd:${IMAGE_TAG}"
 
 echo "Building sandboxd from ${AGENT_SANDBOX_DIR} as ${IMAGE_NAME} (platform: ${PLATFORM})..."
-docker build --platform "${PLATFORM}" -t "${IMAGE_NAME}" -f "${AGENT_SANDBOX_DIR}/packages/sandboxd/Dockerfile" "${AGENT_SANDBOX_DIR}"
+"${DOCKER}" build --platform "${PLATFORM}" -t "${IMAGE_NAME}" -f "${AGENT_SANDBOX_DIR}/packages/sandboxd/Dockerfile" "${AGENT_SANDBOX_DIR}"
 
 if [[ "${PUSH}" == "true" ]]; then
   echo "Pushing ${IMAGE_NAME}..."
-  docker push "${IMAGE_NAME}"
+  "${DOCKER}" push "${IMAGE_NAME}"
 fi
 
-DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_NAME}" 2>/dev/null || docker inspect --format='{{.Id}}' "${IMAGE_NAME}")"
+DIGEST="$("${DOCKER}" inspect --format='{{index .RepoDigests 0}}' "${IMAGE_NAME}" 2>/dev/null || "${DOCKER}" inspect --format='{{.Id}}' "${IMAGE_NAME}")"
 echo "Successfully built sandboxd:"
 echo "  Image:  ${IMAGE_NAME}"
 echo "  Digest: ${DIGEST}"

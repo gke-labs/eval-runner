@@ -256,18 +256,24 @@ exit 0
 EOF
 chmod +x "${MOCK_BIN}/docker"
 
+BUILD_LOG="${TMP_DIR}/build-sandboxd.log"
+BUILD_STATUS=0
 (
+  export DOCKER="${MOCK_BIN}/docker"
   export PATH="${MOCK_BIN}:${PATH}"
   export AGENT_SANDBOX_DIR="${TMP_DIR}/fake-agent-sandbox"
   mkdir -p "${AGENT_SANDBOX_DIR}/packages/sandboxd"
   touch "${AGENT_SANDBOX_DIR}/packages/sandboxd/Dockerfile"
-  "${REPO_ROOT}/dev/tasks/build-sandboxd" >/dev/null 2>&1 || true
-)
+  "${REPO_ROOT}/dev/tasks/build-sandboxd"
+) > "${BUILD_LOG}" 2>&1 || BUILD_STATUS=$?
 
-if grep -q -- "--platform linux/amd64" "${TMP_DIR}/docker.log"; then
+if [[ ${BUILD_STATUS} -eq 0 ]] && grep -q -- "--platform linux/amd64" "${TMP_DIR}/docker.log" 2>/dev/null; then
   echo "PASS: dev/tasks/build-sandboxd builds for linux/amd64 by default."
 else
-  echo "FAIL: dev/tasks/build-sandboxd did not build for linux/amd64 by default. Log: $(cat "${TMP_DIR}/docker.log" 2>/dev/null || true)" >&2
+  echo "FAIL: dev/tasks/build-sandboxd did not build for linux/amd64 by default. (exit status: ${BUILD_STATUS})" >&2
+  echo "Mock docker log: $(cat "${TMP_DIR}/docker.log" 2>/dev/null || true)" >&2
+  echo "build-sandboxd output:" >&2
+  cat "${BUILD_LOG}" >&2
   exit 1
 fi
 
@@ -325,7 +331,7 @@ else
 fi
 
 # Test 8C.1: Kind context without kind on PATH fails fast
-KIND_MISSING_ERR="$(PATH="${MOCK_BIN}:/usr/bin:/bin" "${REPO_ROOT}/dev/tasks/deploy-to-kube" 2>&1 || true)"
+KIND_MISSING_ERR="$(DEPLOY_TO_KUBE_USE_BUILD_BIN=false PATH="${MOCK_BIN}:/usr/bin:/bin" "${REPO_ROOT}/dev/tasks/deploy-to-kube" 2>&1 || true)"
 if echo "${KIND_MISSING_ERR}" | grep -q "error: kind is required on PATH when deploying to a kind cluster"; then
   echo "PASS: deploy-to-kube fails loudly when kind is not on PATH for kind cluster."
 else
