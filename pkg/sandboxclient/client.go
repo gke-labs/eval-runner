@@ -340,7 +340,7 @@ func isResourceExhausted(err error) bool {
 	return false
 }
 
-func (c *sandboxdClient) ReadFile(ctx context.Context, path string) ([]byte, error) {
+func (c *sandboxdClient) ReadFile(ctx context.Context, path string) (_ []byte, retErr error) {
 	cleanPath := strings.TrimPrefix(path, "/")
 	reqURL := fmt.Sprintf("%s/v1/files/%s", c.restBaseURL, cleanPath)
 
@@ -358,7 +358,9 @@ func (c *sandboxdClient) ReadFile(ctx context.Context, path string) ([]byte, err
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			_ = closeErr
+			if retErr == nil {
+				retErr = fmt.Errorf("close response body: %w", closeErr)
+			}
 		}
 	}()
 

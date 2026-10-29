@@ -95,7 +95,7 @@ func (s *Server) routes() {
 func writeResponse(w http.ResponseWriter, status int, body string) {
 	w.WriteHeader(status)
 	if _, err := w.Write([]byte(body)); err != nil {
-		_ = err
+		log.Printf("error writing response: %v", err)
 	}
 }
 

@@ -162,7 +162,7 @@ type installationTokenResponse struct {
 }
 
 // Token returns a cached installation access token, refreshing it if expired or near expiry (within 5 minutes).
-func (a *AppTokenProvider) Token(ctx context.Context) (string, error) {
+func (a *AppTokenProvider) Token(ctx context.Context) (_ string, retErr error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -193,7 +193,9 @@ func (a *AppTokenProvider) Token(ctx context.Context) (string, error) {
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			_ = closeErr
+			if retErr == nil {
+				retErr = fmt.Errorf("close response body: %w", closeErr)
+			}
 		}
 	}()
 
@@ -229,7 +231,7 @@ type appInfoResponse struct {
 }
 
 // Identity returns the GitHub App's bot user login in "<slug>[bot]" format.
-func (a *AppTokenProvider) Identity(ctx context.Context) (string, error) {
+func (a *AppTokenProvider) Identity(ctx context.Context) (_ string, retErr error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -263,7 +265,9 @@ func (a *AppTokenProvider) Identity(ctx context.Context) (string, error) {
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			_ = closeErr
+			if retErr == nil {
+				retErr = fmt.Errorf("close response body: %w", closeErr)
+			}
 		}
 	}()
 

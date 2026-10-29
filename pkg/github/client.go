@@ -335,7 +335,7 @@ func (c *HTTPClient) DoRequestConditional(ctx context.Context, method, path stri
 	return c.doRequestInternal(ctx, method, path, body, out, etag, lastModified)
 }
 
-func (c *HTTPClient) doRequestInternal(ctx context.Context, method, path string, body any, out any, etag, lastModified string) (http.Header, bool, error) {
+func (c *HTTPClient) doRequestInternal(ctx context.Context, method, path string, body any, out any, etag, lastModified string) (_ http.Header, _ bool, retErr error) {
 	if exhausted, waitTime, rem, floor, reset := c.isBudgetExhausted(time.Now()); exhausted {
 		return nil, false, &RateLimitError{
 			StatusCode: http.StatusTooManyRequests,
@@ -393,7 +393,9 @@ func (c *HTTPClient) doRequestInternal(ctx context.Context, method, path string,
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			_ = closeErr
+			if retErr == nil {
+				retErr = fmt.Errorf("close response body: %w", closeErr)
+			}
 		}
 	}()
 

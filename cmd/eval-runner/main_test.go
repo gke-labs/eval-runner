@@ -94,7 +94,7 @@ func TestRetryStartup_SuccessFirstAttempt(t *testing.T) {
 	}
 
 	calls := 0
-	err := retryStartup(context.Background(), testBackoff, logger, "test operation", func(attemptCtx context.Context) error {
+	err := retryStartup(t.Context(), testBackoff, logger, "test operation", func(attemptCtx context.Context) error {
 		calls++
 		return nil
 	})
@@ -137,7 +137,7 @@ func TestRetryStartup_PodLookupRetryThenSuccess(t *testing.T) {
 	}
 
 	var gotPod *corev1.Pod
-	err := retryStartup(context.Background(), testBackoff, logger, "get controller pod", func(attemptCtx context.Context) error {
+	err := retryStartup(t.Context(), testBackoff, logger, "get controller pod", func(attemptCtx context.Context) error {
 		var getErr error
 		gotPod, getErr = fakeClient.CoreV1().Pods("eval-runner").Get(attemptCtx, "eval-runner-controller-abc", metav1.GetOptions{})
 		return getErr
@@ -217,7 +217,7 @@ func TestRetryStartup_ConfigLoadRetryThenSuccess(t *testing.T) {
 	}
 
 	var clusterConfig controller.ClusterConfig
-	err := retryStartup(context.Background(), testBackoff, logger, "load cluster configuration", func(attemptCtx context.Context) error {
+	err := retryStartup(t.Context(), testBackoff, logger, "load cluster configuration", func(attemptCtx context.Context) error {
 		var loadErr error
 		clusterConfig, loadErr = controller.LoadAndResolveClusterConfig(
 			attemptCtx,
@@ -268,7 +268,7 @@ func TestRetryStartup_ExhaustedRetries(t *testing.T) {
 		Steps:    3,
 	}
 
-	err := retryStartup(context.Background(), testBackoff, logger, "test operation", func(attemptCtx context.Context) error {
+	err := retryStartup(t.Context(), testBackoff, logger, "test operation", func(attemptCtx context.Context) error {
 		attempts++
 		return expectedErr
 	})
@@ -293,7 +293,7 @@ func TestRetryStartup_ExhaustedRetries(t *testing.T) {
 }
 
 func TestRetryStartup_ContextCanceled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel() // canceled before execution
 
 	var logBuf bytes.Buffer
@@ -330,7 +330,7 @@ func TestRetryStartup_AttemptTimeout(t *testing.T) {
 
 	var deadlineSet bool
 	var timeoutRemaining time.Duration
-	err := retryStartup(context.Background(), testBackoff, logger, "test operation", func(attemptCtx context.Context) error {
+	err := retryStartup(t.Context(), testBackoff, logger, "test operation", func(attemptCtx context.Context) error {
 		deadline, ok := attemptCtx.Deadline()
 		if ok {
 			deadlineSet = true
@@ -353,7 +353,7 @@ func TestRetryStartup_NilFn(t *testing.T) {
 	logger := zap.New(zap.UseDevMode(true))
 	testBackoff := wait.Backoff{Steps: 1}
 
-	err := retryStartup(context.Background(), testBackoff, logger, "test operation", nil)
+	err := retryStartup(t.Context(), testBackoff, logger, "test operation", nil)
 	if err == nil {
 		t.Fatalf("expected error for nil fn, got nil")
 	}
