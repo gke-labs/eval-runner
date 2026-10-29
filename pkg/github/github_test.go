@@ -21,6 +21,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2959,5 +2960,75 @@ func TestHTTPClient_RateLimitLoggingOneLinePerStateTransition(t *testing.T) {
 	}
 	if !strings.Contains(logMessages[1], "budget recovered") {
 		t.Errorf("expected second log message to mention budget recovered, got %q", logMessages[1])
+	}
+}
+
+type errorCloseBody struct {
+	io.Reader
+	closeErr error
+}
+
+func (b *errorCloseBody) Close() error {
+	return b.closeErr
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestHTTPClient_CloseBodyError(t *testing.T) {
+	ctx := t.Context()
+
+	// 1. When main path succeeds, close error is returned wrapped
+	client := NewHTTPClient(HTTPClientConfig{
+		BaseURL: "http://example.com",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: &errorCloseBody{
+						Reader:   strings.NewReader(`{}`),
+						closeErr: fmt.Errorf("simulated close error"),
+					},
+				}, nil
+			}),
+		},
+	})
+
+	err := client.DoRequest(ctx, http.MethodGet, "/test", nil, nil)
+	if err == nil {
+		t.Fatalf("expected close error, got nil")
+	}
+	if !strings.Contains(err.Error(), "close response body: simulated close error") {
+		t.Errorf("expected wrapped close error, got %v", err)
+	}
+
+	// 2. When main path has HTTP error, HTTP error is preserved and not overwritten by close error
+	clientErr := NewHTTPClient(HTTPClientConfig{
+		BaseURL: "http://example.com",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: &errorCloseBody{
+						Reader:   strings.NewReader(`{"message": "not found"}`),
+						closeErr: fmt.Errorf("simulated close error"),
+					},
+				}, nil
+			}),
+		},
+	})
+
+	err2 := clientErr.DoRequest(ctx, http.MethodGet, "/test", nil, nil)
+	if err2 == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	var permErr *PermanentError
+	if !errors.As(err2, &permErr) || permErr.StatusCode != http.StatusNotFound {
+		t.Errorf("expected PermanentError with 404, got %v", err2)
 	}
 }

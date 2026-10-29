@@ -17,6 +17,7 @@ package github
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -236,6 +237,27 @@ func (f *FakeGitHubServer) RequestLog() []string {
 	return copied
 }
 
+func writeResponse(w http.ResponseWriter, statusCode int, contentType string, body []byte) {
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	if statusCode != 0 {
+		w.WriteHeader(statusCode)
+	}
+	if _, err := w.Write(body); err != nil {
+		log.Printf("fake github server: failed to write response: %v", err)
+	}
+}
+
+func writeJSONResponse(w http.ResponseWriter, statusCode int, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeResponse(w, statusCode, "application/json", append(data, '\n'))
+}
+
 func (f *FakeGitHubServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.requestLog = append(f.requestLog, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
@@ -247,10 +269,7 @@ func (f *FakeGitHubServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			for k, v := range errResp.headers {
 				w.Header().Set(k, v)
 			}
-			w.WriteHeader(errResp.statusCode)
-			if _, err := w.Write([]byte(errResp.body)); err != nil {
-				_ = err
-			}
+			writeResponse(w, errResp.statusCode, "", []byte(errResp.body))
 			f.mu.Unlock()
 			return
 		}
@@ -264,10 +283,7 @@ func (f *FakeGitHubServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		login := f.currentUser
 		f.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]any{"login": login}); err != nil {
-			_ = err
-		}
+		writeJSONResponse(w, http.StatusOK, map[string]any{"login": login})
 		return
 	}
 
@@ -276,23 +292,16 @@ func (f *FakeGitHubServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		slug := f.appSlug
 		f.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]any{"id": 1, "slug": slug}); err != nil {
-			_ = err
-		}
+		writeJSONResponse(w, http.StatusOK, map[string]any{"id": 1, "slug": slug})
 		return
 	}
 
 	// 0c. App installation access tokens: /app/installations/{id}/access_tokens
 	if strings.HasPrefix(path, "/app/installations/") && strings.HasSuffix(path, "/access_tokens") && r.Method == http.MethodPost {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		if err := json.NewEncoder(w).Encode(installationTokenResponse{
+		writeJSONResponse(w, http.StatusCreated, installationTokenResponse{
 			Token:     "ghs_fake_installation_token",
 			ExpiresAt: time.Now().Add(1 * time.Hour),
-		}); err != nil {
-			_ = err
-		}
+		})
 		return
 	}
 
@@ -397,10 +406,7 @@ func (f *FakeGitHubServer) handleListPullRequestFiles(w http.ResponseWriter, r *
 		resp = []pullRequestFileResponse{}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		_ = err
-	}
+	writeJSONResponse(w, http.StatusOK, resp)
 }
 
 func (f *FakeGitHubServer) handleIssueComments(w http.ResponseWriter, r *http.Request) {
@@ -454,10 +460,7 @@ func (f *FakeGitHubServer) handleIssueComments(w http.ResponseWriter, r *http.Re
 			w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"next\"", nextURL))
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(result[start:end]); err != nil {
-			_ = err
-		}
+		writeJSONResponse(w, http.StatusOK, result[start:end])
 
 	case http.MethodPost:
 		var payload commentPayload
@@ -478,11 +481,7 @@ func (f *FakeGitHubServer) handleIssueComments(w http.ResponseWriter, r *http.Re
 		f.comments[c.ID] = c
 		f.issueComments[issueKey] = append(f.issueComments[issueKey], c.ID)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		if err := json.NewEncoder(w).Encode(commentResponse{ID: c.ID}); err != nil {
-			_ = err
-		}
+		writeJSONResponse(w, http.StatusCreated, commentResponse{ID: c.ID})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -523,10 +522,7 @@ func (f *FakeGitHubServer) handleUpdateComment(w http.ResponseWriter, r *http.Re
 	}
 	c.Body = payload.Body
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(c); err != nil {
-		_ = err
-	}
+	writeJSONResponse(w, http.StatusOK, c)
 }
 
 func (f *FakeGitHubServer) handleCreateCheckRun(w http.ResponseWriter, r *http.Request) {
@@ -553,11 +549,7 @@ func (f *FakeGitHubServer) handleCreateCheckRun(w http.ResponseWriter, r *http.R
 	}
 	f.checkRuns[cr.ID] = cr
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(checkRunResponse{ID: cr.ID}); err != nil {
-		_ = err
-	}
+	writeJSONResponse(w, http.StatusCreated, checkRunResponse{ID: cr.ID})
 }
 
 func (f *FakeGitHubServer) handleUpdateCheckRun(w http.ResponseWriter, r *http.Request) {
@@ -595,10 +587,7 @@ func (f *FakeGitHubServer) handleUpdateCheckRun(w http.ResponseWriter, r *http.R
 		cr.Summary = payload.Output.Summary
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(checkRunResponse{ID: cr.ID}); err != nil {
-		_ = err
-	}
+	writeJSONResponse(w, http.StatusOK, checkRunResponse{ID: cr.ID})
 }
 
 func (f *FakeGitHubServer) handleGetPermission(w http.ResponseWriter, r *http.Request) {
@@ -615,21 +604,14 @@ func (f *FakeGitHubServer) handleGetPermission(w http.ResponseWriter, r *http.Re
 	key := fmt.Sprintf("%s/%s/%s", owner, repo, user)
 	perm, ok := f.permissions[key]
 	if !ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		if err := json.NewEncoder(w).Encode(map[string]string{"message": "User is not a collaborator"}); err != nil {
-			_ = err
-		}
+		writeJSONResponse(w, http.StatusNotFound, map[string]string{"message": "User is not a collaborator"})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]string{
+	writeJSONResponse(w, http.StatusOK, map[string]string{
 		"permission": perm,
 		"role_name":  perm,
-	}); err != nil {
-		_ = err
-	}
+	})
 }
 
 func (f *FakeGitHubServer) handleCreateReaction(w http.ResponseWriter, r *http.Request) {
@@ -655,11 +637,7 @@ func (f *FakeGitHubServer) handleCreateReaction(w http.ResponseWriter, r *http.R
 	}
 
 	f.reactions[id] = append(f.reactions[id], payload.Content)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(map[string]any{
+	writeJSONResponse(w, http.StatusCreated, map[string]any{
 		"content": payload.Content,
-	}); err != nil {
-		_ = err
-	}
+	})
 }
