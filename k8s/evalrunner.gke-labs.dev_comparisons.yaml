@@ -381,6 +381,14 @@ spec:
                 description: Message is human-readable detail on failure, notes, or
                   current status.
                 type: string
+              observedBaselineRun:
+                description: ObservedBaselineRun is the baseline Run from which current
+                  status was computed.
+                type: string
+              observedCandidateRun:
+                description: ObservedCandidateRun is the candidate Run from which
+                  current status was computed.
+                type: string
               pImprovement:
                 description: PImprovement is the posterior probability that the candidate
                   is a net improvement.
@@ -461,6 +469,13 @@ spec:
                       updated for this comparison.
                     format: int64
                     type: integer
+                  checkRunIDs:
+                    additionalProperties:
+                      format: int64
+                      type: integer
+                    description: CheckRunIDs records GitHub check run IDs keyed by
+                      head commit SHA.
+                    type: object
                   commentID:
                     description: CommentID is the GitHub issue comment ID created
                       or updated for this comparison.

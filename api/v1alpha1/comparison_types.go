@@ -385,6 +385,10 @@ type ComparisonReportingStatus struct {
 	// +optional
 	CheckRunID int64 `json:"checkRunID,omitempty"`
 
+	// CheckRunIDs records GitHub check run IDs keyed by head commit SHA.
+	// +optional
+	CheckRunIDs map[string]int64 `json:"checkRunIDs,omitempty"`
+
 	// LastPostedHash is the hash of the last successfully posted content and state.
 	// +optional
 	LastPostedHash string `json:"lastPostedHash,omitempty"`
@@ -572,6 +576,14 @@ type ComparisonStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ObservedCandidateRun is the candidate Run from which current status was computed.
+	// +optional
+	ObservedCandidateRun string `json:"observedCandidateRun,omitempty"`
+
+	// ObservedBaselineRun is the baseline Run from which current status was computed.
+	// +optional
+	ObservedBaselineRun string `json:"observedBaselineRun,omitempty"`
 }
 
 // +kubebuilder:object:root=true
