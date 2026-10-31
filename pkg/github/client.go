@@ -615,20 +615,22 @@ type checkRunOutput struct {
 }
 
 type checkRunCreatePayload struct {
-	Name       string          `json:"name"`
-	HeadSHA    string          `json:"head_sha"`
-	DetailsURL string          `json:"details_url,omitempty"`
-	Status     string          `json:"status"`
-	Conclusion string          `json:"conclusion,omitempty"`
-	Output     *checkRunOutput `json:"output,omitempty"`
+	Name       string           `json:"name"`
+	HeadSHA    string           `json:"head_sha"`
+	DetailsURL string           `json:"details_url,omitempty"`
+	Status     string           `json:"status"`
+	Conclusion string           `json:"conclusion,omitempty"`
+	Output     *checkRunOutput  `json:"output,omitempty"`
+	Actions    []CheckRunAction `json:"actions,omitempty"`
 }
 
 type checkRunUpdatePayload struct {
-	Name       string          `json:"name"`
-	DetailsURL string          `json:"details_url,omitempty"`
-	Status     string          `json:"status"`
-	Conclusion string          `json:"conclusion,omitempty"`
-	Output     *checkRunOutput `json:"output,omitempty"`
+	Name       string           `json:"name"`
+	DetailsURL string           `json:"details_url,omitempty"`
+	Status     string           `json:"status"`
+	Conclusion string           `json:"conclusion,omitempty"`
+	Output     *checkRunOutput  `json:"output,omitempty"`
+	Actions    []CheckRunAction `json:"actions,omitempty"`
 }
 
 type checkRunResponse struct {
@@ -650,6 +652,7 @@ func (c *HTTPClient) CreateCheckRun(ctx context.Context, owner, repo string, hea
 			Images:      state.Images,
 			Annotations: state.Annotations,
 		},
+		Actions: SanitizeCheckRunActions(state.Actions),
 	}
 	var resp checkRunResponse
 	if err := c.doRequest(ctx, http.MethodPost, path, payload, &resp); err != nil {
@@ -672,6 +675,7 @@ func (c *HTTPClient) UpdateCheckRun(ctx context.Context, owner, repo string, che
 			Images:      state.Images,
 			Annotations: state.Annotations,
 		},
+		Actions: SanitizeCheckRunActions(state.Actions),
 	}
 	return c.doRequest(ctx, http.MethodPatch, path, payload, nil)
 }

@@ -342,13 +342,25 @@ spec:
                   have been processed by the controller.
                 items:
                   description: ComparisonHandledCommand represents a review comment
-                    command that has been processed by the controller.
+                    or check run command that has been processed by the controller.
                   properties:
-                    commentId:
-                      description: CommentID is the GitHub issue comment ID where
-                        the command was issued.
+                    checkRunId:
+                      description: CheckRunID is the GitHub check run ID where the
+                        action was clicked, or 0 if from a review comment.
                       format: int64
                       type: integer
+                    command:
+                      description: Command is the command that was processed (e.g.
+                        "more 32", "rerun baseline", "rerun candidate").
+                      type: string
+                    commentId:
+                      description: CommentID is the GitHub issue comment ID where
+                        the command was issued, or 0 if from a check run action.
+                      format: int64
+                      type: integer
+                    deliveryId:
+                      description: DeliveryID is the GitHub webhook delivery UUID.
+                      type: string
                     handledAt:
                       description: HandledAt is the time when the controller processed
                         the command.
@@ -370,11 +382,13 @@ spec:
                     requested:
                       description: Requested is the number of additional samples requested.
                       type: integer
+                    requestedBy:
+                      description: RequestedBy is the GitHub username of the user
+                        who issued the command.
+                      type: string
                   required:
-                  - commentId
                   - login
                   - receivedAt
-                  - requested
                   type: object
                 type: array
               message:
@@ -392,17 +406,29 @@ spec:
                   waiting for controller processing.
                 items:
                   description: ComparisonPendingCommand represents an unhandled command
-                    received from a GitHub review comment.
+                    received from a GitHub review comment or check run action.
                   properties:
                     attempts:
                       description: Attempts is the number of times the controller
                         has attempted to process this command.
                       type: integer
-                    commentId:
-                      description: CommentID is the GitHub issue comment ID where
-                        the command was issued.
+                    checkRunId:
+                      description: CheckRunID is the GitHub check run ID where the
+                        action was clicked, or 0 if from a review comment.
                       format: int64
                       type: integer
+                    command:
+                      description: Command is the pending command (e.g. "more 32",
+                        "rerun baseline", "rerun candidate").
+                      type: string
+                    commentId:
+                      description: CommentID is the GitHub issue comment ID where
+                        the command was issued, or 0 if from a check run action.
+                      format: int64
+                      type: integer
+                    deliveryId:
+                      description: DeliveryID is the GitHub webhook delivery UUID.
+                      type: string
                     login:
                       description: Login is the GitHub username of the user who issued
                         the command.
@@ -421,11 +447,13 @@ spec:
                     requested:
                       description: Requested is the number of additional samples requested.
                       type: integer
+                    requestedBy:
+                      description: RequestedBy is the GitHub username of the user
+                        who issued the command.
+                      type: string
                   required:
-                  - commentId
                   - login
                   - receivedAt
-                  - requested
                   type: object
                 type: array
               phase:

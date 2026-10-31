@@ -27,18 +27,25 @@ import (
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/pkg/forge"
+	"github.com/gke-labs/eval-runner/pkg/github"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
 	// MaxPayloadBytes limits the maximum accepted request body size (10 MiB).
 	MaxPayloadBytes = 10 * 1024 * 1024
 )
+
+type cachedPermission struct {
+	hasWrite bool
+	cachedAt time.Time
+}
 
 // Server implements http.Handler for receiving GitHub webhooks.
 type Server struct {
@@ -49,6 +56,17 @@ type Server struct {
 	mu              sync.RWMutex
 	cachedSecret    []byte
 	lastSecretFetch time.Time
+
+	// deliveryMu protects deliveryCache for 24h idempotency
+	deliveryMu    sync.Mutex
+	deliveryCache map[string]time.Time
+
+	// permMu protects collaborator permission cache
+	permMu    sync.RWMutex
+	permCache map[string]cachedPermission
+
+	ghClientMu sync.Mutex
+	ghClient   github.Client
 }
 
 // NewServer creates a new webhook Server and initializes endpoints.
@@ -57,9 +75,12 @@ func NewServer(cfg Config) *Server {
 		cfg.AllowedCloneHosts = []string{DefaultAllowedCloneHosts}
 	}
 	s := &Server{
-		cfg:    cfg,
-		mux:    http.NewServeMux(),
-		worker: NewWorkerPool(cfg),
+		cfg:           cfg,
+		mux:           http.NewServeMux(),
+		worker:        NewWorkerPool(cfg),
+		deliveryCache: make(map[string]time.Time),
+		permCache:     make(map[string]cachedPermission),
+		ghClient:      cfg.GitHubClient,
 	}
 	s.routes()
 	return s
@@ -137,30 +158,261 @@ func (s *Server) getWebhookSecret(ctx context.Context) ([]byte, error) {
 		secretName = DefaultGitHubWebhookSecret
 	}
 
-	var secret corev1.Secret
 	key := types.NamespacedName{
 		Namespace: s.cfg.Namespace,
 		Name:      secretName,
 	}
 
-	if err := s.cfg.Client.Get(ctx, key, &secret); err != nil {
+	secBytes, err := s.extractWebhookSecret(ctx, key)
+	if err == nil && len(secBytes) > 0 {
+		s.mu.Lock()
+		s.cachedSecret = secBytes
+		s.lastSecretFetch = time.Now()
+		s.mu.Unlock()
+		return secBytes, nil
+	}
+
+	// If secretName was default and not found, also check github-app Secret under webhook-secret or secret
+	if secretName == DefaultGitHubWebhookSecret {
+		appKey := types.NamespacedName{
+			Namespace: s.cfg.Namespace,
+			Name:      "github-app",
+		}
+		if appBytes, appErr := s.extractWebhookSecret(ctx, appKey); appErr == nil && len(appBytes) > 0 {
+			s.mu.Lock()
+			s.cachedSecret = appBytes
+			s.lastSecretFetch = time.Now()
+			s.mu.Unlock()
+			return appBytes, nil
+		}
+	}
+
+	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, fmt.Errorf("webhook secret %s/%s not found", s.cfg.Namespace, secretName)
 		}
 		return nil, fmt.Errorf("failed to get webhook secret %s/%s: %w", s.cfg.Namespace, secretName, err)
 	}
 
-	secBytes := secret.Data["secret"]
-	if len(secBytes) == 0 {
-		return nil, fmt.Errorf("key 'secret' not found or empty in Secret %s/%s", s.cfg.Namespace, secretName)
+	return nil, fmt.Errorf("webhook secret key 'webhook-secret' or 'secret' not found in %s/%s", s.cfg.Namespace, secretName)
+}
+
+func (s *Server) extractWebhookSecret(ctx context.Context, key types.NamespacedName) ([]byte, error) {
+	var secret corev1.Secret
+	if err := s.cfg.Client.Get(ctx, key, &secret); err != nil {
+		return nil, err
+	}
+	if b, ok := secret.Data["webhook-secret"]; ok && len(b) > 0 {
+		return b, nil
+	}
+	if b, ok := secret.Data["secret"]; ok && len(b) > 0 {
+		return b, nil
+	}
+	return nil, nil
+}
+
+func (s *Server) isDeliverySeen(id string) bool {
+	if id == "" {
+		return false
+	}
+	s.deliveryMu.Lock()
+	defer s.deliveryMu.Unlock()
+	if s.deliveryCache == nil {
+		return false
+	}
+	t, ok := s.deliveryCache[id]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > 24*time.Hour {
+		delete(s.deliveryCache, id)
+		return false
+	}
+	return true
+}
+
+func (s *Server) rememberDelivery(id string) {
+	if id == "" {
+		return
+	}
+	s.deliveryMu.Lock()
+	defer s.deliveryMu.Unlock()
+	if s.deliveryCache == nil {
+		s.deliveryCache = make(map[string]time.Time)
+	}
+	now := time.Now()
+	s.deliveryCache[id] = now
+	for k, t := range s.deliveryCache {
+		if now.Sub(t) > 24*time.Hour {
+			delete(s.deliveryCache, k)
+		}
+	}
+}
+
+func (s *Server) getGitHubClient(ctx context.Context) (github.Client, error) {
+	s.ghClientMu.Lock()
+	defer s.ghClientMu.Unlock()
+	if s.ghClient != nil {
+		return s.ghClient, nil
 	}
 
-	s.mu.Lock()
-	s.cachedSecret = secBytes
-	s.lastSecretFetch = time.Now()
-	s.mu.Unlock()
+	if s.cfg.Client == nil {
+		return nil, fmt.Errorf("kubernetes client not configured")
+	}
 
-	return secBytes, nil
+	// Load github-app secret
+	appName := s.cfg.GitHubAppSecret
+	if appName == "" {
+		appName = "github-app"
+	}
+
+	var appSec corev1.Secret
+	if err := s.cfg.Client.Get(ctx, types.NamespacedName{Namespace: s.cfg.Namespace, Name: appName}, &appSec); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("warning: error reading secret %s: %v", appName, err)
+		}
+		return nil, fmt.Errorf("github-app secret %s/%s not found: %w", s.cfg.Namespace, appName, err)
+	}
+
+	appID := string(appSec.Data["app-id"])
+	installationID := string(appSec.Data["installation-id"])
+	privateKey := appSec.Data["private-key"]
+	appSlug := string(appSec.Data["app-slug"])
+
+	if appID == "" || installationID == "" || len(privateKey) == 0 {
+		return nil, fmt.Errorf("missing app-id, installation-id, or private-key in secret %s/%s", s.cfg.Namespace, appName)
+	}
+
+	provider, err := github.NewAppTokenProvider(github.AppConfig{
+		AppID:          appID,
+		InstallationID: installationID,
+		PrivateKeyPEM:  privateKey,
+		AppSlug:        appSlug,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error creating App token provider from %s/%s: %w", s.cfg.Namespace, appName, err)
+	}
+
+	client := github.NewHTTPClient(github.HTTPClientConfig{
+		AppAuth: provider,
+	})
+	s.ghClient = client
+	return client, nil
+}
+
+func (s *Server) checkCollaboratorWriteAccess(ctx context.Context, owner, repo, username string) (bool, error) {
+	cacheKey := fmt.Sprintf("%s/%s/%s", strings.ToLower(owner), strings.ToLower(repo), strings.ToLower(username))
+	s.permMu.RLock()
+	if entry, ok := s.permCache[cacheKey]; ok {
+		if time.Since(entry.cachedAt) < 10*time.Minute {
+			s.permMu.RUnlock()
+			return entry.hasWrite, nil
+		}
+	}
+	s.permMu.RUnlock()
+
+	ghClient, err := s.getGitHubClient(ctx)
+	if err != nil {
+		return false, fmt.Errorf("github client unavailable: %w", err)
+	}
+
+	perm, err := ghClient.GetRepoPermission(ctx, owner, repo, username)
+	if err != nil {
+		return false, err
+	}
+
+	hasWrite := github.HasWriteAccess(perm)
+
+	s.permMu.Lock()
+	if s.permCache == nil {
+		s.permCache = make(map[string]cachedPermission)
+	}
+	now := time.Now()
+	for k, v := range s.permCache {
+		if now.Sub(v.cachedAt) > 10*time.Minute {
+			delete(s.permCache, k)
+		}
+	}
+	s.permCache[cacheKey] = cachedPermission{
+		hasWrite: hasWrite,
+		cachedAt: now,
+	}
+	s.permMu.Unlock()
+
+	return hasWrite, nil
+}
+
+func (s *Server) findComparisonForHeadSHA(ctx context.Context, targetRepo, headSHA string) (*v1alpha1.Comparison, error) {
+	if s.cfg.Client == nil || headSHA == "" {
+		return nil, nil
+	}
+
+	var compList v1alpha1.ComparisonList
+	var listOpts []client.ListOption
+	if s.cfg.Namespace != "" {
+		listOpts = append(listOpts, client.InNamespace(s.cfg.Namespace))
+	}
+	listOpts = append(listOpts, client.MatchingLabels{LabelHeadSHA: headSHA})
+
+	if err := s.cfg.Client.List(ctx, &compList, listOpts...); err != nil {
+		return nil, fmt.Errorf("failed to list comparisons: %w", err)
+	}
+
+	targetRepoNoHost := targetRepo
+	if parts := strings.Split(targetRepo, "/"); len(parts) == 3 {
+		targetRepoNoHost = parts[1] + "/" + parts[2]
+	}
+	targetRepoWithHost := targetRepo
+	if !strings.Contains(targetRepo, ".") {
+		targetRepoWithHost = "github.com/" + targetRepo
+	}
+
+	sanitizedRepo := SanitizeLabelValue(targetRepo)
+	sanitizedNoHost := SanitizeLabelValue(targetRepoNoHost)
+	sanitizedWithHost := SanitizeLabelValue(targetRepoWithHost)
+
+	var best *v1alpha1.Comparison
+	for i := range compList.Items {
+		comp := &compList.Items[i]
+
+		// 1. Check head SHA exact match on labels or spec
+		compHeadSHA := comp.Labels[LabelHeadSHA]
+		if compHeadSHA == "" && comp.Spec.PullRequest != nil {
+			compHeadSHA = comp.Spec.PullRequest.HeadSHA
+		}
+		if compHeadSHA == "" || !strings.EqualFold(compHeadSHA, headSHA) {
+			continue
+		}
+
+		// 2. Check target repo match on labels or spec
+		matchedRepo := false
+		if comp.Labels != nil {
+			for _, lKey := range []string{LabelTargetRepo, LabelRepo} {
+				lVal := comp.Labels[lKey]
+				if lVal != "" && (lVal == sanitizedRepo || lVal == sanitizedNoHost || lVal == sanitizedWithHost ||
+					strings.EqualFold(lVal, targetRepo) || strings.EqualFold(lVal, targetRepoNoHost)) {
+					matchedRepo = true
+					break
+				}
+			}
+		}
+		if !matchedRepo && comp.Spec.PullRequest != nil {
+			r := comp.Spec.PullRequest.Repository
+			if strings.EqualFold(r, targetRepo) || strings.EqualFold(r, targetRepoNoHost) || strings.EqualFold(r, targetRepoWithHost) {
+				matchedRepo = true
+			}
+		}
+
+		if !matchedRepo {
+			continue
+		}
+
+		if best == nil || comp.CreationTimestamp.After(best.CreationTimestamp.Time) {
+			best = comp
+		}
+	}
+
+	return best, nil
 }
 
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -433,6 +685,9 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case EventIssueComment:
 		s.handleIssueCommentEvent(w, r, payload, deliveryID)
 
+	case EventCheckRun:
+		s.handleCheckRunEvent(w, r, payload, deliveryID)
+
 	default:
 		log.Printf("ignoring unhandled event type %q", eventType)
 		writeResponse(w, http.StatusOK, "ignored: event type not handled\n")
@@ -541,10 +796,13 @@ func (s *Server) handleIssueCommentEvent(w http.ResponseWriter, r *http.Request,
 		}
 
 		newCmd := v1alpha1.ComparisonPendingCommand{
-			CommentID:  event.Comment.ID,
-			Login:      author,
-			Requested:  n,
-			ReceivedAt: metav1.Now(),
+			CommentID:   event.Comment.ID,
+			DeliveryID:  deliveryID,
+			Login:       author,
+			RequestedBy: author,
+			Command:     fmt.Sprintf("more %d", n),
+			Requested:   n,
+			ReceivedAt:  metav1.Now(),
 		}
 
 		comp.Status.PendingCommands = append(comp.Status.PendingCommands, newCmd)
@@ -581,6 +839,200 @@ func (s *Server) handleIssueCommentEvent(w http.ResponseWriter, r *http.Request,
 
 	log.Printf("successfully recorded /eval more %d on PR #%d for delivery %s", n, prNum, deliveryID)
 	writeResponse(w, http.StatusOK, "ok: pending command recorded\n")
+}
+
+func (s *Server) handleCheckRunEvent(w http.ResponseWriter, r *http.Request, payload []byte, deliveryID string) {
+	ctx := r.Context()
+
+	// 1. Idempotency on GitHub redelivery (X-GitHub-Delivery id remembered for 24h)
+	if s.isDeliverySeen(deliveryID) {
+		log.Printf("redelivery %s already processed; ignoring", deliveryID)
+		writeResponse(w, http.StatusOK, "ok: delivery already processed\n")
+		return
+	}
+
+	// 2. Unmarshal payload
+	var event GitHubCheckRunEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		http.Error(w, fmt.Sprintf("Malformed JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// 3. Action filter: only "requested_action"
+	if event.Action != ActionRequestedAction {
+		log.Printf("ignoring check_run action %q for delivery %s", event.Action, deliveryID)
+		writeResponse(w, http.StatusOK, "ignored: action not actionable\n")
+		return
+	}
+
+	// 4. Validate requested action identifier
+	if event.RequestedAction == nil || event.RequestedAction.Identifier == "" {
+		http.Error(w, "missing requested_action identifier", http.StatusBadRequest)
+		return
+	}
+
+	actionID := event.RequestedAction.Identifier
+	var cmdString string
+	var requestedSamples int
+	switch actionID {
+	case github.ActionIdentifierMore32:
+		cmdString = "more 32"
+		requestedSamples = 32
+	case github.ActionIdentifierRerunBase:
+		cmdString = "rerun baseline"
+		requestedSamples = 0
+	case github.ActionIdentifierRerunCand:
+		cmdString = "rerun candidate"
+		requestedSamples = 0
+	default:
+		log.Printf("unknown action identifier %q for delivery %s", actionID, deliveryID)
+		http.Error(w, fmt.Sprintf("unknown action identifier: %s", actionID), http.StatusBadRequest)
+		return
+	}
+
+	// 5. Validate sender (not empty or bot)
+	sender := strings.TrimSpace(event.Sender.Login)
+	if sender == "" || strings.HasSuffix(strings.ToLower(sender), "[bot]") || strings.EqualFold(event.Sender.Type, "Bot") || !IsValidGitHubLogin(sender) {
+		log.Printf("rejecting check_run action from invalid/bot sender %q (type %q) for delivery %s", sender, event.Sender.Type, deliveryID)
+		http.Error(w, "Forbidden: bot or empty sender", http.StatusForbidden)
+		return
+	}
+
+	// 6. Check repository metadata and allow-list
+	owner, repo, err := ParseOwnerAndName(&event.Repository)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid repository metadata: %v", err), http.StatusBadRequest)
+		return
+	}
+	repoFullName := fmt.Sprintf("%s/%s", owner, repo)
+	if !IsRepositoryAllowed(repoFullName, s.cfg.WebhookRepositories) {
+		log.Printf("ignoring check_run event for repository %s (delivery %s): not in allow-list", repoFullName, deliveryID)
+		writeResponse(w, http.StatusOK, "ignored: repository not in allow-list\n")
+		return
+	}
+
+	// 7. Validate head commit SHA
+	headSHA := strings.ToLower(strings.TrimSpace(event.CheckRun.HeadSHA))
+	if headSHA == "" {
+		http.Error(w, "missing head_sha in check_run", http.StatusBadRequest)
+		return
+	}
+	if err := ValidateCommitSHA(headSHA); err != nil {
+		log.Printf("invalid commit SHA %q in check_run: %v", headSHA, err)
+		http.Error(w, fmt.Sprintf("invalid commit SHA in check_run: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// 8. Resolve Comparison from check_run.head_sha + repository before checking permissions
+	comp, err := s.findComparisonForHeadSHA(ctx, repoFullName, headSHA)
+	if err != nil {
+		log.Printf("failed to find comparison for head SHA %s on repo %s: %v", headSHA, repoFullName, err)
+		http.Error(w, fmt.Sprintf("failed to resolve comparison: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if comp == nil {
+		log.Printf("no comparison found for head SHA %s on repo %s (delivery %s)", headSHA, repoFullName, deliveryID)
+		http.Error(w, "Comparison not found", http.StatusNotFound)
+		return
+	}
+
+	// 9. Check sender has write access to repository (collaborators/{user}/permission >= write, cached)
+	hasWrite, err := s.checkCollaboratorWriteAccess(ctx, owner, repo, sender)
+	if err != nil {
+		log.Printf("failed to check collaborator permission for %s on %s: %v", sender, repoFullName, err)
+		http.Error(w, fmt.Sprintf("failed to check collaborator permission: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if !hasWrite {
+		log.Printf("sender %s lacks write access to %s; rejecting check_run action %s (delivery %s)", sender, repoFullName, actionID, deliveryID)
+		http.Error(w, "Forbidden: sender lacks write access to repository", http.StatusForbidden)
+		return
+	}
+
+	// 10. Append pending command to Comparison status
+	newCmd := v1alpha1.ComparisonPendingCommand{
+		CheckRunID:  event.CheckRun.ID,
+		DeliveryID:  deliveryID,
+		Login:       sender,
+		RequestedBy: sender,
+		Command:     cmdString,
+		Requested:   requestedSamples,
+		ReceivedAt:  metav1.Now(),
+	}
+
+	var alreadyRecorded bool
+	var queueFull bool
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest v1alpha1.Comparison
+		if err := s.cfg.Client.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: comp.Name}, &latest); err != nil {
+			return err
+		}
+
+		for _, cmd := range latest.Status.PendingCommands {
+			if (deliveryID != "" && cmd.DeliveryID == deliveryID) ||
+				(cmd.CheckRunID == event.CheckRun.ID && cmd.Command == cmdString && cmd.CheckRunID != 0) {
+				alreadyRecorded = true
+				return nil
+			}
+		}
+		for _, cmd := range latest.Status.HandledCommands {
+			if (deliveryID != "" && cmd.DeliveryID == deliveryID) ||
+				(cmd.CheckRunID == event.CheckRun.ID && cmd.Command == cmdString && cmd.CheckRunID != 0) {
+				alreadyRecorded = true
+				return nil
+			}
+		}
+
+		if len(latest.Status.PendingCommands) >= v1alpha1.MaxPendingCommands {
+			queueFull = true
+			return nil
+		}
+
+		latest.Status.PendingCommands = append(latest.Status.PendingCommands, newCmd)
+		return s.cfg.Client.Status().Update(ctx, &latest)
+	})
+
+	if err != nil {
+		log.Printf("failed to update pendingCommands on comparison %s/%s: %v", comp.Namespace, comp.Name, err)
+		http.Error(w, fmt.Sprintf("failed to update comparison: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if alreadyRecorded {
+		s.rememberDelivery(deliveryID)
+		log.Printf("check_run action %s already recorded on Comparison %s/%s (delivery %s)", actionID, comp.Namespace, comp.Name, deliveryID)
+		writeResponse(w, http.StatusOK, "ok: already recorded\n")
+		return
+	}
+
+	if queueFull {
+		log.Printf("pendingCommands queue is full on Comparison %s/%s; dropping check_run action %s (delivery %s)", comp.Namespace, comp.Name, actionID, deliveryID)
+		writeResponse(w, http.StatusOK, "ok: queue full\n")
+		return
+	}
+
+	// 10. Remember delivery for 24h
+	s.rememberDelivery(deliveryID)
+
+	// 11. Reply by updating check run to in_progress with "requested by @user"
+	ghClient, err := s.getGitHubClient(ctx)
+	if err != nil {
+		log.Printf("warning: could not get github client to update check run: %v", err)
+	} else if event.CheckRun.ID != 0 {
+		updateState := github.CheckRunState{
+			Name:       event.CheckRun.Name,
+			Status:     "in_progress",
+			Conclusion: "",
+			Title:      fmt.Sprintf("in progress · requested by @%s", sender),
+			Summary:    fmt.Sprintf("requested by @%s", sender),
+		}
+		if updateErr := ghClient.UpdateCheckRun(ctx, owner, repo, event.CheckRun.ID, updateState); updateErr != nil {
+			log.Printf("warning: failed to update check run %d to in_progress: %v", event.CheckRun.ID, updateErr)
+		}
+	}
+
+	log.Printf("successfully recorded check_run action %s (%q) on Comparison %s/%s for delivery %s", actionID, cmdString, comp.Namespace, comp.Name, deliveryID)
+	writeResponse(w, http.StatusOK, "ok\n")
 }
 
 // validateCloneURL validates that a repository clone URL parses, that its host

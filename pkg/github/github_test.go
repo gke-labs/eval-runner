@@ -3231,6 +3231,224 @@ func TestCheckRunStateForComparison_ScoringFailure(t *testing.T) {
 	}
 }
 
+func TestCheckRunStateForComparison_ActionsPolicy(t *testing.T) {
+	// Verify action button constraints
+	allActions := []CheckRunAction{ActionMore32, ActionRerunBase, ActionRerunCand}
+	for _, a := range allActions {
+		if len(a.Label) > 20 {
+			t.Errorf("Action %s label %q exceeds 20 characters (got %d)", a.Identifier, a.Label, len(a.Label))
+		}
+		if len(a.Description) > 40 {
+			t.Errorf("Action %s description %q exceeds 40 characters (got %d)", a.Identifier, a.Description, len(a.Description))
+		}
+		if len(a.Identifier) > 20 {
+			t.Errorf("Action identifier %q exceeds 20 characters (got %d)", a.Identifier, len(a.Identifier))
+		}
+	}
+
+	t.Run("ConclusiveVerdictsOfferOnlyMore32", func(t *testing.T) {
+		for _, v := range []v1alpha1.ComparisonVerdict{
+			v1alpha1.ComparisonVerdictImproved,
+			v1alpha1.ComparisonVerdictRegressed,
+			v1alpha1.ComparisonVerdictUnchanged,
+		} {
+			comp := &v1alpha1.Comparison{
+				Status: v1alpha1.ComparisonStatus{
+					Phase:   v1alpha1.ComparisonPhaseCompleted,
+					Verdict: v,
+				},
+			}
+			state := CheckRunStateForComparison(comp, nil, nil, "", "")
+			if len(state.Actions) != 1 || state.Actions[0].Identifier != ActionIdentifierMore32 {
+				t.Errorf("Verdict %s: expected [more-32], got %+v", v, state.Actions)
+			}
+		}
+	})
+
+	t.Run("InconclusiveVerdictOffersMore32AndRerunBase", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+			},
+		}
+		state := CheckRunStateForComparison(comp, nil, nil, "", "")
+		if len(state.Actions) != 2 ||
+			state.Actions[0].Identifier != ActionIdentifierMore32 ||
+			state.Actions[1].Identifier != ActionIdentifierRerunBase {
+			t.Errorf("Inconclusive: expected [more-32, rerun-base], got %+v", state.Actions)
+		}
+	})
+
+	t.Run("CandidateRunFailedOffersRerunCand", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+			},
+		}
+		candRun := &v1alpha1.Run{
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseFailed,
+			},
+		}
+		baseRun := &v1alpha1.Run{
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+			},
+		}
+		state := CheckRunStateForComparison(comp, baseRun, candRun, "", "")
+		if len(state.Actions) != 1 || state.Actions[0].Identifier != ActionIdentifierRerunCand {
+			t.Errorf("Candidate failed: expected [rerun-cand], got %+v", state.Actions)
+		}
+	})
+
+	t.Run("BaselineRunFailedOffersRerunBase", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+			},
+		}
+		candRun := &v1alpha1.Run{
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+			},
+		}
+		baseRun := &v1alpha1.Run{
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseFailed,
+			},
+		}
+		state := CheckRunStateForComparison(comp, baseRun, candRun, "", "")
+		if len(state.Actions) != 1 || state.Actions[0].Identifier != ActionIdentifierRerunBase {
+			t.Errorf("Baseline failed: expected [rerun-base], got %+v", state.Actions)
+		}
+	})
+
+	t.Run("BothRunsFailedOffersRerunCandAndRerunBase", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+			},
+		}
+		candRun := &v1alpha1.Run{
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseFailed,
+			},
+		}
+		baseRun := &v1alpha1.Run{
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseFailed,
+			},
+		}
+		state := CheckRunStateForComparison(comp, baseRun, candRun, "", "")
+		if len(state.Actions) != 2 ||
+			state.Actions[0].Identifier != ActionIdentifierRerunCand ||
+			state.Actions[1].Identifier != ActionIdentifierRerunBase {
+			t.Errorf("Both failed: expected [rerun-cand, rerun-base], got %+v", state.Actions)
+		}
+	})
+
+	t.Run("ScoringFailureOffersRerunCandAndRerunBase", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{Name: "scoring-fail", Namespace: "eval-runner"},
+			Spec: v1alpha1.ComparisonSpec{
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run"},
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run"},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+				Conditions: []metav1.Condition{
+					{
+						Type:    v1alpha1.ConditionTypeArtifactsReadable,
+						Status:  metav1.ConditionFalse,
+						Reason:  v1alpha1.ConditionReasonNotFound,
+						Message: "Inspect log not found in sink",
+					},
+				},
+			},
+		}
+		state := CheckRunStateForComparison(comp, nil, nil, "", "")
+		if len(state.Actions) != 2 ||
+			state.Actions[0].Identifier != ActionIdentifierRerunCand ||
+			state.Actions[1].Identifier != ActionIdentifierRerunBase {
+			t.Errorf("Scoring failure: expected [rerun-cand, rerun-base], got %+v", state.Actions)
+		}
+	})
+
+	t.Run("RunningVerdictOffersNoActions", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseRunning,
+				Verdict: v1alpha1.ComparisonVerdictRunning,
+			},
+		}
+		state := CheckRunStateForComparison(comp, nil, nil, "", "")
+		if len(state.Actions) != 0 {
+			t.Errorf("Running: expected empty actions, got %+v", state.Actions)
+		}
+	})
+
+	t.Run("SanitizeCheckRunActionsLimits", func(t *testing.T) {
+		oversized := []CheckRunAction{
+			{Label: "1234567890123456789012345", Description: "123456789012345678901234567890123456789012345", Identifier: "1234567890123456789012345"},
+			{Label: "b2", Description: "desc2", Identifier: "id2"},
+			{Label: "b3", Description: "desc3", Identifier: "id3"},
+			{Label: "b4", Description: "desc4", Identifier: "id4"},
+		}
+		sanitized := SanitizeCheckRunActions(oversized)
+		if len(sanitized) != 3 {
+			t.Fatalf("expected clamped to 3 actions, got %d", len(sanitized))
+		}
+		if len(sanitized[0].Label) != 20 {
+			t.Errorf("expected label clamped to 20, got %d (%q)", len(sanitized[0].Label), sanitized[0].Label)
+		}
+		if len(sanitized[0].Description) != 40 {
+			t.Errorf("expected description clamped to 40, got %d (%q)", len(sanitized[0].Description), sanitized[0].Description)
+		}
+		if len(sanitized[0].Identifier) != 20 {
+			t.Errorf("expected identifier clamped to 20, got %d (%q)", len(sanitized[0].Identifier), sanitized[0].Identifier)
+		}
+	})
+}
+
+func TestRenderComparisonMarkdown_MultipleRequestsByUserCount(t *testing.T) {
+	comp := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{Name: "comp-multi-audit", Namespace: "eval-runner"},
+		Spec: v1alpha1.ComparisonSpec{
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: "gke-labs/eval-runner",
+				Number:     433,
+			},
+		},
+		Status: v1alpha1.ComparisonStatus{
+			Verdict: v1alpha1.ComparisonVerdictInconclusive,
+			HandledCommands: []v1alpha1.ComparisonHandledCommand{
+				{
+					Command:     "more 32",
+					Requested:   32,
+					RequestedBy: "alice",
+					Outcome:     "applied",
+				},
+				{
+					Command:     "more 32",
+					Requested:   32,
+					RequestedBy: "alice",
+					Outcome:     "applied",
+				},
+			},
+		},
+	}
+
+	md := RenderComparisonMarkdown(comp, nil, nil, "")
+	if !strings.Contains(md, "+32 samples requested by @alice (x2)") {
+		t.Errorf("expected markdown to contain '+32 samples requested by @alice (x2)', got:\n%s", md)
+	}
+}
+
 func TestCheckRunStateForComparison_TransientErrorDoesNotTriggerScoringFailure(t *testing.T) {
 	// A comparison in phase Running with a temporary error message (e.g. transient network timeout)
 	// must not be treated as a scoring failure when ConditionTypeArtifactsReadable is not ConditionFalse.

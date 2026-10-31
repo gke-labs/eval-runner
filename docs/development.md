@@ -780,7 +780,11 @@ Creating and updating GitHub Check Runs via the REST API requires a GitHub App (
    In GitHub Organization / User Settings -> Developer Settings -> GitHub Apps -> New GitHub App:
    - **GitHub App name**: e.g. `eval-runner` (or your choice).
    - **Homepage URL**: Your project or UI URL.
-   - **Webhook**: Active can be disabled (or configure webhook URL if integrating with `eval-runner-webhook`).
+   - **Webhook**:
+     - Check **Active**
+     - **Webhook URL**: `https://<host>/webhook`
+     - **Webhook secret**: Generate a random secret and store it in Kubernetes (see step 3).
+     - **Subscribe to events**: Check `Issue comment` and `Check run` (`check_run`) to enable interactive review comments and check-run action buttons ("Run 32 more samples", "Re-run baseline", "Re-run candidate"). (The forge poller handles branch pushes and PR synchronization).
    - **Repository permissions:**
      - **Pull requests**: Read and write (to list, create, and update PR comments)
      - **Checks**: Read and write (to create and update check runs)
@@ -793,14 +797,15 @@ Creating and updating GitHub Check Runs via the REST API requires a GitHub App (
 
 3. **Create the Secret in the controller namespace:**
    ```bash
-   kubectl create secret generic github-token \
+   kubectl create secret generic github-app \
      --namespace=eval-runner \
      --from-literal=app-id=123456 \
      --from-literal=installation-id=987654 \
-     --from-file=private-key=eval-runner.private-key.pem
+     --from-file=private-key=eval-runner.private-key.pem \
+     --from-literal=webhook-secret=your-webhook-secret
    ```
 
-   *(Note: The controller mints RS256 JWTs and exchanges them for GitHub App installation access tokens with automatic 1-hour caching and refresh. The private key and tokens live exclusively in the `eval-runner` controller namespace and are never mounted in sandbox pods.)*
+   *(Note: The controller and webhook load GitHub App credentials from `github-app`. The webhook uses `webhook-secret` to verify HMAC signatures and the App credentials to check collaborator permissions and update check run states. The private key and tokens live exclusively in the `eval-runner` namespace and are never mounted in sandbox pods.)*
 
 ### Option B: Personal Access Token (PAT) Authentication
 

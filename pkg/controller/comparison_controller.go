@@ -509,6 +509,26 @@ func (r *ComparisonReconciler) reactToDeniedOrErroredCommand(
 	}
 }
 
+func pendingCommandKey(cmd v1alpha1.ComparisonPendingCommand) string {
+	if cmd.CommentID != 0 {
+		return fmt.Sprintf("comment:%d", cmd.CommentID)
+	}
+	if cmd.DeliveryID != "" {
+		return fmt.Sprintf("delivery:%s", cmd.DeliveryID)
+	}
+	return fmt.Sprintf("checkrun:%d:%s:%s", cmd.CheckRunID, cmd.Login, cmd.Command)
+}
+
+func handledCommandKey(cmd v1alpha1.ComparisonHandledCommand) string {
+	if cmd.CommentID != 0 {
+		return fmt.Sprintf("comment:%d", cmd.CommentID)
+	}
+	if cmd.DeliveryID != "" {
+		return fmt.Sprintf("delivery:%s", cmd.DeliveryID)
+	}
+	return fmt.Sprintf("checkrun:%d:%s:%s", cmd.CheckRunID, cmd.Login, cmd.Command)
+}
+
 func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp *v1alpha1.Comparison) error {
 	if len(comp.Status.PendingCommands) == 0 {
 		return nil
@@ -526,8 +546,10 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 	}
 
 	var newHandled []v1alpha1.ComparisonHandledCommand
-	updatedPending := make(map[int64]v1alpha1.ComparisonPendingCommand)
+	updatedPending := make(map[string]v1alpha1.ComparisonPendingCommand)
 	totalExtraBump := 0
+	newCandRunName := ""
+	newBaseRunName := ""
 
 	for _, cmd := range comp.Status.PendingCommands {
 		if cmd.NextAttemptAt != nil && cmd.NextAttemptAt.After(now) {
@@ -582,20 +604,94 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 		}
 
 		if authorized {
-			samplesToBump := cmd.Requested
-			if comp.Spec.Sampling != nil {
-				maxPerTask := comp.Spec.Sampling.EffectiveMaxSamplesPerTask()
-				if maxPerTask > 0 && samplesToBump > maxPerTask {
-					samplesToBump = maxPerTask
+			if strings.HasPrefix(cmd.Command, "rerun") {
+				if strings.Contains(cmd.Command, "candidate") {
+					if comp.Spec.Candidate.Run == "" {
+						terminalOutcome = "error: no candidate run configured to rerun"
+					} else {
+						var candRun v1alpha1.Run
+						if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: comp.Spec.Candidate.Run}, &candRun); err != nil {
+							logger.Info("could not get candidate run to rerun", "run", comp.Spec.Candidate.Run, "err", err)
+							terminalOutcome = fmt.Sprintf("error: candidate run %q not found: %v", comp.Spec.Candidate.Run, err)
+						} else {
+							freshName := fmt.Sprintf("%s-rerun-%d", candRun.Name, now.UnixNano())
+							freshRun := &v1alpha1.Run{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:        freshName,
+									Namespace:   comp.Namespace,
+									Labels:      make(map[string]string),
+									Annotations: make(map[string]string),
+								},
+								Spec: *candRun.Spec.DeepCopy(),
+							}
+							for k, v := range candRun.Labels {
+								freshRun.Labels[k] = v
+							}
+							for k, v := range candRun.Annotations {
+								freshRun.Annotations[k] = v
+							}
+							if err := r.Create(ctx, freshRun); err != nil {
+								logger.Info("failed to create fresh candidate run for rerun", "name", freshName, "err", err)
+								terminalOutcome = fmt.Sprintf("error: failed creating fresh candidate run: %v", err)
+							} else {
+								newCandRunName = freshName
+								terminalOutcome = "applied"
+							}
+						}
+					}
+				} else if strings.Contains(cmd.Command, "baseline") {
+					if comp.Spec.Baseline.Run == "" {
+						terminalOutcome = "error: no baseline run configured to rerun"
+					} else {
+						var baseRun v1alpha1.Run
+						if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: comp.Spec.Baseline.Run}, &baseRun); err != nil {
+							logger.Info("could not get baseline run to rerun", "run", comp.Spec.Baseline.Run, "err", err)
+							terminalOutcome = fmt.Sprintf("error: baseline run %q not found: %v", comp.Spec.Baseline.Run, err)
+						} else {
+							freshName := fmt.Sprintf("%s-rerun-%d", baseRun.Name, now.UnixNano())
+							freshRun := &v1alpha1.Run{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:        freshName,
+									Namespace:   comp.Namespace,
+									Labels:      make(map[string]string),
+									Annotations: make(map[string]string),
+								},
+								Spec: *baseRun.Spec.DeepCopy(),
+							}
+							for k, v := range baseRun.Labels {
+								freshRun.Labels[k] = v
+							}
+							for k, v := range baseRun.Annotations {
+								freshRun.Annotations[k] = v
+							}
+							if err := r.Create(ctx, freshRun); err != nil {
+								logger.Info("failed to create fresh baseline run for rerun", "name", freshName, "err", err)
+								terminalOutcome = fmt.Sprintf("error: failed creating fresh baseline run: %v", err)
+							} else {
+								newBaseRunName = freshName
+								terminalOutcome = "applied"
+							}
+						}
+					}
+				} else {
+					terminalOutcome = fmt.Sprintf("error: unsupported rerun target in command %q", cmd.Command)
 				}
-			} else if samplesToBump > v1alpha1.DefaultMaxSamplesPerTask {
-				samplesToBump = v1alpha1.DefaultMaxSamplesPerTask
+			} else {
+				samplesToBump := cmd.Requested
+				if comp.Spec.Sampling != nil {
+					maxPerTask := comp.Spec.Sampling.EffectiveMaxSamplesPerTask()
+					if maxPerTask > 0 && samplesToBump > maxPerTask {
+						samplesToBump = maxPerTask
+					}
+				} else if samplesToBump > v1alpha1.DefaultMaxSamplesPerTask {
+					samplesToBump = v1alpha1.DefaultMaxSamplesPerTask
+				}
+				totalExtraBump += samplesToBump
+				terminalOutcome = "applied"
 			}
-			totalExtraBump += samplesToBump
-			terminalOutcome = "applied"
 
-			// Acknowledge via GitHub reaction (eyes) or fallback comment
-			if ghClient != nil && comp.Spec.PullRequest != nil {
+			// Acknowledge via GitHub reaction (eyes) or fallback comment for comment commands
+			if cmd.CommentID != 0 && ghClient != nil && comp.Spec.PullRequest != nil {
 				parts := strings.Split(comp.Spec.PullRequest.Repository, "/")
 				if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 					owner, repo := parts[0], parts[1]
@@ -610,13 +706,21 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 				}
 			}
 
+			reqBy := cmd.RequestedBy
+			if reqBy == "" {
+				reqBy = cmd.Login
+			}
 			handled := v1alpha1.ComparisonHandledCommand{
-				CommentID:  cmd.CommentID,
-				Login:      cmd.Login,
-				Requested:  cmd.Requested,
-				ReceivedAt: cmd.ReceivedAt,
-				HandledAt:  &metav1.Time{Time: r.now()},
-				Outcome:    terminalOutcome,
+				CommentID:   cmd.CommentID,
+				CheckRunID:  cmd.CheckRunID,
+				DeliveryID:  cmd.DeliveryID,
+				Login:       cmd.Login,
+				RequestedBy: reqBy,
+				Command:     cmd.Command,
+				Requested:   cmd.Requested,
+				ReceivedAt:  cmd.ReceivedAt,
+				HandledAt:   &metav1.Time{Time: r.now()},
+				Outcome:     terminalOutcome,
 			}
 			newHandled = append(newHandled, handled)
 		} else if isTransient {
@@ -626,7 +730,7 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 				nextTime := metav1.NewTime(now.Add(delay))
 				cmd.Attempts = attempts
 				cmd.NextAttemptAt = &nextTime
-				updatedPending[cmd.CommentID] = cmd
+				updatedPending[pendingCommandKey(cmd)] = cmd
 				logger.Info("transient error verifying permissions, retrying", "commentId", cmd.CommentID, "user", cmd.Login, "attempt", attempts, "nextAttemptAt", nextTime.Time, "maxAttempts", v1alpha1.MaxCommandAttempts, "err", transientErr)
 			} else {
 				var outcome string
@@ -637,30 +741,50 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 				}
 				logger.Info("transient error retries exhausted, marking terminal", "commentId", cmd.CommentID, "user", cmd.Login, "attempts", attempts, "outcome", outcome)
 
-				r.reactToDeniedOrErroredCommand(ctx, ghClient, comp.Spec.PullRequest, cmd.CommentID)
+				if cmd.CommentID != 0 {
+					r.reactToDeniedOrErroredCommand(ctx, ghClient, comp.Spec.PullRequest, cmd.CommentID)
+				}
 
+				reqBy := cmd.RequestedBy
+				if reqBy == "" {
+					reqBy = cmd.Login
+				}
 				handled := v1alpha1.ComparisonHandledCommand{
-					CommentID:  cmd.CommentID,
-					Login:      cmd.Login,
-					Requested:  cmd.Requested,
-					ReceivedAt: cmd.ReceivedAt,
-					HandledAt:  &metav1.Time{Time: r.now()},
-					Outcome:    outcome,
+					CommentID:   cmd.CommentID,
+					CheckRunID:  cmd.CheckRunID,
+					DeliveryID:  cmd.DeliveryID,
+					Login:       cmd.Login,
+					RequestedBy: reqBy,
+					Command:     cmd.Command,
+					Requested:   cmd.Requested,
+					ReceivedAt:  cmd.ReceivedAt,
+					HandledAt:   &metav1.Time{Time: r.now()},
+					Outcome:     outcome,
 				}
 				newHandled = append(newHandled, handled)
 			}
 		} else {
 			logger.Info("command denied or terminal error", "commentId", cmd.CommentID, "user", cmd.Login, "outcome", terminalOutcome)
 
-			r.reactToDeniedOrErroredCommand(ctx, ghClient, comp.Spec.PullRequest, cmd.CommentID)
+			if cmd.CommentID != 0 {
+				r.reactToDeniedOrErroredCommand(ctx, ghClient, comp.Spec.PullRequest, cmd.CommentID)
+			}
 
+			reqBy := cmd.RequestedBy
+			if reqBy == "" {
+				reqBy = cmd.Login
+			}
 			handled := v1alpha1.ComparisonHandledCommand{
-				CommentID:  cmd.CommentID,
-				Login:      cmd.Login,
-				Requested:  cmd.Requested,
-				ReceivedAt: cmd.ReceivedAt,
-				HandledAt:  &metav1.Time{Time: r.now()},
-				Outcome:    terminalOutcome,
+				CommentID:   cmd.CommentID,
+				CheckRunID:  cmd.CheckRunID,
+				DeliveryID:  cmd.DeliveryID,
+				Login:       cmd.Login,
+				RequestedBy: reqBy,
+				Command:     cmd.Command,
+				Requested:   cmd.Requested,
+				ReceivedAt:  cmd.ReceivedAt,
+				HandledAt:   &metav1.Time{Time: r.now()},
+				Outcome:     terminalOutcome,
 			}
 			newHandled = append(newHandled, handled)
 		}
@@ -669,9 +793,9 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 	key := types.NamespacedName{Namespace: comp.Namespace, Name: comp.Name}
 	specBumped := false
 
-	handledIDs := make(map[int64]bool, len(newHandled))
+	handledIDs := make(map[string]bool, len(newHandled))
 	for _, h := range newHandled {
-		handledIDs[h.CommentID] = true
+		handledIDs[handledCommandKey(h)] = true
 	}
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -680,12 +804,24 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 			return err
 		}
 
+		specChanged := false
 		if totalExtraBump > 0 && !specBumped {
 			latest.Spec.ExtraSamples += totalExtraBump
+			specChanged = true
+			specBumped = true
+		}
+		if newCandRunName != "" {
+			latest.Spec.Candidate.Run = newCandRunName
+			specChanged = true
+		}
+		if newBaseRunName != "" {
+			latest.Spec.Baseline.Run = newBaseRunName
+			specChanged = true
+		}
+		if specChanged {
 			if err := r.Update(ctx, &latest); err != nil {
 				return err
 			}
-			specBumped = true
 		}
 
 		if len(newHandled) > 0 {
@@ -697,16 +833,45 @@ func (r *ComparisonReconciler) processPendingCommands(ctx context.Context, comp 
 
 		var remainingPending []v1alpha1.ComparisonPendingCommand
 		for _, p := range latest.Status.PendingCommands {
-			if handledIDs[p.CommentID] {
+			if handledIDs[pendingCommandKey(p)] {
 				continue
 			}
-			if up, ok := updatedPending[p.CommentID]; ok {
+			if up, ok := updatedPending[pendingCommandKey(p)]; ok {
 				remainingPending = append(remainingPending, up)
 			} else {
 				remainingPending = append(remainingPending, p)
 			}
 		}
 		latest.Status.PendingCommands = remainingPending
+
+		if newCandRunName != "" || newBaseRunName != "" {
+			if newCandRunName != "" && len(latest.Status.Batches) > 0 {
+				latest.Status.Batches[0].CandidateRun = newCandRunName
+				latest.Status.Batches[0].Phase = v1alpha1.ComparisonPhaseRunning
+			}
+			if newBaseRunName != "" && len(latest.Status.Batches) > 0 {
+				latest.Status.Batches[0].BaselineRun = newBaseRunName
+				latest.Status.Batches[0].Phase = v1alpha1.ComparisonPhaseRunning
+			}
+			latest.Status.Phase = v1alpha1.ComparisonPhaseRunning
+			latest.Status.Verdict = v1alpha1.ComparisonVerdictRunning
+			if newCandRunName != "" {
+				latest.Status.Message = fmt.Sprintf("Re-running candidate run %s", newCandRunName)
+			} else {
+				latest.Status.Message = fmt.Sprintf("Re-running baseline run %s", newBaseRunName)
+			}
+		}
+
+		hasHandledCheckRunCmd := false
+		for _, h := range newHandled {
+			if h.CheckRunID != 0 {
+				hasHandledCheckRunCmd = true
+				break
+			}
+		}
+		if hasHandledCheckRunCmd && latest.Status.Reporting != nil {
+			latest.Status.Reporting.LastPostedHash = ""
+		}
 
 		if err := r.Status().Update(ctx, &latest); err != nil {
 			return err

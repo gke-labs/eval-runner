@@ -426,16 +426,34 @@ const (
 	MaxReportingAttempts = 4
 )
 
-// ComparisonPendingCommand represents an unhandled command received from a GitHub review comment.
+// ComparisonPendingCommand represents an unhandled command received from a GitHub review comment or check run action.
 type ComparisonPendingCommand struct {
-	// CommentID is the GitHub issue comment ID where the command was issued.
-	CommentID int64 `json:"commentId"`
+	// CommentID is the GitHub issue comment ID where the command was issued, or 0 if from a check run action.
+	// +optional
+	CommentID int64 `json:"commentId,omitempty"`
+
+	// CheckRunID is the GitHub check run ID where the action was clicked, or 0 if from a review comment.
+	// +optional
+	CheckRunID int64 `json:"checkRunId,omitempty"`
+
+	// DeliveryID is the GitHub webhook delivery UUID.
+	// +optional
+	DeliveryID string `json:"deliveryId,omitempty"`
 
 	// Login is the GitHub username of the user who issued the command.
 	Login string `json:"login"`
 
+	// RequestedBy is the GitHub username of the user who issued the command.
+	// +optional
+	RequestedBy string `json:"requestedBy,omitempty"`
+
+	// Command is the pending command (e.g. "more 32", "rerun baseline", "rerun candidate").
+	// +optional
+	Command string `json:"command,omitempty"`
+
 	// Requested is the number of additional samples requested.
-	Requested int `json:"requested"`
+	// +optional
+	Requested int `json:"requested,omitempty"`
 
 	// ReceivedAt is the time when the webhook received and recorded the command.
 	ReceivedAt metav1.Time `json:"receivedAt"`
@@ -450,16 +468,34 @@ type ComparisonPendingCommand struct {
 	NextAttemptAt *metav1.Time `json:"nextAttemptAt,omitempty"`
 }
 
-// ComparisonHandledCommand represents a review comment command that has been processed by the controller.
+// ComparisonHandledCommand represents a review comment or check run command that has been processed by the controller.
 type ComparisonHandledCommand struct {
-	// CommentID is the GitHub issue comment ID where the command was issued.
-	CommentID int64 `json:"commentId"`
+	// CommentID is the GitHub issue comment ID where the command was issued, or 0 if from a check run action.
+	// +optional
+	CommentID int64 `json:"commentId,omitempty"`
+
+	// CheckRunID is the GitHub check run ID where the action was clicked, or 0 if from a review comment.
+	// +optional
+	CheckRunID int64 `json:"checkRunId,omitempty"`
+
+	// DeliveryID is the GitHub webhook delivery UUID.
+	// +optional
+	DeliveryID string `json:"deliveryId,omitempty"`
 
 	// Login is the GitHub username of the user who issued the command.
 	Login string `json:"login"`
 
+	// RequestedBy is the GitHub username of the user who issued the command.
+	// +optional
+	RequestedBy string `json:"requestedBy,omitempty"`
+
+	// Command is the command that was processed (e.g. "more 32", "rerun baseline", "rerun candidate").
+	// +optional
+	Command string `json:"command,omitempty"`
+
 	// Requested is the number of additional samples requested.
-	Requested int `json:"requested"`
+	// +optional
+	Requested int `json:"requested,omitempty"`
 
 	// ReceivedAt is the time when the webhook received and recorded the command.
 	ReceivedAt metav1.Time `json:"receivedAt"`

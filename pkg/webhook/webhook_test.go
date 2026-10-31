@@ -35,6 +35,7 @@ import (
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/pkg/forge"
 	"github.com/gke-labs/eval-runner/pkg/forge/consumer"
+	"github.com/gke-labs/eval-runner/pkg/github"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -4204,4 +4205,382 @@ func TestWebhookAndSyncer_ByteIdenticalObjects(t *testing.T) {
 			t.Errorf("Comparison %s JSON mismatch:\nWebhook:  %s\nConsumer: %s", cConsumer.Name, string(wJSON), string(cJSON))
 		}
 	}
+}
+
+func TestHandler_CheckRun_RequestedAction(t *testing.T) {
+	secretKey := []byte("checkrun-secret")
+	scheme := newTestScheme()
+
+	owner := "gke-labs"
+	repo := "eval-runner"
+	repoFullName := fmt.Sprintf("%s/%s", owner, repo)
+	headSHA := "1234567890abcdef1234567890abcdef12345678"
+
+	// Create a fake GitHub server
+	fakeGH := github.NewFakeGitHubServer()
+	defer fakeGH.Close()
+
+	// Set permissions
+	fakeGH.SetUserPermission(owner, repo, "write-user", "write")
+	fakeGH.SetUserPermission(owner, repo, "admin-user", "admin")
+	fakeGH.SetUserPermission(owner, repo, "read-user", "read")
+
+	// Pre-create check run on fake server
+	checkRunID, err := fakeGH.Client("test-token").CreateCheckRun(t.Context(), owner, repo, headSHA, github.CheckRunState{
+		Name:   github.CheckRunName,
+		Status: "completed",
+	})
+	if err != nil {
+		t.Fatalf("failed to create check run: %v", err)
+	}
+
+	// Comparison labeled with target-repo and head-sha (deliberately not named by head or PR)
+	comp := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "arbitrary-comp-name-999",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				LabelTargetRepo: SanitizeLabelValue(repoFullName),
+				LabelHeadSHA:    headSHA,
+			},
+		},
+		Spec: v1alpha1.ComparisonSpec{
+			PullRequest: &v1alpha1.PullRequestSpec{
+				Repository: repoFullName,
+				Number:     433,
+				HeadSHA:    headSHA,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(comp).WithObjects(comp).Build()
+
+	cfg := Config{
+		Namespace:           "eval-runner",
+		StaticWebhookSecret: secretKey,
+		WebhookRepositories: []string{repoFullName},
+		Client:              cl,
+		GitHubClient:        fakeGH.Client("test-token"),
+	}
+
+	server := NewServer(cfg)
+	server.Start()
+	defer server.Stop()
+
+	makePayload := func(action, identifier, senderLogin string) []byte {
+		var reqAction string
+		if identifier != "" {
+			reqAction = fmt.Sprintf(`"requested_action": {"identifier": %q},`, identifier)
+		}
+		return []byte(fmt.Sprintf(`{
+			"action": %q,
+			%s
+			"check_run": {
+				"id": %d,
+				"name": %q,
+				"head_sha": %q
+			},
+			"repository": {
+				"name": %q,
+				"full_name": %q,
+				"owner": {"login": %q}
+			},
+			"sender": {
+				"login": %q
+			}
+		}`, action, reqAction, checkRunID, github.CheckRunName, headSHA, repo, repoFullName, owner, senderLogin))
+	}
+
+	t.Run("RejectsBadSignature", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierMore32, "write-user")
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-sig-fail")
+		req.Header.Set(HeaderHubSignature256, "sha256=badsignaturebadsignaturebadsignaturebadsignaturebadsignature")
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized, got %d", rr.Code)
+		}
+	})
+
+	t.Run("RejectsUnknownIdentifier", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, "unknown-action", "write-user")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-unknown-id")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", rr.Code)
+		}
+		if !strings.Contains(rr.Body.String(), "unknown action identifier") {
+			t.Errorf("expected body to mention unknown action identifier, got: %s", rr.Body.String())
+		}
+	})
+
+	t.Run("RejectsSenderWithoutWriteAccess", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierMore32, "read-user")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-read-only")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden, got %d", rr.Code)
+		}
+	})
+
+	t.Run("RejectsBotSender", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierMore32, "renovate[bot]")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-bot")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden, got %d", rr.Code)
+		}
+	})
+
+	t.Run("RejectsBotType", func(t *testing.T) {
+		payload := []byte(fmt.Sprintf(`{
+			"action": %q,
+			"requested_action": {"identifier": %q},
+			"check_run": {
+				"id": %d,
+				"name": %q,
+				"head_sha": %q
+			},
+			"repository": {
+				"name": %q,
+				"full_name": %q,
+				"owner": {"login": %q}
+			},
+			"sender": {
+				"login": "some-bot",
+				"type": "Bot"
+			}
+		}`, ActionRequestedAction, github.ActionIdentifierMore32, checkRunID, github.CheckRunName, headSHA, repo, repoFullName, owner))
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-bot-type")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden, got %d", rr.Code)
+		}
+	})
+
+	t.Run("RejectsInvalidCommitSHA", func(t *testing.T) {
+		payload := []byte(fmt.Sprintf(`{
+			"action": %q,
+			"requested_action": {"identifier": %q},
+			"check_run": {
+				"id": %d,
+				"name": %q,
+				"head_sha": "not-a-valid-sha"
+			},
+			"repository": {
+				"name": %q,
+				"full_name": %q,
+				"owner": {"login": %q}
+			},
+			"sender": {
+				"login": "write-user"
+			}
+		}`, ActionRequestedAction, github.ActionIdentifierMore32, checkRunID, github.CheckRunName, repo, repoFullName, owner))
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-invalid-sha")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for invalid commit SHA, got %d", rr.Code)
+		}
+	})
+
+	t.Run("ComparisonNotFoundReturns404BeforePermissionCheck", func(t *testing.T) {
+		unknownSHA := "ffffffffffffffffffffffffffffffffffffffff"
+		payload := []byte(fmt.Sprintf(`{
+			"action": %q,
+			"requested_action": {"identifier": %q},
+			"check_run": {
+				"id": %d,
+				"name": %q,
+				"head_sha": %q
+			},
+			"repository": {
+				"name": %q,
+				"full_name": %q,
+				"owner": {"login": %q}
+			},
+			"sender": {
+				"login": "write-user"
+			}
+		}`, ActionRequestedAction, github.ActionIdentifierMore32, checkRunID, github.CheckRunName, unknownSHA, repo, repoFullName, owner))
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-unknown-comp")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("expected 404 Not Found for unknown comparison, got %d", rr.Code)
+		}
+	})
+
+	t.Run("AcceptsMore32_AppendsPendingCommand_UpdatesCheckRun", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierMore32, "write-user")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-more-32")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		var updatedComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: comp.Name}, &updatedComp); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+		if len(updatedComp.Status.PendingCommands) != 1 {
+			t.Fatalf("expected 1 pending command, got %d", len(updatedComp.Status.PendingCommands))
+		}
+		cmd := updatedComp.Status.PendingCommands[0]
+		if cmd.Command != "more 32" {
+			t.Errorf("expected command 'more 32', got %q", cmd.Command)
+		}
+		if cmd.Requested != 32 {
+			t.Errorf("expected requested samples 32, got %d", cmd.Requested)
+		}
+		if cmd.RequestedBy != "write-user" || cmd.Login != "write-user" {
+			t.Errorf("expected requestedBy/login 'write-user', got requestedBy=%q, login=%q", cmd.RequestedBy, cmd.Login)
+		}
+		if cmd.CheckRunID != checkRunID {
+			t.Errorf("expected checkRunId %d, got %d", checkRunID, cmd.CheckRunID)
+		}
+		if cmd.DeliveryID != "deliv-more-32" {
+			t.Errorf("expected deliveryId 'deliv-more-32', got %q", cmd.DeliveryID)
+		}
+
+		// Verify Check Run updated to in_progress with "requested by @user"
+		cr := fakeGH.GetCheckRun(checkRunID)
+		if cr == nil {
+			t.Fatalf("check run %d not found on fake server", checkRunID)
+		}
+		if cr.Status != "in_progress" {
+			t.Errorf("expected check run status 'in_progress', got %q", cr.Status)
+		}
+		if !strings.Contains(cr.Summary, "requested by @write-user") && !strings.Contains(cr.Title, "requested by @write-user") {
+			t.Errorf("expected check run title/summary to contain 'requested by @write-user', title=%q summary=%q", cr.Title, cr.Summary)
+		}
+	})
+
+	t.Run("IdempotentOnRedelivery", func(t *testing.T) {
+		// Re-send same delivery ID
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierMore32, "write-user")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-more-32")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK on redelivery, got %d", rr.Code)
+		}
+
+		var updatedComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: comp.Name}, &updatedComp); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+		// Still only 1 pending command
+		if len(updatedComp.Status.PendingCommands) != 1 {
+			t.Errorf("expected pending commands to remain 1 after redelivery, got %d", len(updatedComp.Status.PendingCommands))
+		}
+	})
+
+	t.Run("AcceptsRerunBase", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierRerunBase, "admin-user")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-rerun-base")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		var updatedComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: comp.Name}, &updatedComp); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+		if len(updatedComp.Status.PendingCommands) != 2 {
+			t.Fatalf("expected 2 pending commands, got %d", len(updatedComp.Status.PendingCommands))
+		}
+		cmd := updatedComp.Status.PendingCommands[1]
+		if cmd.Command != "rerun baseline" {
+			t.Errorf("expected command 'rerun baseline', got %q", cmd.Command)
+		}
+		if cmd.RequestedBy != "admin-user" {
+			t.Errorf("expected requestedBy 'admin-user', got %q", cmd.RequestedBy)
+		}
+	})
+
+	t.Run("AcceptsRerunCand", func(t *testing.T) {
+		payload := makePayload(ActionRequestedAction, github.ActionIdentifierRerunCand, "admin-user")
+		sig := ComputeSignature(payload, secretKey)
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set(HeaderGitHubEvent, EventCheckRun)
+		req.Header.Set(HeaderGitHubDelivery, "deliv-rerun-cand")
+		req.Header.Set(HeaderHubSignature256, sig)
+		rr := httptest.NewRecorder()
+
+		server.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		var updatedComp v1alpha1.Comparison
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: comp.Name}, &updatedComp); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+		if len(updatedComp.Status.PendingCommands) != 3 {
+			t.Fatalf("expected 3 pending commands, got %d", len(updatedComp.Status.PendingCommands))
+		}
+		cmd := updatedComp.Status.PendingCommands[2]
+		if cmd.Command != "rerun candidate" {
+			t.Errorf("expected command 'rerun candidate', got %q", cmd.Command)
+		}
+		if cmd.RequestedBy != "admin-user" {
+			t.Errorf("expected requestedBy 'admin-user', got %q", cmd.RequestedBy)
+		}
+	})
 }

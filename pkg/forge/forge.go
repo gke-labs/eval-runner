@@ -130,6 +130,13 @@ type CheckRunAnnotation struct {
 	RawDetails      string `json:"raw_details,omitempty"`
 }
 
+// CheckRunAction represents an interactive action button on a check run.
+type CheckRunAction struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Identifier  string `json:"identifier"`
+}
+
 // Status represents a commit status check or check run posted back to a forge.
 type Status struct {
 	Status      string               `json:"status,omitempty"`
@@ -142,4 +149,5 @@ type Status struct {
 	CheckRunID  int64                `json:"check_run_id,omitempty"`
 	Images      []CheckRunImage      `json:"images,omitempty"`
 	Annotations []CheckRunAnnotation `json:"annotations,omitempty"`
+	Actions     []CheckRunAction     `json:"actions,omitempty"`
 }

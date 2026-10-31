@@ -14520,6 +14520,501 @@ func TestComparisonController_PendingCommands(t *testing.T) {
 			t.Errorf("expected HandledCommands to be bounded by %d, got %d", v1alpha1.MaxHandledCommands, len(latest.Status.HandledCommands))
 		}
 	})
+
+	t.Run("check run action button press bumps extra samples and records audit", func(t *testing.T) {
+		server := github.NewFakeGitHubServer()
+		defer server.Close()
+		server.SetUserPermission("gke-labs", "eval-runner", "reviewer", "write")
+		tokenSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: "eval-runner"},
+			Data:       map[string][]byte{"token": []byte("ghp_test")},
+		}
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{Name: "comp-button-action", Namespace: "eval-runner"},
+			Spec: v1alpha1.ComparisonSpec{
+				PullRequest: &v1alpha1.PullRequestSpec{
+					Repository: "gke-labs/eval-runner",
+					Number:     433,
+				},
+				ExtraSamples: 0,
+			},
+			Status: v1alpha1.ComparisonStatus{
+				PendingCommands: []v1alpha1.ComparisonPendingCommand{
+					{
+						CheckRunID:  9001,
+						DeliveryID:  "deliv-btn-32",
+						Login:       "reviewer",
+						RequestedBy: "reviewer",
+						Command:     "more 32",
+						Requested:   32,
+						ReceivedAt:  metav1.Now(),
+					},
+				},
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(comp, tokenSecret).WithStatusSubresource(comp).Build()
+		reconciler := &ComparisonReconciler{
+			Client:              cl,
+			Scheme:              scheme,
+			ControllerNamespace: "eval-runner",
+			GitHubTokenSecret:   "github-token",
+			GitHubClientFactory: func(creds GitHubCredentials) github.Client {
+				return server.Client(creds.Token)
+			},
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-button-action"}}
+		_, _ = reconciler.Reconcile(t.Context(), req)
+
+		var latest v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &latest); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+		if latest.Spec.ExtraSamples != 32 {
+			t.Errorf("expected Spec.ExtraSamples 32, got %d", latest.Spec.ExtraSamples)
+		}
+		if len(latest.Status.PendingCommands) != 0 {
+			t.Errorf("expected 0 pending commands, got %d", len(latest.Status.PendingCommands))
+		}
+		if len(latest.Status.HandledCommands) != 1 {
+			t.Fatalf("expected 1 handled command, got %d", len(latest.Status.HandledCommands))
+		}
+		h := latest.Status.HandledCommands[0]
+		if h.Outcome != "applied" {
+			t.Errorf("expected outcome 'applied', got %q", h.Outcome)
+		}
+		if h.RequestedBy != "reviewer" {
+			t.Errorf("expected requestedBy 'reviewer', got %q", h.RequestedBy)
+		}
+		if h.Command != "more 32" {
+			t.Errorf("expected command 'more 32', got %q", h.Command)
+		}
+		if h.CheckRunID != 9001 {
+			t.Errorf("expected checkRunId 9001, got %d", h.CheckRunID)
+		}
+
+		// Verify PR comment footer includes audit line "+32 samples requested by @reviewer"
+		commentMD := github.RenderComparisonMarkdown(&latest, nil, nil, "")
+		if !strings.Contains(commentMD, "+32 samples requested by @reviewer") {
+			t.Errorf("expected comment markdown to contain '+32 samples requested by @reviewer', got:\n%s", commentMD)
+		}
+	})
+
+	t.Run("check run action button press results in a new batch Run same as more 32", func(t *testing.T) {
+		taskID := "docs/readme_comprehension"
+		fakeGCS := fakes.NewFakeStorageClient()
+		sink, err := gcs.New(t.Context(), "gs://test-bucket", gcs.WithStorageClient(fakeGCS))
+		if err != nil {
+			t.Fatalf("failed to create sink: %v", err)
+		}
+
+		tScores := make([]stats.SampleScore, 8)
+		nowTime := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+		for i := 0; i < 8; i++ {
+			tScores[i] = stats.SampleScore{ID: fmt.Sprint(i + 1), Score: 0.5}
+		}
+
+		fakeGCS.Objects["test-bucket/runs/cand-sha/"+taskID+"/log.json"] = fakes.FakeObject{
+			Data: makeSyntheticInspectLogWithDataset(taskID, tScores, 64),
+		}
+		fakeGCS.Objects["test-bucket/runs/base-sha/"+taskID+"/log.json"] = fakes.FakeObject{
+			Data: makeSyntheticInspectLogWithDataset(taskID, tScores, 64),
+		}
+
+		candSeedRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-run-seed", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:        v1alpha1.RepoSpec{URL: "https://github.com/gke-labs/eval-runner.git", Commit: "cand-sha"},
+				Model:       "mockllm/model",
+				SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:          taskID,
+						Phase:       v1alpha1.TaskPhaseCompleted,
+						LogPath:     "gs://test-bucket/runs/cand-sha/" + taskID + "/log.json",
+						Samples:     8,
+						SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+					},
+				},
+			},
+		}
+		baseSeedRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-run-seed", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:        v1alpha1.RepoSpec{URL: "https://github.com/gke-labs/eval-runner.git", Commit: "base-sha"},
+				Model:       "mockllm/model",
+				SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:          taskID,
+						Phase:       v1alpha1.TaskPhaseCompleted,
+						LogPath:     "gs://test-bucket/runs/base-sha/" + taskID + "/log.json",
+						Samples:     8,
+						SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+					},
+				},
+			},
+		}
+
+		compTime := metav1.NewTime(nowTime.Add(-10 * time.Minute))
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{Name: "comp-button-batch", Namespace: "eval-runner"},
+			Spec: v1alpha1.ComparisonSpec{
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run-seed"},
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run-seed"},
+				PullRequest: &v1alpha1.PullRequestSpec{
+					Repository: "gke-labs/eval-runner",
+					Number:     433,
+					HeadSHA:    "cand-sha",
+					BaseSHA:    "base-sha",
+				},
+				Sampling: &v1alpha1.ComparisonSamplingSpec{
+					BatchSize:         8,
+					MaxSamplesPerTask: 64,
+				},
+				ExtraSamples: 0,
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase:               v1alpha1.ComparisonPhaseCompleted,
+				Verdict:             v1alpha1.ComparisonVerdictInconclusive,
+				CompletionTime:      &compTime,
+				ExtraSamplesApplied: 0,
+				Batches: []v1alpha1.ComparisonBatchStatus{
+					{
+						Index:        1,
+						CandidateRun: "cand-run-seed",
+						BaselineRun:  "base-run-seed",
+						Phase:        v1alpha1.ComparisonPhaseCompleted,
+						SampleRange:  &v1alpha1.SampleRange{Start: 1, End: 8},
+					},
+				},
+				Tasks: []v1alpha1.ComparisonTaskStatus{
+					{
+						ID:              taskID,
+						Label:           v1alpha1.ComparisonTaskLabelInconclusive,
+						Decision:        v1alpha1.ComparisonTaskLabelInconclusive,
+						SamplesRun:      8,
+						PossibleSamples: 64,
+					},
+				},
+				PendingCommands: []v1alpha1.ComparisonPendingCommand{
+					{
+						CheckRunID:  9002,
+						DeliveryID:  "deliv-batch-more-32",
+						Login:       "developer",
+						RequestedBy: "developer",
+						Command:     "more 32",
+						Requested:   32,
+						ReceivedAt:  metav1.Now(),
+					},
+				},
+			},
+		}
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(comp, candSeedRun, baseSeedRun).
+			WithStatusSubresource(comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:              cl,
+			Scheme:              scheme,
+			ArtifactSink:        sink,
+			ControllerNamespace: "eval-runner",
+			CommandUsers:        []string{"developer"},
+			Now:                 func() time.Time { return nowTime },
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-button-batch"}}
+
+		// Reconcile processes the pending command from button press, bumping ExtraSamples to 32,
+		// and schedules a new batch Run (batch 2).
+		_, err = reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var latest v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &latest); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+
+		if latest.Spec.ExtraSamples != 32 {
+			t.Errorf("expected Spec.ExtraSamples 32, got %d", latest.Spec.ExtraSamples)
+		}
+		if len(latest.Status.HandledCommands) != 1 || latest.Status.HandledCommands[0].Outcome != "applied" {
+			t.Errorf("expected handledCommand applied, got %+v", latest.Status.HandledCommands)
+		}
+
+		// Verify batch 2 runs were created
+		var runs v1alpha1.RunList
+		if err := cl.List(t.Context(), &runs); err != nil {
+			t.Fatalf("failed to list runs: %v", err)
+		}
+		foundBatch2 := false
+		for _, r := range runs.Items {
+			if r.Labels[LabelBatch] == "2" {
+				foundBatch2 = true
+				break
+			}
+		}
+		if !foundBatch2 {
+			t.Errorf("expected a new batch 2 Run to be created from button press pending command, found runs: %+v", runs.Items)
+		}
+	})
+
+	t.Run("check run action button press rerun baseline recreates baseline run", func(t *testing.T) {
+		baseSeedRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-run-orig", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:        v1alpha1.RepoSpec{URL: "https://github.com/gke-labs/eval-runner.git", Commit: "base-sha"},
+				Model:       "mockllm/model",
+				SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+			},
+		}
+		candSeedRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-run-orig", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:        v1alpha1.RepoSpec{URL: "https://github.com/gke-labs/eval-runner.git", Commit: "cand-sha"},
+				Model:       "mockllm/model",
+				SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+			},
+		}
+
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{Name: "comp-rerun-base", Namespace: "eval-runner"},
+			Spec: v1alpha1.ComparisonSpec{
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run-orig"},
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run-orig"},
+				PullRequest: &v1alpha1.PullRequestSpec{
+					Repository: "gke-labs/eval-runner",
+					Number:     433,
+				},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+				Reporting: &v1alpha1.ComparisonReportingStatus{
+					CheckRunID:     101,
+					LastPostedHash: "old-hash",
+				},
+				PendingCommands: []v1alpha1.ComparisonPendingCommand{
+					{
+						CheckRunID:  101,
+						DeliveryID:  "deliv-rerun-b",
+						Login:       "developer",
+						RequestedBy: "developer",
+						Command:     "rerun baseline",
+						ReceivedAt:  metav1.Now(),
+					},
+				},
+			},
+		}
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(comp, baseSeedRun, candSeedRun).
+			WithStatusSubresource(comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:              cl,
+			Scheme:              scheme,
+			ControllerNamespace: "eval-runner",
+			CommandUsers:        []string{"developer"},
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-rerun-base"}}
+		_, _ = reconciler.Reconcile(t.Context(), req)
+
+		var latest v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &latest); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+
+		if latest.Spec.Baseline.Run == "base-run-orig" || !strings.HasPrefix(latest.Spec.Baseline.Run, "base-run-orig-rerun-") {
+			t.Errorf("expected Baseline.Run repointed to fresh rerun name, got %q", latest.Spec.Baseline.Run)
+		}
+		if latest.Status.Phase != v1alpha1.ComparisonPhaseRunning {
+			t.Errorf("expected comparison Phase Running, got %q", latest.Status.Phase)
+		}
+		if len(latest.Status.HandledCommands) != 1 || latest.Status.HandledCommands[0].Outcome != "applied" {
+			t.Fatalf("expected handled command applied, got %+v", latest.Status.HandledCommands)
+		}
+		if latest.Status.Reporting.LastPostedHash != "" {
+			t.Errorf("expected LastPostedHash cleared so reporter updates check run, got %q", latest.Status.Reporting.LastPostedHash)
+		}
+
+		// Verify fresh Run was created in cluster with matching Spec
+		var freshRun v1alpha1.Run
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: latest.Spec.Baseline.Run}, &freshRun); err != nil {
+			t.Fatalf("expected fresh baseline Run %q created: %v", latest.Spec.Baseline.Run, err)
+		}
+		if freshRun.Spec.Repo.Commit != "base-sha" || freshRun.Spec.Model != "mockllm/model" {
+			t.Errorf("fresh run spec mismatch: %+v", freshRun.Spec)
+		}
+	})
+
+	t.Run("check run action button press rerun candidate recreates candidate run", func(t *testing.T) {
+		candSeedRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "cand-run-failed", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:        v1alpha1.RepoSpec{URL: "https://github.com/gke-labs/eval-runner.git", Commit: "cand-sha"},
+				Model:       "mockllm/model",
+				SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseFailed,
+			},
+		}
+		baseSeedRun := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "base-run-done", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo:        v1alpha1.RepoSpec{URL: "https://github.com/gke-labs/eval-runner.git", Commit: "base-sha"},
+				Model:       "mockllm/model",
+				SampleRange: &v1alpha1.SampleRange{Start: 1, End: 8},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseCompleted,
+			},
+		}
+
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{Name: "comp-rerun-cand", Namespace: "eval-runner"},
+			Spec: v1alpha1.ComparisonSpec{
+				Candidate: v1alpha1.ComparisonRunRef{Run: "cand-run-failed"},
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run-done"},
+				PullRequest: &v1alpha1.PullRequestSpec{
+					Repository: "gke-labs/eval-runner",
+					Number:     433,
+				},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				Phase:   v1alpha1.ComparisonPhaseCompleted,
+				Verdict: v1alpha1.ComparisonVerdictInconclusive,
+				Reporting: &v1alpha1.ComparisonReportingStatus{
+					CheckRunID:     102,
+					LastPostedHash: "old-cand-hash",
+				},
+				PendingCommands: []v1alpha1.ComparisonPendingCommand{
+					{
+						CheckRunID:  102,
+						DeliveryID:  "deliv-rerun-c",
+						Login:       "developer",
+						RequestedBy: "developer",
+						Command:     "rerun candidate",
+						ReceivedAt:  metav1.Now(),
+					},
+				},
+			},
+		}
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(comp, candSeedRun, baseSeedRun).
+			WithStatusSubresource(comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:              cl,
+			Scheme:              scheme,
+			ControllerNamespace: "eval-runner",
+			CommandUsers:        []string{"developer"},
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-rerun-cand"}}
+		_, _ = reconciler.Reconcile(t.Context(), req)
+
+		var latest v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &latest); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+
+		if latest.Spec.Candidate.Run == "cand-run-failed" || !strings.HasPrefix(latest.Spec.Candidate.Run, "cand-run-failed-rerun-") {
+			t.Errorf("expected Candidate.Run repointed to fresh rerun name, got %q", latest.Spec.Candidate.Run)
+		}
+		if latest.Status.Phase != v1alpha1.ComparisonPhaseRunning {
+			t.Errorf("expected comparison Phase Running, got %q", latest.Status.Phase)
+		}
+		if len(latest.Status.HandledCommands) != 1 || latest.Status.HandledCommands[0].Outcome != "applied" {
+			t.Fatalf("expected handled command applied, got %+v", latest.Status.HandledCommands)
+		}
+		if latest.Status.Reporting.LastPostedHash != "" {
+			t.Errorf("expected LastPostedHash cleared, got %q", latest.Status.Reporting.LastPostedHash)
+		}
+
+		var freshRun v1alpha1.Run
+		if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "eval-runner", Name: latest.Spec.Candidate.Run}, &freshRun); err != nil {
+			t.Fatalf("expected fresh candidate Run %q created: %v", latest.Spec.Candidate.Run, err)
+		}
+		if freshRun.Spec.Repo.Commit != "cand-sha" {
+			t.Errorf("fresh run commit mismatch: %q", freshRun.Spec.Repo.Commit)
+		}
+	})
+
+	t.Run("check run action button press rerun when run not found marks error", func(t *testing.T) {
+		comp := &v1alpha1.Comparison{
+			ObjectMeta: metav1.ObjectMeta{Name: "comp-rerun-missing", Namespace: "eval-runner"},
+			Spec: v1alpha1.ComparisonSpec{
+				Candidate: v1alpha1.ComparisonRunRef{Run: "missing-run"},
+				Baseline:  v1alpha1.ComparisonRunRef{Run: "base-run"},
+				PullRequest: &v1alpha1.PullRequestSpec{
+					Repository: "gke-labs/eval-runner",
+					Number:     433,
+				},
+			},
+			Status: v1alpha1.ComparisonStatus{
+				PendingCommands: []v1alpha1.ComparisonPendingCommand{
+					{
+						CheckRunID:  103,
+						DeliveryID:  "deliv-rerun-m",
+						Login:       "developer",
+						RequestedBy: "developer",
+						Command:     "rerun candidate",
+						ReceivedAt:  metav1.Now(),
+					},
+				},
+			},
+		}
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(comp).
+			WithStatusSubresource(comp).
+			Build()
+
+		reconciler := &ComparisonReconciler{
+			Client:              cl,
+			Scheme:              scheme,
+			ControllerNamespace: "eval-runner",
+			CommandUsers:        []string{"developer"},
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "comp-rerun-missing"}}
+		_, _ = reconciler.Reconcile(t.Context(), req)
+
+		var latest v1alpha1.Comparison
+		if err := cl.Get(t.Context(), req.NamespacedName, &latest); err != nil {
+			t.Fatalf("failed to get comparison: %v", err)
+		}
+
+		if len(latest.Status.HandledCommands) != 1 {
+			t.Fatalf("expected 1 handled command, got %d", len(latest.Status.HandledCommands))
+		}
+		h := latest.Status.HandledCommands[0]
+		if !strings.HasPrefix(h.Outcome, "error: candidate run \"missing-run\" not found") {
+			t.Errorf("expected outcome error mentioning missing run, got %q", h.Outcome)
+		}
+	})
 }
 
 func TestAdaptivePairedSampling_BaselineReuse_AddOwnerReferenceErrorRequeues(t *testing.T) {

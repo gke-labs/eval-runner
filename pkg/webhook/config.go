@@ -25,6 +25,7 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/discovery"
 	"github.com/gke-labs/eval-runner/pkg/forge"
 	"github.com/gke-labs/eval-runner/pkg/forge/consumer"
+	"github.com/gke-labs/eval-runner/pkg/github"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -123,6 +124,12 @@ type Config struct {
 
 	// Consumer optionally provides an explicit Consumer.
 	Consumer *consumer.Consumer
+
+	// GitHubAppSecret optionally specifies the Secret name containing GitHub App credentials.
+	GitHubAppSecret string
+
+	// GitHubClient optionally provides a direct GitHub client for tests and API calls.
+	GitHubClient github.Client
 }
 
 // RawWebhookFlags captures explicit flags passed on the command line.
@@ -131,6 +138,7 @@ type RawWebhookFlags struct {
 	ConfigMapName            string
 	ListenAddr               string
 	GitHubWebhookSecret      string
+	GitHubAppSecret          string
 	DefaultModel             string
 	DefaultCohort            string
 	DefaultLimit             *int
@@ -218,6 +226,12 @@ func ResolveWebhookConfig(cm *corev1.ConfigMap, flags RawWebhookFlags, cl client
 			trimmed := strings.TrimSpace(val)
 			if trimmed != "" {
 				cfg.GitHubWebhookSecret = trimmed
+			}
+		}
+		if val, ok := cm.Data[configkeys.ConfigMapKeyGitHubAppSecret]; ok {
+			trimmed := strings.TrimSpace(val)
+			if trimmed != "" {
+				cfg.GitHubAppSecret = trimmed
 			}
 		}
 		if val, ok := cm.Data[ConfigMapKeyDefaultModel]; ok {
@@ -338,6 +352,12 @@ func ResolveWebhookConfig(cm *corev1.ConfigMap, flags RawWebhookFlags, cl client
 		} else {
 			cfg.DefaultBudgetUSD = nil
 		}
+	}
+	if flags.IsExplicit("github-app-secret") && flags.GitHubAppSecret != "" {
+		cfg.GitHubAppSecret = flags.GitHubAppSecret
+	}
+	if cfg.GitHubAppSecret == "" {
+		cfg.GitHubAppSecret = "github-app"
 	}
 	if flags.IsExplicit("webhook-repositories") {
 		cfg.WebhookRepositories = ParseRepositoryList(flags.WebhookRepositories)

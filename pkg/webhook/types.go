@@ -65,6 +65,9 @@ const (
 	// EventIssueComment is the GitHub event name for issue comments.
 	EventIssueComment = "issue_comment"
 
+	// EventCheckRun is the GitHub event name for check run events.
+	EventCheckRun = "check_run"
+
 	// EventPing is the GitHub event name for webhook ping.
 	EventPing = "ping"
 
@@ -82,6 +85,9 @@ const (
 
 	// ActionCreated is the issue_comment action when a comment is created.
 	ActionCreated = "created"
+
+	// ActionRequestedAction is the check_run action when an action button is clicked.
+	ActionRequestedAction = "requested_action"
 )
 
 var (
@@ -197,6 +203,33 @@ func ParseEvalMoreCommand(body string, maxSamplesPerTask int) (int, bool) {
 		n = maxSamplesPerTask
 	}
 	return n, true
+}
+
+// GitHubCheckRunEvent represents the payload of a GitHub check_run webhook event.
+type GitHubCheckRunEvent struct {
+	Action          string                 `json:"action"`
+	CheckRun        GitHubCheckRunData     `json:"check_run"`
+	RequestedAction *GitHubRequestedAction `json:"requested_action,omitempty"`
+	Repository      GitHubRepository       `json:"repository"`
+	Sender          struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"sender"`
+}
+
+// GitHubCheckRunData represents check run details in GitHub webhook payloads.
+type GitHubCheckRunData struct {
+	ID         int64  `json:"id"`
+	HeadSHA    string `json:"head_sha"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	Name       string `json:"name"`
+	DetailsURL string `json:"details_url"`
+}
+
+// GitHubRequestedAction represents the requested action in check_run events.
+type GitHubRequestedAction struct {
+	Identifier string `json:"identifier"`
 }
 
 // PullRequestWorkItem contains pre-validated fields for PR reconciliation in the worker.

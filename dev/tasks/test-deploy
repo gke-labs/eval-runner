@@ -135,6 +135,7 @@ VALID_DRY_RUN="deploy-eval-runner
     kubectl-apply-00-namespaces.yaml
     kubectl-apply-evalrunner.gke-labs.dev_comparisons.yaml
     kubectl-apply-evalrunner.gke-labs.dev_runs.yaml
+    kubectl-apply-httproute.yaml
     kubectl-apply-rbac.yaml
     kubectl-apply-runner-deployment.yaml
     kubectl-apply-sandbox-networkpolicy.yaml
@@ -399,6 +400,15 @@ if echo "${TAG_ISOLATION_OUT}" | grep -q "env IMAGE_TAG=${SANDBOXD_TAG} .*sandbo
   echo "PASS: deploy-to-kube passes IMAGE_TAG=\${SANDBOXD_TAG} to sandboxd-image when IMAGE_TAG is set in caller environment."
 else
   echo "FAIL: deploy-to-kube did not isolate IMAGE_TAG for sandboxd-image. Got: ${TAG_ISOLATION_OUT}" >&2
+  exit 1
+fi
+
+# Test 8I: --gateway-name and --gateway-namespace
+GW_RUN="$(IMAGE_PREFIX="gcr.io/test-project" "${REPO_ROOT}/dev/tasks/deploy-to-kube" --dry-run --gateway-name=my-gw --gateway-namespace=my-ns)"
+if echo "${GW_RUN}" | grep -q "Apply parameterized HTTPRoute (my-ns/my-gw)"; then
+  echo "PASS: deploy-to-kube respects --gateway-name and --gateway-namespace."
+else
+  echo "FAIL: deploy-to-kube did not respect --gateway-name/--gateway-namespace. Got: ${GW_RUN}" >&2
   exit 1
 fi
 

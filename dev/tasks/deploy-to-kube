@@ -29,6 +29,8 @@ export GOTOOLCHAIN=auto
 source "${REPO_ROOT}/dev/tasks/versions.sh"
 
 IMAGE_PREFIX="${IMAGE_PREFIX:-}"
+GATEWAY_NAME="${GATEWAY_NAME:-hello-gw}"
+GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-default}"
 DRY_RUN=false
 SKIP_SANDBOXD_BUILD=false
 SKIP_DEPLOY=false
@@ -45,6 +47,8 @@ to whatever kubeconfig/context is currently active.
 Options:
   --image-prefix PREFIX      Container image registry prefix (e.g. gcr.io/my-project).
                              Required unless context is kind-* (defaults to images.local).
+  --gateway-name NAME        Gateway parentRef name for HTTPRoute (defaults to hello-gw).
+  --gateway-namespace NS     Gateway namespace for HTTPRoute (defaults to default).
   --set KEY=VALUE            Extra eval-runner-config ConfigMap entries (repeatable),
                              e.g. --set artifactBucket=my-bucket --set defaultModel=gemini-2.5-flash
   --skip-sandboxd-build      Skip building and pushing sandboxd; reuse an existing image.
@@ -63,6 +67,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --image-prefix=*)
       IMAGE_PREFIX="${1#*=}"
+      shift
+      ;;
+    --gateway-name)
+      GATEWAY_NAME="$2"
+      shift 2
+      ;;
+    --gateway-name=*)
+      GATEWAY_NAME="${1#*=}"
+      shift
+      ;;
+    --gateway-namespace)
+      GATEWAY_NAMESPACE="$2"
+      shift 2
+      ;;
+    --gateway-namespace=*)
+      GATEWAY_NAMESPACE="${1#*=}"
       shift
       ;;
     --set)
@@ -377,6 +397,63 @@ else
       SINCE_ARG="${STARTED_TIME}"
     fi
     wait_for_effective_settings "${ARTIFACT_BUCKET}" "${SINCE_ARG}"
+  fi
+
+  if [[ "${GATEWAY_NAME}" != "hello-gw" || "${GATEWAY_NAMESPACE}" != "default" ]]; then
+    step "Apply parameterized HTTPRoute (${GATEWAY_NAMESPACE}/${GATEWAY_NAME})"
+    CUSTOM_ROUTE="apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hello
+  namespace: ${GATEWAY_NAMESPACE}
+  labels:
+    app: eval-runner
+spec:
+  parentRefs:
+  - name: ${GATEWAY_NAME}
+    sectionName: https
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /webhook
+    backendRefs:
+    - name: eval-runner-webhook
+      namespace: eval-runner
+      port: 80
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: eval-runner-ui
+      namespace: eval-runner
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-default-httproutes
+  namespace: eval-runner
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: ${GATEWAY_NAMESPACE}
+  to:
+  - group: \"\"
+    kind: Service
+    name: eval-runner-ui
+  - group: \"\"
+    kind: Service
+    name: eval-runner-webhook"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+      echo "kubectl apply -f - << 'EOF'"
+      echo "${CUSTOM_ROUTE}"
+      echo "EOF"
+    else
+      echo "${CUSTOM_ROUTE}" | kubectl apply -f -
+    fi
   fi
 fi
 

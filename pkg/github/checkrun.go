@@ -42,6 +42,65 @@ type CheckRunImage = forge.CheckRunImage
 // CheckRunAnnotation represents a file annotation on a check run.
 type CheckRunAnnotation = forge.CheckRunAnnotation
 
+// CheckRunAction represents an interactive action button on a check run.
+type CheckRunAction = forge.CheckRunAction
+
+// CheckRun action identifiers.
+const (
+	ActionIdentifierMore32    = "more-32"
+	ActionIdentifierRerunBase = "rerun-base"
+	ActionIdentifierRerunCand = "rerun-cand"
+)
+
+var (
+	// ActionMore32 requests 32 more evaluation samples.
+	ActionMore32 = CheckRunAction{
+		Label:       "Run 32 more samples",
+		Description: "Run 32 more evaluation samples",
+		Identifier:  ActionIdentifierMore32,
+	}
+	// ActionRerunBase re-runs the baseline evaluation run.
+	ActionRerunBase = CheckRunAction{
+		Label:       "Re-run baseline",
+		Description: "Re-run baseline evaluation run",
+		Identifier:  ActionIdentifierRerunBase,
+	}
+	// ActionRerunCand re-runs the candidate evaluation run.
+	ActionRerunCand = CheckRunAction{
+		Label:       "Re-run candidate",
+		Description: "Re-run candidate evaluation run",
+		Identifier:  ActionIdentifierRerunCand,
+	}
+)
+
+// MaxCheckRunActions is the maximum number of actions supported by GitHub on a check run.
+const MaxCheckRunActions = 3
+
+// SanitizeCheckRunActions enforces GitHub check-run action limits:
+// maximum 3 actions, label <= 20 characters, description <= 40 characters, identifier <= 20 characters.
+func SanitizeCheckRunActions(actions []CheckRunAction) []CheckRunAction {
+	if len(actions) == 0 {
+		return nil
+	}
+	if len(actions) > MaxCheckRunActions {
+		actions = actions[:MaxCheckRunActions]
+	}
+	sanitized := make([]CheckRunAction, 0, len(actions))
+	for _, a := range actions {
+		if len(a.Label) > 20 {
+			a.Label = a.Label[:20]
+		}
+		if len(a.Description) > 40 {
+			a.Description = a.Description[:40]
+		}
+		if len(a.Identifier) > 20 {
+			a.Identifier = a.Identifier[:20]
+		}
+		sanitized = append(sanitized, a)
+	}
+	return sanitized
+}
+
 // TaskSampleFailure records a failing sample for an evaluation task.
 type TaskSampleFailure struct {
 	SampleID string
@@ -59,6 +118,7 @@ type CheckRunState struct {
 	DetailsURL  string // URL of the details page
 	Images      []CheckRunImage
 	Annotations []CheckRunAnnotation
+	Actions     []CheckRunAction
 }
 
 // CheckRunOption configures CheckRunStateForComparison.
@@ -464,6 +524,7 @@ func CheckRunStateForComparison(comp *v1alpha1.Comparison, baseRun, candRun *v1a
 		}
 		state.Title = headline
 		state.Summary = headline
+		state.Actions = []CheckRunAction{ActionRerunCand, ActionRerunBase}
 		return state
 	}
 
@@ -589,6 +650,31 @@ func CheckRunStateForComparison(comp *v1alpha1.Comparison, baseRun, candRun *v1a
 		}
 	}
 
+	candFailed := (candRun != nil && candRun.Status.Phase == v1alpha1.RunPhaseFailed) || (comp != nil && strings.Contains(comp.Status.Message, "candidate task failed"))
+	baseFailed := (baseRun != nil && baseRun.Status.Phase == v1alpha1.RunPhaseFailed) || (comp != nil && strings.Contains(comp.Status.Message, "baseline task failed"))
+
+	if candFailed || baseFailed {
+		var actions []CheckRunAction
+		if candFailed {
+			actions = append(actions, ActionRerunCand)
+		}
+		if baseFailed {
+			actions = append(actions, ActionRerunBase)
+		}
+		if len(actions) == 0 {
+			actions = []CheckRunAction{ActionRerunCand, ActionRerunBase}
+		}
+		state.Actions = actions
+	} else {
+		switch comp.Status.Verdict {
+		case v1alpha1.ComparisonVerdictInconclusive:
+			state.Actions = []CheckRunAction{ActionMore32, ActionRerunBase}
+		case v1alpha1.ComparisonVerdictImproved, v1alpha1.ComparisonVerdictRegressed, v1alpha1.ComparisonVerdictUnchanged:
+			state.Actions = []CheckRunAction{ActionMore32}
+		}
+	}
+
+	state.Actions = SanitizeCheckRunActions(state.Actions)
 	state.DetailsURL = CheckRunDetailsURL(comp, uiBaseURL, baseRun, candRun)
 
 	return state

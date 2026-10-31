@@ -56,6 +56,7 @@ func main() {
 	var namespace string
 	var configMapName string
 	var webhookSecretName string
+	var githubAppSecret string
 	var defaultModel string
 	var defaultCohort string
 	var defaultLimit int
@@ -72,6 +73,7 @@ func main() {
 	flag.StringVar(&namespace, "namespace", defaultNs, "Kubernetes namespace to manage Runs and Comparisons in")
 	flag.StringVar(&configMapName, "configmap-name", webhook.DefaultConfigMapName, "Name of ConfigMap containing cluster settings")
 	flag.StringVar(&webhookSecretName, "github-webhook-secret", webhook.DefaultGitHubWebhookSecret, "Name of Secret containing GitHub webhook secret")
+	flag.StringVar(&githubAppSecret, "github-app-secret", "github-app", "Name of Secret containing GitHub App credentials")
 	flag.StringVar(&defaultModel, "default-model", "", "Default model identifier for created Runs (e.g. mockllm/model)")
 	flag.StringVar(&defaultCohort, "default-cohort", "", "Default cohort identifier for created Runs")
 	flag.IntVar(&defaultLimit, "default-limit", 0, "Default sample limit for created Runs (0 = unlimited)")
@@ -119,6 +121,7 @@ func main() {
 		ConfigMapName:            configMapName,
 		ListenAddr:               listenAddr,
 		GitHubWebhookSecret:      webhookSecretName,
+		GitHubAppSecret:          githubAppSecret,
 		DefaultModel:             defaultModel,
 		DefaultCohort:            defaultCohort,
 		DefaultLimit:             limitPtr,

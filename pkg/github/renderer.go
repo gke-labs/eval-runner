@@ -418,6 +418,67 @@ func BuildComparisonFooter(comp *v1alpha1.Comparison, baseRun, candRun *v1alpha1
 		footerBuilder.WriteString(strings.Join(lines, "\n"))
 		footerBuilder.WriteString("\n")
 	}
+
+	// Audit requested samples (e.g. "+32 samples requested by @user" or "+32 samples requested by @user (x2)")
+	type sampleAuditEntry struct {
+		user    string
+		samples int
+		count   int
+	}
+	var auditList []sampleAuditEntry
+	auditIndex := make(map[string]int)
+
+	recordAudit := func(user string, samples int) {
+		if user == "" || samples <= 0 {
+			return
+		}
+		key := fmt.Sprintf("%s:%d", user, samples)
+		if idx, ok := auditIndex[key]; ok {
+			auditList[idx].count++
+		} else {
+			auditIndex[key] = len(auditList)
+			auditList = append(auditList, sampleAuditEntry{
+				user:    user,
+				samples: samples,
+				count:   1,
+			})
+		}
+	}
+
+	if comp != nil {
+		for _, cmd := range comp.Status.HandledCommands {
+			if cmd.Outcome == "applied" && cmd.Requested > 0 {
+				user := cmd.RequestedBy
+				if user == "" {
+					user = cmd.Login
+				}
+				recordAudit(user, cmd.Requested)
+			}
+		}
+		for _, cmd := range comp.Status.PendingCommands {
+			if cmd.Requested > 0 {
+				user := cmd.RequestedBy
+				if user == "" {
+					user = cmd.Login
+				}
+				recordAudit(user, cmd.Requested)
+			}
+		}
+	}
+
+	var requestedAudits []string
+	for _, entry := range auditList {
+		if entry.count > 1 {
+			requestedAudits = append(requestedAudits, fmt.Sprintf("+%d samples requested by @%s (x%d)", entry.samples, entry.user, entry.count))
+		} else {
+			requestedAudits = append(requestedAudits, fmt.Sprintf("+%d samples requested by @%s", entry.samples, entry.user))
+		}
+	}
+	if len(requestedAudits) > 0 {
+		footerBuilder.WriteString("\n")
+		footerBuilder.WriteString(strings.Join(requestedAudits, "\n"))
+		footerBuilder.WriteString("\n")
+	}
 	return footerBuilder.String()
 }
 

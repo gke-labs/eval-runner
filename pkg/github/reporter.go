@@ -58,7 +58,7 @@ func NewReporter(client Client, opts ReporterOptions) *Reporter {
 }
 
 // HashContent computes an idempotency SHA-256 hash across markdown content and check run state.
-func HashContent(markdown string, state CheckRunState) string {
+func HashContent(markdown string, state CheckRunState, extraHash ...string) string {
 	h := sha256.New()
 	h.Write([]byte(markdown))
 	h.Write([]byte{0})
@@ -97,6 +97,18 @@ func HashContent(markdown string, state CheckRunState) string {
 		h.Write([]byte{0})
 		h.Write([]byte(ann.RawDetails))
 	}
+	for _, act := range state.Actions {
+		h.Write([]byte{0})
+		h.Write([]byte(act.Label))
+		h.Write([]byte{0})
+		h.Write([]byte(act.Description))
+		h.Write([]byte{0})
+		h.Write([]byte(act.Identifier))
+	}
+	for _, eh := range extraHash {
+		h.Write([]byte{0})
+		h.Write([]byte(eh))
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -121,9 +133,20 @@ func (r *Reporter) Report(ctx context.Context, comp *v1alpha1.Comparison, baseRu
 		crOpts = append(crOpts, WithAnnotations(r.Annotations))
 	}
 
+	var extraHashes []string
+	for _, cmd := range comp.Status.HandledCommands {
+		if cmd.CheckRunID != 0 {
+			tStr := ""
+			if cmd.HandledAt != nil {
+				tStr = cmd.HandledAt.String()
+			}
+			extraHashes = append(extraHashes, fmt.Sprintf("cr-cmd:%d:%s:%s", cmd.CheckRunID, cmd.Command, tStr))
+		}
+	}
+
 	markdown := RenderComparisonMarkdown(comp, baseRun, candRun, r.UIBaseURL)
 	checkState := CheckRunStateForComparison(comp, baseRun, candRun, r.InconclusivePolicy, r.UIBaseURL, crOpts...)
-	hash := HashContent(markdown, checkState)
+	hash := HashContent(markdown, checkState, extraHashes...)
 
 	commentID := int64(0)
 	checkRunID := int64(0)
