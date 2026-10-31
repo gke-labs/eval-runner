@@ -224,6 +224,18 @@ func (s *ReloadableSink) ArtifactPrefix(commit string) string {
 	return ""
 }
 
+// TaskArtifactPath implements TaskArtifactPather for ReloadableSink.
+func (s *ReloadableSink) TaskArtifactPath(commit, taskID, filename string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.currentTracked != nil && s.currentTracked.sink != nil {
+		if pather, ok := s.currentTracked.sink.(TaskArtifactPather); ok {
+			return pather.TaskArtifactPath(commit, taskID, filename)
+		}
+	}
+	return ""
+}
+
 // IsDurable reports whether the current active sink provides durable persistent storage.
 func (s *ReloadableSink) IsDurable() bool {
 	s.mu.RLock()

@@ -203,12 +203,26 @@ func (s *LocalDirSink) Load(ctx context.Context, path string) ([]byte, error) {
 	return data, nil
 }
 
+// TaskArtifactPather is an optional interface implemented by sinks that provide custom path derivation for task artifacts.
+type TaskArtifactPather interface {
+	TaskArtifactPath(commit, taskID, filename string) string
+}
+
 // ArtifactPrefix implements ArtifactSink for LocalDirSink.
 func (s *LocalDirSink) ArtifactPrefix(commit string) string {
 	if s.BaseDir == "" || strings.TrimSpace(commit) == "" {
 		return ""
 	}
 	return filepath.Join(s.BaseDir, "runs", commit) + "/"
+}
+
+// TaskArtifactPath derives the storage path for a task artifact in LocalDirSink, respecting URL query escaping on taskID.
+func (s *LocalDirSink) TaskArtifactPath(commit, taskID, filename string) string {
+	if strings.TrimSpace(s.BaseDir) == "" || strings.TrimSpace(commit) == "" {
+		return ""
+	}
+	escapedTaskID := url.QueryEscape(taskID)
+	return filepath.Join(s.BaseDir, "runs", commit, escapedTaskID, filename)
 }
 
 // Close implements ArtifactSink for LocalDirSink.
@@ -263,6 +277,7 @@ func (s *LocalDirSink) StoreArtifact(ctx context.Context, meta RunMetadata, file
 		TaskID:            meta.TaskID,
 		Model:             meta.Model,
 		Commit:            meta.Commit,
+		LogFilename:       filename,
 		RunName:           meta.RunName,
 		RunNamespace:      meta.RunNamespace,
 		ControllerVersion: meta.ControllerVersion,

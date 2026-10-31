@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -2382,7 +2383,9 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 	var readyTasks []readyTaskItem
 	terminalFailures := make(map[string]string)
 	type rescuedTaskInfo struct {
-		agg *artifacts.TaskAggregates
+		agg     *artifacts.TaskAggregates
+		summary *artifacts.TaskSummary
+		logPath string
 	}
 	rescuedTasks := make(map[string]rescuedTaskInfo)
 	waitingInGracePeriod := false
@@ -2454,6 +2457,8 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 			reqWindow := taskRequestedWindowSize(run.Spec, t)
 			rescued := false
 			var rescuedAgg *artifacts.TaskAggregates
+			var rescuedSummary *artifacts.TaskSummary
+			var rescuedLogPath string
 
 			if t.Samples > 0 && (reqWindow <= 0 || t.Samples >= reqWindow) {
 				rescued = true
@@ -2466,18 +2471,53 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 						if reqWindow <= 0 || agg.Samples >= reqWindow || (t.PossibleSamples > 0 && agg.Samples >= t.PossibleSamples) {
 							rescued = true
 							rescuedAgg = agg
+							rescuedLogPath = t.LogPath
 						}
+					}
+				}
+			} else if run.Spec.Repo.Commit != "" {
+				summaryPath := artifacts.ArtifactTarget(r.artifactSink(), run.Spec.Repo.Commit, t.ID, "summary.json")
+				loadCtx, loadCancel := r.stepContext(ctx, run.Status.ExecutionDeadline, r.artifactSinkTimeout())
+				data, loadErr := artifacts.LoadWithTimeout(loadCtx, r.artifactSink(), summaryPath)
+				loadCancel()
+				if loadErr != nil {
+					if !artifacts.IsNotFound(loadErr) {
+						logger.V(1).Info("probed artifact sink for restart rescue", "task", t.ID, "path", summaryPath, "outcome", "error", "error", loadErr)
+						return ctrl.Result{}, fmt.Errorf("probe artifact sink for task %s summary: %w", t.ID, loadErr)
+					}
+					logger.V(1).Info("probed artifact sink for restart rescue", "task", t.ID, "path", summaryPath, "outcome", "not_found")
+				} else if len(data) > 0 {
+					var sum artifacts.TaskSummary
+					if parseErr := json.Unmarshal(data, &sum); parseErr != nil {
+						logger.V(1).Info("probed artifact sink for restart rescue", "task", t.ID, "path", summaryPath, "outcome", "unparseable", "error", parseErr)
+					} else if reqWindow <= 0 || sum.SampleCount >= reqWindow || (sum.PossibleSamples > 0 && sum.SampleCount >= sum.PossibleSamples) {
+						if sum.SampleCount > 0 {
+							logger.V(1).Info("probed artifact sink for restart rescue", "task", t.ID, "path", summaryPath, "outcome", "complete", "samples", sum.SampleCount)
+							rescued = true
+							rescuedSummary = &sum
+							if sum.LogFilename != "" {
+								rescuedLogPath = artifacts.ArtifactTarget(r.artifactSink(), run.Spec.Repo.Commit, t.ID, sum.LogFilename)
+							}
+						} else {
+							logger.V(1).Info("probed artifact sink for restart rescue", "task", t.ID, "path", summaryPath, "outcome", "empty", "samples", 0)
+						}
+					} else {
+						logger.V(1).Info("probed artifact sink for restart rescue", "task", t.ID, "path", summaryPath, "outcome", "partial", "samples", sum.SampleCount, "requested", reqWindow)
 					}
 				}
 			}
 
 			if rescued {
 				sampleCount := t.Samples
-				if sampleCount == 0 && rescuedAgg != nil {
-					sampleCount = rescuedAgg.Samples
+				if sampleCount == 0 {
+					if rescuedSummary != nil {
+						sampleCount = rescuedSummary.SampleCount
+					} else if rescuedAgg != nil {
+						sampleCount = rescuedAgg.Samples
+					}
 				}
 				logger.Info("restart rescue", "task", t.ID, "run", run.Name, "samples", sampleCount)
-				rescuedTasks[t.ID] = rescuedTaskInfo{agg: rescuedAgg}
+				rescuedTasks[t.ID] = rescuedTaskInfo{agg: rescuedAgg, summary: rescuedSummary, logPath: rescuedLogPath}
 				continue
 			}
 
@@ -2537,35 +2577,34 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 					} else if !strings.Contains(status.Tasks[i].Message, "restart rescue") {
 						status.Tasks[i].Message = status.Tasks[i].Message + " (restart rescue)"
 					}
-					if info.agg != nil {
+					if status.Tasks[i].LogPath == "" && info.logPath != "" {
+						status.Tasks[i].LogPath = info.logPath
+					}
+					if info.summary != nil {
+						status.Tasks[i].Samples = info.summary.SampleCount
+						status.Tasks[i].Successes = info.summary.Successes
+						status.Tasks[i].MeanScore = info.summary.MeanScore
+						status.Tasks[i].SuccessRate = info.summary.SuccessRate
+						status.Tasks[i].SuccessRateCI = info.summary.SuccessRateCI
+						status.Tasks[i].SuccessRateSD = info.summary.SuccessRateSD
+						status.Tasks[i].PossibleSamples = info.summary.PossibleSamples
+						if info.summary.SampleRange != nil {
+							status.Tasks[i].SampleRange = &v1alpha1.SampleRange{
+								Start: info.summary.SampleRange.Start,
+								End:   info.summary.SampleRange.End,
+							}
+						}
+					} else if info.agg != nil {
 						if status.Tasks[i].Samples == 0 {
 							status.Tasks[i].Samples = info.agg.Samples
 							status.Tasks[i].Successes = info.agg.Successes
 							status.Tasks[i].MeanScore = info.agg.MeanScore
 						}
 						if status.Tasks[i].SuccessRate == nil && info.agg.Samples > 0 {
-							if info.agg.IsBinary() {
-								est := stats.Proportion(info.agg.Successes, info.agg.Samples, 0.95)
-								rate := est.Point
-								status.Tasks[i].SuccessRate = &rate
-								status.Tasks[i].SuccessRateCI = &v1alpha1.ConfidenceInterval{
-									Lower:      est.CI.Lower,
-									Upper:      est.CI.Upper,
-									Confidence: 0.95,
-									Method:     "wilson",
-								}
-							} else {
-								est := stats.Mean(info.agg.Scores, 0.95)
-								rate := est.Point
-								status.Tasks[i].SuccessRate = &rate
-								status.Tasks[i].SuccessRateCI = &v1alpha1.ConfidenceInterval{
-									Lower:      est.CI.Lower,
-									Upper:      est.CI.Upper,
-									Confidence: 0.95,
-									Method:     "t",
-								}
-								status.Tasks[i].SuccessRateSD = est.SD
-							}
+							rate, ci, sd := computeTaskAggregateStats(info.agg)
+							status.Tasks[i].SuccessRate = rate
+							status.Tasks[i].SuccessRateCI = ci
+							status.Tasks[i].SuccessRateSD = sd
 						}
 					}
 					if status.Tasks[i].MeanScore == nil && status.Tasks[i].Samples > 0 {
@@ -2601,10 +2640,13 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 			if msg, failed := terminalFailures[tid]; failed {
 				run.Status.Tasks[i].Phase = v1alpha1.TaskPhaseFailed
 				run.Status.Tasks[i].Message = msg
-			} else if _, ok := rescuedTasks[tid]; ok {
+			} else if info, ok := rescuedTasks[tid]; ok {
 				run.Status.Tasks[i].Phase = v1alpha1.TaskPhaseCompleted
 				if run.Status.Tasks[i].Message == "" {
 					run.Status.Tasks[i].Message = "restart rescue"
+				}
+				if run.Status.Tasks[i].LogPath == "" && info.logPath != "" {
+					run.Status.Tasks[i].LogPath = info.logPath
 				}
 			}
 		}
@@ -3182,32 +3224,7 @@ func (r *RunReconciler) executeTask(ctx context.Context, run *v1alpha1.Run, task
 		logger.V(1).Info("failed to extract task sample summaries from inspect log", "task", taskID, "error", err)
 	}
 
-	var successRate *float64
-	var successRateCI *v1alpha1.ConfidenceInterval
-	var successRateSD *float64
-
-	if agg.IsBinary() {
-		est := stats.Proportion(agg.Successes, agg.Samples, 0.95)
-		rate := est.Point
-		successRate = &rate
-		successRateCI = &v1alpha1.ConfidenceInterval{
-			Lower:      est.CI.Lower,
-			Upper:      est.CI.Upper,
-			Confidence: 0.95,
-			Method:     "wilson",
-		}
-	} else {
-		est := stats.Mean(agg.Scores, 0.95)
-		rate := est.Point
-		successRate = &rate
-		successRateCI = &v1alpha1.ConfidenceInterval{
-			Lower:      est.CI.Lower,
-			Upper:      est.CI.Upper,
-			Confidence: 0.95,
-			Method:     "t",
-		}
-		successRateSD = est.SD
-	}
+	successRate, successRateCI, successRateSD := computeTaskAggregateStats(agg)
 
 	meta := artifacts.RunMetadata{
 		RunName:           run.Name,
@@ -3683,6 +3700,31 @@ func taskRequestedWindowSize(spec v1alpha1.RunSpec, t v1alpha1.TaskStatus) int {
 		return t.PossibleSamples
 	}
 	return 0
+}
+
+// computeTaskAggregateStats computes success rate point estimate, confidence interval, and SD from task aggregates.
+func computeTaskAggregateStats(agg *artifacts.TaskAggregates) (*float64, *v1alpha1.ConfidenceInterval, *float64) {
+	if agg == nil || agg.Samples <= 0 {
+		return nil, nil, nil
+	}
+	if agg.IsBinary() {
+		est := stats.Proportion(agg.Successes, agg.Samples, 0.95)
+		rate := est.Point
+		return &rate, &v1alpha1.ConfidenceInterval{
+			Lower:      est.CI.Lower,
+			Upper:      est.CI.Upper,
+			Confidence: 0.95,
+			Method:     "wilson",
+		}, nil
+	}
+	est := stats.Mean(agg.Scores, 0.95)
+	rate := est.Point
+	return &rate, &v1alpha1.ConfidenceInterval{
+		Lower:      est.CI.Lower,
+		Upper:      est.CI.Upper,
+		Confidence: 0.95,
+		Method:     "t",
+	}, est.SD
 }
 
 // InspectEvalArgs builds the CLI arguments for inspect eval.

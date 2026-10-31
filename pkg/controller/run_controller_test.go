@@ -5393,6 +5393,507 @@ func TestReconcileRunningTask_RestartRescueFromReadableLog(t *testing.T) {
 	})
 }
 
+type transientErrorSink struct {
+	err error
+}
+
+func (s *transientErrorSink) StoreArtifact(ctx context.Context, meta artifacts.RunMetadata, filename string, data []byte) (string, error) {
+	return "", s.err
+}
+
+func (s *transientErrorSink) StoreComparison(ctx context.Context, comparisonName string, data []byte) (string, error) {
+	return "", s.err
+}
+
+func (s *transientErrorSink) StoreManifest(ctx context.Context, meta artifacts.RunMetadata, data []byte) (string, error) {
+	return "", s.err
+}
+
+func (s *transientErrorSink) Load(ctx context.Context, path string) ([]byte, error) {
+	return nil, s.err
+}
+
+func (s *transientErrorSink) ArtifactPrefix(commit string) string {
+	return "mem://runs/" + commit + "/"
+}
+
+func (s *transientErrorSink) IsDurable() bool {
+	return false
+}
+
+func (s *transientErrorSink) Close() error {
+	return nil
+}
+
+func TestReconcileRunningTask_RestartRescueFromDerivedLogPath(t *testing.T) {
+	scheme := setupScheme(t)
+
+	completeInspectLog := `{
+		"version": 2,
+		"status": "started",
+		"eval": {"task": "task-probe-rescue"},
+		"samples": [
+			{"id": "s1", "scores": {"accuracy": {"value": 1.0}}},
+			{"id": "s2", "scores": {"accuracy": {"value": 1.0}}}
+		]
+	}`
+
+	partialInspectLog := `{
+		"version": 2,
+		"status": "started",
+		"eval": {"task": "task-probe-rescue"},
+		"samples": [
+			{"id": "s1", "scores": {"accuracy": {"value": 1.0}}}
+		]
+	}`
+
+	t.Run("Running task with no Samples/LogPath and complete summary at derived path -> Completed with correct counts", func(t *testing.T) {
+		sink := artifacts.NewInMemorySink()
+		rate := 1.0
+		meta := artifacts.RunMetadata{
+			RunName:         "test-run-probe-rescue",
+			RunNamespace:    "eval-runner",
+			TaskID:          "task-probe-rescue",
+			Commit:          "c0ffee1",
+			SampleCount:     2,
+			Successes:       2,
+			MeanScore:       &rate,
+			SuccessRate:     &rate,
+			PossibleSamples: 2,
+			SampleRange:     &artifacts.SampleRange{Start: 1, End: 2},
+		}
+		logFilename := "2026-10-31T15-27-47-00-00_task-probe-rescue_ByhDsNK8zVf5BWpRqxd9Y9.json"
+		expectedLogPath, err := sink.StoreArtifact(t.Context(), meta, logFilename, []byte(completeInspectLog))
+		if err != nil {
+			t.Fatalf("Failed to store artifact: %v", err)
+		}
+
+		limit := 2
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-run-probe-rescue",
+				Namespace: "eval-runner",
+			},
+			Spec: v1alpha1.RunSpec{
+				Model: "mockllm/model",
+				Limit: &limit,
+				Repo: v1alpha1.RepoSpec{
+					Commit: "c0ffee1",
+				},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseRunning,
+				Discovery: &v1alpha1.RunDiscoveryStatus{
+					TaskCount:         1,
+					EligibleTaskCount: 1,
+					TaskIDs:           []string{"task-probe-rescue"},
+				},
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:             "task-probe-rescue",
+						Phase:          v1alpha1.TaskPhaseRunning,
+						Samples:        0,
+						SamplesPlanned: 2,
+						LogPath:        "",
+					},
+				},
+			},
+		}
+
+		manifest := &v1alpha1.Manifest{
+			Tasks: []v1alpha1.ManifestTask{
+				{ID: "task-probe-rescue", Spec: "eval.py@rescue"},
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(run).
+			WithStatusSubresource(run).
+			Build()
+
+		reconciler := &RunReconciler{
+			Client:           cl,
+			Scheme:           scheme,
+			ArtifactSink:     sink,
+			SandboxNamespace: "eval-runner-sandbox",
+		}
+		reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-probe-rescue"}}
+		res, err := reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("Reconcile error: %v", err)
+		}
+		if !res.Requeue {
+			t.Errorf("Expected Requeue after restart rescue")
+		}
+
+		var updatedRun v1alpha1.Run
+		if err := cl.Get(t.Context(), req.NamespacedName, &updatedRun); err != nil {
+			t.Fatalf("Failed to get updated run: %v", err)
+		}
+
+		task := updatedRun.Status.Tasks[0]
+		if task.Phase != v1alpha1.TaskPhaseCompleted {
+			t.Errorf("Expected task to be Completed via restart rescue, got %s (msg: %s)", task.Phase, task.Message)
+		}
+		if !strings.Contains(task.Message, "restart rescue") {
+			t.Errorf("Expected message to contain 'restart rescue', got %q", task.Message)
+		}
+		if task.Samples != 2 || task.Successes != 2 {
+			t.Errorf("Expected 2 samples and 2 successes, got samples=%d successes=%d", task.Samples, task.Successes)
+		}
+		if task.LogPath != expectedLogPath {
+			t.Errorf("Expected task LogPath to be %q, got %q", expectedLogPath, task.LogPath)
+		}
+		if task.PossibleSamples != 2 {
+			t.Errorf("Expected task PossibleSamples to be 2, got %d", task.PossibleSamples)
+		}
+		if task.SampleRange == nil || task.SampleRange.Start != 1 || task.SampleRange.End != 2 {
+			t.Errorf("Expected task SampleRange to be [1, 2], got %+v", task.SampleRange)
+		}
+	})
+
+	t.Run("LocalDirSink with hierarchical taskID rescues and unescapes path properly", func(t *testing.T) {
+		tempDir := t.TempDir()
+		localSink := &artifacts.LocalDirSink{BaseDir: tempDir}
+		rate := 1.0
+		meta := artifacts.RunMetadata{
+			RunName:         "test-run-local-rescue",
+			RunNamespace:    "eval-runner",
+			TaskID:          "docs/readme_comprehension",
+			Commit:          "c0ffee1",
+			SampleCount:     2,
+			Successes:       2,
+			MeanScore:       &rate,
+			SuccessRate:     &rate,
+			PossibleSamples: 2,
+		}
+		logFilename := "2026-10-31T15-27-47-00-00_readme-comprehension_ByhDsNK8zVf5BWpRqxd9Y9.json"
+		expectedLogPath, err := localSink.StoreArtifact(t.Context(), meta, logFilename, []byte(completeInspectLog))
+		if err != nil {
+			t.Fatalf("Failed to store artifact in LocalDirSink: %v", err)
+		}
+
+		limit := 2
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-run-local-rescue",
+				Namespace: "eval-runner",
+			},
+			Spec: v1alpha1.RunSpec{
+				Model: "mockllm/model",
+				Limit: &limit,
+				Repo: v1alpha1.RepoSpec{
+					Commit: "c0ffee1",
+				},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseRunning,
+				Discovery: &v1alpha1.RunDiscoveryStatus{
+					TaskCount:         1,
+					EligibleTaskCount: 1,
+					TaskIDs:           []string{"docs/readme_comprehension"},
+				},
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:             "docs/readme_comprehension",
+						Phase:          v1alpha1.TaskPhaseRunning,
+						Samples:        0,
+						SamplesPlanned: 2,
+						LogPath:        "",
+					},
+				},
+			},
+		}
+
+		manifest := &v1alpha1.Manifest{
+			Tasks: []v1alpha1.ManifestTask{
+				{ID: "docs/readme_comprehension", Spec: "eval.py@rescue"},
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(run).
+			WithStatusSubresource(run).
+			Build()
+
+		reconciler := &RunReconciler{
+			Client:           cl,
+			Scheme:           scheme,
+			ArtifactSink:     localSink,
+			SandboxNamespace: "eval-runner-sandbox",
+		}
+		reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-local-rescue"}}
+		res, err := reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("Reconcile error: %v", err)
+		}
+		if !res.Requeue {
+			t.Errorf("Expected Requeue after restart rescue")
+		}
+
+		var updatedRun v1alpha1.Run
+		if err := cl.Get(t.Context(), req.NamespacedName, &updatedRun); err != nil {
+			t.Fatalf("Failed to get updated run: %v", err)
+		}
+
+		task := updatedRun.Status.Tasks[0]
+		if task.Phase != v1alpha1.TaskPhaseCompleted {
+			t.Errorf("Expected task to be Completed via restart rescue, got %s (msg: %s)", task.Phase, task.Message)
+		}
+		if task.LogPath != expectedLogPath {
+			t.Errorf("Expected task LogPath to be %q, got %q", expectedLogPath, task.LogPath)
+		}
+	})
+
+	t.Run("Running task with no Samples/LogPath and missing summary -> Failed as before", func(t *testing.T) {
+		sink := artifacts.NewInMemorySink()
+		limit := 2
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-run-probe-missing",
+				Namespace: "eval-runner",
+			},
+			Spec: v1alpha1.RunSpec{
+				Model: "mockllm/model",
+				Limit: &limit,
+				Repo: v1alpha1.RepoSpec{
+					Commit: "c0ffee1",
+				},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseRunning,
+				Discovery: &v1alpha1.RunDiscoveryStatus{
+					TaskCount:         1,
+					EligibleTaskCount: 1,
+					TaskIDs:           []string{"task-probe-rescue"},
+				},
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:             "task-probe-rescue",
+						Phase:          v1alpha1.TaskPhaseRunning,
+						Samples:        0,
+						SamplesPlanned: 2,
+						LogPath:        "",
+					},
+				},
+			},
+		}
+
+		manifest := &v1alpha1.Manifest{
+			Tasks: []v1alpha1.ManifestTask{
+				{ID: "task-probe-rescue", Spec: "eval.py@rescue"},
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(run).
+			WithStatusSubresource(run).
+			Build()
+
+		reconciler := &RunReconciler{
+			Client:           cl,
+			Scheme:           scheme,
+			ArtifactSink:     sink,
+			SandboxNamespace: "eval-runner-sandbox",
+		}
+		reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-probe-missing"}}
+		_, err := reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("Reconcile error: %v", err)
+		}
+
+		var updatedRun v1alpha1.Run
+		if err := cl.Get(t.Context(), req.NamespacedName, &updatedRun); err != nil {
+			t.Fatalf("Failed to get updated run: %v", err)
+		}
+
+		task := updatedRun.Status.Tasks[0]
+		if task.Phase != v1alpha1.TaskPhaseFailed {
+			t.Errorf("Expected task to fail with missing log, got %s", task.Phase)
+		}
+		if !strings.Contains(task.Message, "task sandbox missing while in Running phase") {
+			t.Errorf("Expected failure message to mention sandbox missing, got: %s", task.Message)
+		}
+	})
+
+	t.Run("Running task with no Samples/LogPath and partial summary -> Failed as before", func(t *testing.T) {
+		sink := artifacts.NewInMemorySink()
+		rate := 1.0
+		meta := artifacts.RunMetadata{
+			RunName:      "test-run-probe-partial",
+			RunNamespace: "eval-runner",
+			TaskID:       "task-probe-rescue",
+			Commit:       "c0ffee1",
+			SampleCount:  1,
+			Successes:    1,
+			MeanScore:    &rate,
+			SuccessRate:  &rate,
+		}
+		logFilename := "2026-10-31T15-27-47-00-00_task-probe-rescue_ByhDsNK8zVf5BWpRqxd9Y9.json"
+		_, err := sink.StoreArtifact(t.Context(), meta, logFilename, []byte(partialInspectLog))
+		if err != nil {
+			t.Fatalf("Failed to store artifact: %v", err)
+		}
+
+		limit := 2
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-run-probe-partial",
+				Namespace: "eval-runner",
+			},
+			Spec: v1alpha1.RunSpec{
+				Model: "mockllm/model",
+				Limit: &limit,
+				Repo: v1alpha1.RepoSpec{
+					Commit: "c0ffee1",
+				},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseRunning,
+				Discovery: &v1alpha1.RunDiscoveryStatus{
+					TaskCount:         1,
+					EligibleTaskCount: 1,
+					TaskIDs:           []string{"task-probe-rescue"},
+				},
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:             "task-probe-rescue",
+						Phase:          v1alpha1.TaskPhaseRunning,
+						Samples:        0,
+						SamplesPlanned: 2,
+						LogPath:        "",
+					},
+				},
+			},
+		}
+
+		manifest := &v1alpha1.Manifest{
+			Tasks: []v1alpha1.ManifestTask{
+				{ID: "task-probe-rescue", Spec: "eval.py@rescue"},
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(run).
+			WithStatusSubresource(run).
+			Build()
+
+		reconciler := &RunReconciler{
+			Client:           cl,
+			Scheme:           scheme,
+			ArtifactSink:     sink,
+			SandboxNamespace: "eval-runner-sandbox",
+		}
+		reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-probe-partial"}}
+		_, err = reconciler.Reconcile(t.Context(), req)
+		if err != nil {
+			t.Fatalf("Reconcile error: %v", err)
+		}
+
+		var updatedRun v1alpha1.Run
+		if err := cl.Get(t.Context(), req.NamespacedName, &updatedRun); err != nil {
+			t.Fatalf("Failed to get updated run: %v", err)
+		}
+
+		task := updatedRun.Status.Tasks[0]
+		if task.Phase != v1alpha1.TaskPhaseFailed {
+			t.Errorf("Expected task to fail with partial log, got %s", task.Phase)
+		}
+		if !strings.Contains(task.Message, "task sandbox missing while in Running phase") {
+			t.Errorf("Expected failure message to mention sandbox missing, got: %s", task.Message)
+		}
+	})
+
+	t.Run("Running task with no Samples/LogPath and probe error other than not-found returns error", func(t *testing.T) {
+		transientErrSink := &transientErrorSink{
+			err: errors.New("storage network timeout"),
+		}
+
+		limit := 2
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-run-probe-error",
+				Namespace: "eval-runner",
+			},
+			Spec: v1alpha1.RunSpec{
+				Model: "mockllm/model",
+				Limit: &limit,
+				Repo: v1alpha1.RepoSpec{
+					Commit: "c0ffee1",
+				},
+			},
+			Status: v1alpha1.RunStatus{
+				Phase: v1alpha1.RunPhaseRunning,
+				Discovery: &v1alpha1.RunDiscoveryStatus{
+					TaskCount:         1,
+					EligibleTaskCount: 1,
+					TaskIDs:           []string{"task-probe-rescue"},
+				},
+				Tasks: []v1alpha1.TaskStatus{
+					{
+						ID:             "task-probe-rescue",
+						Phase:          v1alpha1.TaskPhaseRunning,
+						Samples:        0,
+						SamplesPlanned: 2,
+						LogPath:        "",
+					},
+				},
+			},
+		}
+
+		manifest := &v1alpha1.Manifest{
+			Tasks: []v1alpha1.ManifestTask{
+				{ID: "task-probe-rescue", Spec: "eval.py@rescue"},
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(run).
+			WithStatusSubresource(run).
+			Build()
+
+		reconciler := &RunReconciler{
+			Client:           cl,
+			Scheme:           scheme,
+			ArtifactSink:     transientErrSink,
+			SandboxNamespace: "eval-runner-sandbox",
+		}
+		reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-probe-error"}}
+		_, err := reconciler.Reconcile(t.Context(), req)
+		if err == nil {
+			t.Fatalf("Expected error from Reconcile when probe fails with non-not-found error, got nil")
+		}
+		if !strings.Contains(err.Error(), "storage network timeout") {
+			t.Errorf("Expected error to mention 'storage network timeout', got: %v", err)
+		}
+
+		// Verify task was NOT marked Failed
+		var updatedRun v1alpha1.Run
+		if getErr := cl.Get(t.Context(), req.NamespacedName, &updatedRun); getErr != nil {
+			t.Fatalf("Failed to get updated run: %v", getErr)
+		}
+		task := updatedRun.Status.Tasks[0]
+		if task.Phase != v1alpha1.TaskPhaseRunning {
+			t.Errorf("Expected task to remain Running on transient probe error, got phase %s", task.Phase)
+		}
+	})
+}
+
 func TestReconcileRunningTaskSandboxCacheLagGracePeriodAndExpiry(t *testing.T) {
 	scheme := setupScheme(t)
 

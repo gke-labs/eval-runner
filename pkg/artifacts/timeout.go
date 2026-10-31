@@ -32,14 +32,28 @@ func manifestTarget(sink ArtifactSink, commit string) string {
 	return commit
 }
 
-func artifactTarget(sink ArtifactSink, commit, taskID, filename string) string {
+// ArtifactTarget resolves the storage target or URI for a task artifact.
+// If the sink implements TaskArtifactPather, it delegates to TaskArtifactPath.
+// Otherwise it derives the path using the sink's ArtifactPrefix.
+func ArtifactTarget(sink ArtifactSink, commit, taskID, filename string) string {
+	if pather, ok := sink.(TaskArtifactPather); ok {
+		if path := pather.TaskArtifactPath(commit, taskID, filename); path != "" {
+			return path
+		}
+	}
 	if sink != nil {
 		if prefix := sink.ArtifactPrefix(commit); prefix != "" {
 			return fmt.Sprintf("%s%s/%s", prefix, taskID, filename)
 		}
 	}
-	if commit != "" || taskID != "" {
+	if commit != "" && taskID != "" {
 		return fmt.Sprintf("%s/%s/%s", commit, taskID, filename)
+	}
+	if taskID != "" {
+		return fmt.Sprintf("%s/%s", taskID, filename)
+	}
+	if commit != "" {
+		return fmt.Sprintf("%s/%s", commit, filename)
 	}
 	return filename
 }
@@ -105,7 +119,7 @@ func StoreArtifactWithTimeout(ctx context.Context, sink ArtifactSink, meta RunMe
 		case r := <-ch:
 			return r.path, r.err
 		case <-time.After(defaultGraceWindow):
-			target := artifactTarget(sink, meta.Commit, meta.TaskID, filename)
+			target := ArtifactTarget(sink, meta.Commit, meta.TaskID, filename)
 			return "", fmt.Errorf("store artifact for %s: sink did not report completion within deadline: %w", target, ctx.Err())
 		}
 	}

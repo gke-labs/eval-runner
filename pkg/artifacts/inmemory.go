@@ -136,6 +136,7 @@ func (s *InMemorySink) StoreArtifact(ctx context.Context, meta RunMetadata, file
 		TaskID:            meta.TaskID,
 		Model:             meta.Model,
 		Commit:            meta.Commit,
+		LogFilename:       filename,
 		RunName:           meta.RunName,
 		RunNamespace:      meta.RunNamespace,
 		ControllerVersion: meta.ControllerVersion,

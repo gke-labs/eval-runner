@@ -325,7 +325,7 @@ When a `Run` specifies `spec.model`, after discovery completes, the controller e
 - **Inspect Execution**: The sandbox executes `inspect eval <spec> --model <model> --limit <start>-<end>` (or `1..limit`) and writes output logs to `/workspace/out/<task-log>.json`.
 - **Result Retrieval and Metrics**: The controller pulls the Inspect log via sandboxd REST `ReadFile`, parses sample scores, computes single-task success rate and 95% confidence intervals (Wilson score interval for binary scores, Student's t-interval for continuous scores), extracts token usage (`input`, `output`, `total`), writes the log and `summary.json` to the artifact sink, and updates `Run.status.tasks[]`.
 - **Terminal Immutability**: When all tasks complete, `Run.status.phase` is set to `Completed` (or `Failed`). Once terminal, Runs are strictly immutable (ADR-025); new sample windows are evaluated by spawning fresh batch Runs.
-- **Restart Resilience**: Task status (`Phase=Completed`, sample counts, and log path) is persisted before task sandboxes are deleted, and controller restarts rescue already scored tasks whose sandboxes are missing rather than marking them failed.
+- **Restart Resilience**: Task status (`Phase=Completed`, sample counts, and log path) is persisted before task sandboxes are deleted, and controller restarts rescue already scored tasks whose sandboxes are missing rather than marking them failed. When status lacks sample counts and log path, the controller probes the artifact sink for summary.json at the task's derived storage path to rescue completed tasks.
 
 ### Adaptive Paired Batches and Comparison Flow
 

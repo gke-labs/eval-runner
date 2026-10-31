@@ -112,6 +112,7 @@ type TaskSummary struct {
 	TaskID            string                       `json:"taskId"`
 	Model             string                       `json:"model"`
 	Commit            string                       `json:"commit"`
+	LogFilename       string                       `json:"logFilename,omitempty"`
 	RunName           string                       `json:"runName,omitempty"`
 	RunNamespace      string                       `json:"runNamespace,omitempty"`
 	ControllerVersion string                       `json:"controllerVersion,omitempty"`

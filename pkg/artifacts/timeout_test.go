@@ -373,3 +373,31 @@ func TestTimeoutWrappers_GraceWindowPrefersSinkError(t *testing.T) {
 		}
 	})
 }
+
+func TestArtifactTarget(t *testing.T) {
+	memSink := artifacts.NewInMemorySink()
+	gotMem := artifacts.ArtifactTarget(memSink, "c0ffee1", "task-1", "summary.json")
+	wantMem := "mem://runs/c0ffee1/task-1/summary.json"
+	if gotMem != wantMem {
+		t.Errorf("ArtifactTarget(memSink) = %q, want %q", gotMem, wantMem)
+	}
+
+	localSink := &artifacts.LocalDirSink{BaseDir: "/tmp/eval-artifacts"}
+	gotLocal := artifacts.ArtifactTarget(localSink, "c0ffee1", "docs/readme_comprehension", "summary.json")
+	wantLocal := "/tmp/eval-artifacts/runs/c0ffee1/docs%2Freadme_comprehension/summary.json"
+	if gotLocal != wantLocal {
+		t.Errorf("ArtifactTarget(localSink) = %q, want %q", gotLocal, wantLocal)
+	}
+
+	reloadable := artifacts.NewReloadableSink(localSink)
+	gotReloadable := artifacts.ArtifactTarget(reloadable, "c0ffee1", "docs/readme_comprehension", "summary.json")
+	if gotReloadable != wantLocal {
+		t.Errorf("ArtifactTarget(reloadable) = %q, want %q", gotReloadable, wantLocal)
+	}
+
+	gotNil := artifacts.ArtifactTarget(nil, "c0ffee1", "task-1", "summary.json")
+	wantNil := "c0ffee1/task-1/summary.json"
+	if gotNil != wantNil {
+		t.Errorf("ArtifactTarget(nil) = %q, want %q", gotNil, wantNil)
+	}
+}
