@@ -17918,9 +17918,14 @@ func TestComparisonReconciler_HeadMove_ExtraSamplesWorksAfterReset(t *testing.T)
 		t.Fatalf("expected phase Completed on first run, got %v", curComp.Status.Phase)
 	}
 
-	// Seed stale pr-test-b2-cand with old commit cand1SHA
+	// Seed stale pr-test-b2-cand with old commit cand1SHA, LabelComparison and LabelRole labels, and discovery sandbox finalizer
 	staleB2Cand := &v1alpha1.Run{
-		ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-b2-cand", curComp.Name), Namespace: "eval-runner"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       fmt.Sprintf("%s-b2-cand", curComp.Name),
+			Namespace:  "eval-runner",
+			Labels:     map[string]string{LabelComparison: curComp.Name, LabelRole: RoleCandidate},
+			Finalizers: []string{v1alpha1.FinalizerDiscoverySandbox},
+		},
 		Spec: v1alpha1.RunSpec{
 			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: f.cand1SHA},
 			Model:       "mockllm/model",
@@ -17937,9 +17942,19 @@ func TestComparisonReconciler_HeadMove_ExtraSamplesWorksAfterReset(t *testing.T)
 		t.Fatalf("update comp failed: %v", err)
 	}
 
-	// Reconcile: status resets, cand2 batch 1 evaluates and completes
+	// Reconcile: status resets, cand2 batch 1 evaluates and completes.
+	// The head-move reset path deletes stale Runs matching LabelComparison whose commit != new candidate/baseline.
 	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
 		t.Fatalf("second reconcile failed: %v", err)
+	}
+
+	// Stale b2-cand had a finalizer, so deletion marks it with DeletionTimestamp
+	var terminatingB2Cand v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: staleB2Cand.Namespace, Name: staleB2Cand.Name}, &terminatingB2Cand); err != nil {
+		t.Fatalf("failed getting stale batch 2 run: %v", err)
+	}
+	if terminatingB2Cand.DeletionTimestamp == nil {
+		t.Fatalf("expected DeletionTimestamp on stale b2-cand after head move")
 	}
 
 	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
@@ -17964,18 +17979,25 @@ func TestComparisonReconciler_HeadMove_ExtraSamplesWorksAfterReset(t *testing.T)
 		t.Fatalf("update extra samples failed: %v", err)
 	}
 
-	// Reconcile: ensureBatchRun detects stale b2-cand and returns an error waiting for cleanup!
-	_, err = f.reconciler.Reconcile(ctx, f.req)
-	if err == nil || !strings.Contains(err.Error(), "stale batch run") || !strings.Contains(err.Error(), "cleanup pending") {
-		t.Fatalf("expected stale batch run error from ensureBatchRun, got %v", err)
+	// Reconcile: ensureBatchRun detects terminating b2-cand and returns RequeueAfter 15s instead of an error!
+	result, err := f.reconciler.Reconcile(ctx, f.req)
+	if err != nil {
+		t.Fatalf("expected no error while waiting for terminating batch run, got %v", err)
+	}
+	if result.RequeueAfter != 15*time.Second {
+		t.Fatalf("expected RequeueAfter: 15s, got %v", result.RequeueAfter)
 	}
 
-	// Now simulate cleanup of the stale run: delete it from the cluster
-	if err := f.client.Delete(ctx, staleB2Cand); err != nil {
-		t.Fatalf("failed deleting stale batch 2 run: %v", err)
+	// Now simulate the Run controller finishing cleanup and removing the finalizer:
+	terminatingB2Cand.Finalizers = nil
+	if err := f.client.Update(ctx, &terminatingB2Cand); err != nil {
+		t.Fatalf("failed removing finalizer: %v", err)
+	}
+	if err := f.client.Delete(ctx, &terminatingB2Cand); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("failed deleting stale run after finalizer removed: %v", err)
 	}
 
-	// Next reconcile: now that stale run is gone, fresh batch 2 for cand2 is scheduled!
+	// Next reconcile: now that stale run is gone, fresh batch 2 for cand2 is scheduled with no cleanup pending error!
 	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
 		t.Fatalf("reconcile after stale run cleanup failed: %v", err)
 	}
@@ -17996,6 +18018,250 @@ func TestComparisonReconciler_HeadMove_ExtraSamplesWorksAfterReset(t *testing.T)
 	}
 	if cand2B2.Spec.Repo.Commit != f.cand2SHA {
 		t.Errorf("expected new batch 2 run to have commit %q, got %q", f.cand2SHA, cand2B2.Spec.Repo.Commit)
+	}
+}
+
+func TestComparisonReconciler_HeadMove_CurrentCandidateAndBaselineRunsNotDeleted(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, false)
+
+	// Complete initial reconcile with cand1
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	// Create an existing extension Run for the current baseline (commit f.baseSHA)
+	baseBatchRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       fmt.Sprintf("%s-b2-base", f.comp.Name),
+			Namespace:  "eval-runner",
+			Labels:     map[string]string{LabelComparison: f.comp.Name, LabelRole: RoleBaseline},
+			Finalizers: []string{v1alpha1.FinalizerDiscoverySandbox},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: f.baseSHA},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 2, End: 2},
+		},
+	}
+	if err := f.client.Create(ctx, baseBatchRun); err != nil {
+		t.Fatalf("create base batch run failed: %v", err)
+	}
+
+	// Create an existing extension Run for the new candidate (commit f.cand2SHA)
+	cand2BatchRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       fmt.Sprintf("%s-b3-cand", f.comp.Name),
+			Namespace:  "eval-runner",
+			Labels:     map[string]string{LabelComparison: f.comp.Name, LabelRole: RoleCandidate},
+			Finalizers: []string{v1alpha1.FinalizerDiscoverySandbox},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: f.cand2SHA},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 3, End: 3},
+		},
+	}
+	if err := f.client.Create(ctx, cand2BatchRun); err != nil {
+		t.Fatalf("create cand2 batch run failed: %v", err)
+	}
+
+	// Create a stale extension Run for old candidate (commit f.cand1SHA)
+	staleCand1BatchRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       fmt.Sprintf("%s-b2-cand", f.comp.Name),
+			Namespace:  "eval-runner",
+			Labels:     map[string]string{LabelComparison: f.comp.Name, LabelRole: RoleCandidate},
+			Finalizers: []string{v1alpha1.FinalizerDiscoverySandbox},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: f.cand1SHA},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 2, End: 2},
+		},
+	}
+	if err := f.client.Create(ctx, staleCand1BatchRun); err != nil {
+		t.Fatalf("create stale cand1 batch run failed: %v", err)
+	}
+
+	// Head moves to cand2: update spec.candidate.run
+	var curComp v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	curComp.Spec.Candidate.Run = "cand2-run"
+	if err := f.client.Update(ctx, &curComp); err != nil {
+		t.Fatalf("update comp failed: %v", err)
+	}
+
+	// Reconcile head-move
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("head-move reconcile failed: %v", err)
+	}
+
+	// Verify current baseline seed run and current baseline batch run are NOT deleted
+	var checkBaseRun v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: f.baseRun.Namespace, Name: f.baseRun.Name}, &checkBaseRun); err != nil {
+		t.Fatalf("expected baseline run to exist: %v", err)
+	}
+	if checkBaseRun.DeletionTimestamp != nil {
+		t.Errorf("baseline run should not have DeletionTimestamp")
+	}
+
+	var checkBaseBatchRun v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: baseBatchRun.Namespace, Name: baseBatchRun.Name}, &checkBaseBatchRun); err != nil {
+		t.Fatalf("expected baseline batch run to exist: %v", err)
+	}
+	if checkBaseBatchRun.DeletionTimestamp != nil {
+		t.Errorf("baseline batch run should not have DeletionTimestamp")
+	}
+
+	// Verify current candidate seed run and current candidate batch run are NOT deleted
+	var checkCand2Run v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: f.cand2Run.Namespace, Name: f.cand2Run.Name}, &checkCand2Run); err != nil {
+		t.Fatalf("expected cand2 run to exist: %v", err)
+	}
+	if checkCand2Run.DeletionTimestamp != nil {
+		t.Errorf("cand2 run should not have DeletionTimestamp")
+	}
+
+	var checkCand2BatchRun v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: cand2BatchRun.Namespace, Name: cand2BatchRun.Name}, &checkCand2BatchRun); err != nil {
+		t.Fatalf("expected cand2 batch run to exist: %v", err)
+	}
+	if checkCand2BatchRun.DeletionTimestamp != nil {
+		t.Errorf("cand2 batch run should not have DeletionTimestamp")
+	}
+
+	// Verify stale cand1 batch run WAS deleted (has DeletionTimestamp)
+	var checkStaleRun v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: staleCand1BatchRun.Namespace, Name: staleCand1BatchRun.Name}, &checkStaleRun); err != nil {
+		t.Fatalf("expected stale run to still exist with finalizer: %v", err)
+	}
+	if checkStaleRun.DeletionTimestamp == nil {
+		t.Errorf("stale cand1 batch run should have DeletionTimestamp")
+	}
+}
+
+func TestComparisonReconciler_BaseMove_SharedBaselineBatchRunSurvives(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, false)
+
+	// Complete initial reconcile for Comparison A (f.comp, "pr-test")
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("first reconcile of comp A failed: %v", err)
+	}
+
+	// Comparison A has a baseline batch Run (pr-test-b2-base) with commit f.baseSHA
+	compAB2Base := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       fmt.Sprintf("%s-b2-base", f.comp.Name),
+			Namespace:  "eval-runner",
+			Labels:     map[string]string{LabelComparison: f.comp.Name, LabelRole: RoleBaseline, LabelBatchKey: "shared-batch-key-1"},
+			Finalizers: []string{v1alpha1.FinalizerDiscoverySandbox},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: f.baseSHA},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 2, End: 2},
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseCompleted,
+		},
+	}
+	if err := f.client.Create(ctx, compAB2Base); err != nil {
+		t.Fatalf("create comp A b2 base run failed: %v", err)
+	}
+
+	// Comparison A also has an old candidate batch Run (pr-test-b2-cand) with old commit f.cand1SHA
+	compAB2Cand := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       fmt.Sprintf("%s-b2-cand", f.comp.Name),
+			Namespace:  "eval-runner",
+			Labels:     map[string]string{LabelComparison: f.comp.Name, LabelRole: RoleCandidate},
+			Finalizers: []string{v1alpha1.FinalizerDiscoverySandbox},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo:        v1alpha1.RepoSpec{URL: "git://repo", Commit: f.cand1SHA},
+			Model:       "mockllm/model",
+			SampleRange: &v1alpha1.SampleRange{Start: 2, End: 2},
+		},
+	}
+	if err := f.client.Create(ctx, compAB2Cand); err != nil {
+		t.Fatalf("create comp A b2 cand run failed: %v", err)
+	}
+
+	// Comparison B adopts Comparison A's baseline batch Run by name
+	compB := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{Name: "pr-other", Namespace: "eval-runner"},
+		Spec: v1alpha1.ComparisonSpec{
+			Baseline:  v1alpha1.ComparisonRunRef{Run: f.baseRun.Name},
+			Candidate: v1alpha1.ComparisonRunRef{Run: "other-cand-run"},
+		},
+		Status: v1alpha1.ComparisonStatus{
+			Phase: v1alpha1.ComparisonPhaseRunning,
+			Batches: []v1alpha1.ComparisonBatchStatus{
+				{Index: 1, CandidateRun: "other-cand-run", BaselineRun: f.baseRun.Name, Phase: v1alpha1.ComparisonPhaseCompleted},
+				{Index: 2, CandidateRun: "other-cand-b2", BaselineRun: compAB2Base.Name, Phase: v1alpha1.ComparisonPhaseCompleted},
+			},
+		},
+	}
+	if err := f.client.Create(ctx, compB); err != nil {
+		t.Fatalf("create comp B failed: %v", err)
+	}
+
+	// Now Comparison A undergoes a base move (e.g. consumer rewrites spec.baseline.run)
+	newBaseSHA := "3333333333333333333333333333333333333333"
+	newBaseRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "base-run-2", Namespace: "eval-runner"},
+		Spec: v1alpha1.RunSpec{
+			Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: newBaseSHA},
+			Model: "mockllm/model",
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseCompleted,
+			Tasks: []v1alpha1.TaskStatus{
+				{ID: f.taskID, Phase: v1alpha1.TaskPhaseCompleted, LogPath: "gs://eval-bucket/runs/" + newBaseSHA + "/" + f.taskID + "/inspect.json", Samples: 1},
+			},
+			Summary: &v1alpha1.RunSummary{TotalSamples: 1},
+		},
+	}
+	if err := f.client.Create(ctx, newBaseRun); err != nil {
+		t.Fatalf("create new baseline run failed: %v", err)
+	}
+
+	var curCompA v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curCompA); err != nil {
+		t.Fatalf("get comp A failed: %v", err)
+	}
+	curCompA.Spec.Baseline.Run = newBaseRun.Name
+	// Candidate also moves to cand2
+	curCompA.Spec.Candidate.Run = f.cand2Run.Name
+	if err := f.client.Update(ctx, &curCompA); err != nil {
+		t.Fatalf("update comp A failed: %v", err)
+	}
+
+	// Reconcile Comparison A on base/cand move
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("reconcile comp A on base move failed: %v", err)
+	}
+
+	// Verify Comparison A's -b2-base adopted by Comparison B is NOT deleted (survives A's base move)
+	var checkAdoptedBase v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: compAB2Base.Namespace, Name: compAB2Base.Name}, &checkAdoptedBase); err != nil {
+		t.Fatalf("expected adopted baseline batch run to survive: %v", err)
+	}
+	if checkAdoptedBase.DeletionTimestamp != nil {
+		t.Errorf("adopted baseline batch run %s should not have DeletionTimestamp", compAB2Base.Name)
+	}
+
+	// Verify Comparison A's stale candidate batch run WAS deleted
+	var checkStaleCand v1alpha1.Run
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: compAB2Cand.Namespace, Name: compAB2Cand.Name}, &checkStaleCand); err != nil {
+		t.Fatalf("expected stale cand run to exist with finalizer: %v", err)
+	}
+	if checkStaleCand.DeletionTimestamp == nil {
+		t.Errorf("stale cand run %s should have DeletionTimestamp", compAB2Cand.Name)
 	}
 }
 

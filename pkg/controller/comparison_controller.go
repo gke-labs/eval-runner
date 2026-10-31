@@ -79,6 +79,13 @@ const (
 	RoleBaseline = "baseline"
 )
 
+// errBatchRunTerminating indicates that a batch Run is terminating and waiting for sandbox cleanup.
+var errBatchRunTerminating = errors.New("batch run is terminating: waiting for cleanup")
+
+func isBatchRunTerminating(err error) bool {
+	return errors.Is(err, errBatchRunTerminating)
+}
+
 // PairedSampleScore records paired scores for a single sample ID.
 type PairedSampleScore = stats.PairedSampleScore
 
@@ -1339,7 +1346,7 @@ func (r *ComparisonReconciler) ensureBatchRun(
 		return "", fmt.Errorf("failed looking up %s run %q: %w", role, runName, err)
 	} else {
 		if existingRun.DeletionTimestamp != nil {
-			return "", fmt.Errorf("batch run %q is terminating: waiting for cleanup", runName)
+			return "", fmt.Errorf("batch run %q is terminating: waiting for cleanup: %w", runName, errBatchRunTerminating)
 		}
 		if role == RoleCandidate && templateRun.Spec.Repo.Commit != "" && existingRun.Spec.Repo.Commit != templateRun.Spec.Repo.Commit {
 			return "", fmt.Errorf("stale batch run %q exists for commit %s (want %s); cleanup pending", runName, existingRun.Spec.Repo.Commit, templateRun.Spec.Repo.Commit)
@@ -1847,6 +1854,44 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			return ctrl.Result{}, fmt.Errorf("failed looking up candidate run %s: %w", comp.Spec.Candidate.Run, err)
 		}
 
+		// Delete stale candidate extension Runs from previous candidate commits before persisting status reset.
+		candCommit := ""
+		if cRun != nil {
+			candCommit = cRun.Spec.Repo.Commit
+		} else if comp.Spec.PullRequest != nil {
+			candCommit = comp.Spec.PullRequest.HeadSHA
+		}
+
+		if candCommit != "" {
+			var runList v1alpha1.RunList
+			if err := r.List(ctx, &runList, client.InNamespace(comp.Namespace), client.MatchingLabels{LabelComparison: comp.Name}); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed listing runs for comparison %s: %w", comp.Name, err)
+			}
+			for i := range runList.Items {
+				run := &runList.Items[i]
+				if run.Labels[LabelRole] != RoleCandidate {
+					continue
+				}
+				if run.Spec.Repo.Commit == candCommit {
+					continue
+				}
+				if run.DeletionTimestamp != nil {
+					continue
+				}
+				if err := r.Delete(ctx, run); err != nil {
+					if !apierrors.IsNotFound(err) {
+						return ctrl.Result{}, fmt.Errorf("failed deleting stale run %s: %w", run.Name, err)
+					}
+					continue
+				}
+				logger.Info("deleted stale batch run",
+					"comparison", comp.Name,
+					"run", run.Name,
+					"oldCommit", run.Spec.Repo.Commit,
+				)
+			}
+		}
+
 		msg := ""
 		if cRun == nil {
 			msg = "waiting for candidate run"
@@ -2071,6 +2116,8 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 					}
 				}
 			}
+		} else if bRun.DeletionTimestamp != nil {
+			break
 		}
 		batches = append(batches, v1alpha1.ComparisonBatchStatus{
 			Index:        k,
@@ -2901,11 +2948,17 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 
 			baseRunName, err := r.ensureBatchRun(ctx, &comp, &baselineRun, RoleBaseline, tasksToRun, batchRange, nextBatchIndex)
 			if err != nil {
+				if isBatchRunTerminating(err) {
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+				}
 				return ctrl.Result{}, err
 			}
 
 			candCloneName, err := r.ensureBatchRun(ctx, &comp, &candidateRun, RoleCandidate, tasksToRun, batchRange, nextBatchIndex)
 			if err != nil {
+				if isBatchRunTerminating(err) {
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+				}
 				return ctrl.Result{}, err
 			}
 
@@ -3086,11 +3139,17 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 
 			baseRunName, err := r.ensureBatchRun(ctx, &comp, &baselineRun, RoleBaseline, tasksToRun, batchRange, nextBatchIndex)
 			if err != nil {
+				if isBatchRunTerminating(err) {
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+				}
 				return ctrl.Result{}, err
 			}
 
 			candCloneName, err := r.ensureBatchRun(ctx, &comp, &candidateRun, RoleCandidate, tasksToRun, batchRange, nextBatchIndex)
 			if err != nil {
+				if isBatchRunTerminating(err) {
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+				}
 				return ctrl.Result{}, err
 			}
 
