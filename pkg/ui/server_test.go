@@ -4609,6 +4609,65 @@ func TestServerSeries_Ordering(t *testing.T) {
 	})
 }
 
+func TestServer_SeriesDetail_FailedTaskWithSamples(t *testing.T) {
+	scheme := newTestScheme(t)
+	rate := 0.75
+
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "base-failed-run",
+			Namespace: "eval-runner",
+			Labels: map[string]string{
+				"evalrunner.gke-labs.dev/repo":     "gke-labs_eval-runner",
+				"evalrunner.gke-labs.dev/branch":   "main",
+				"evalrunner.gke-labs.dev/head-sha": "1111111222222233333334444444555555556666",
+			},
+			Annotations: map[string]string{
+				"evalrunner.gke-labs.dev/commit-time": "2026-10-20T01:00:00Z",
+			},
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/gke-labs/eval-runner.git",
+				Commit: "1111111222222233333334444444555555556666",
+			},
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseCompleted,
+			Tasks: []v1alpha1.TaskStatus{
+				{
+					ID:          "task-fail-scored",
+					Phase:       v1alpha1.TaskPhaseFailed,
+					Samples:     8,
+					Successes:   6,
+					SuccessRate: &rate,
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+	server := NewServer(Config{Client: cl})
+
+	req := httptest.NewRequest(http.MethodGet, "/github.com/gke-labs/eval-runner/series/main?task=task-fail-scored", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "failed after 8 samples") {
+		t.Errorf("expected body to contain 'failed after 8 samples', got:\n%s", body)
+	}
+	if !strings.Contains(body, "chip bad") {
+		t.Errorf("expected body to contain 'chip bad', got:\n%s", body)
+	}
+	if !strings.Contains(body, "0.75") {
+		t.Errorf("expected body to contain rate 0.75, got:\n%s", body)
+	}
+}
+
 func TestServerSeries_NCap(t *testing.T) {
 	scheme := newTestScheme(t)
 	rate := 0.85

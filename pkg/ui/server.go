@@ -681,7 +681,7 @@ func collectSeries(runs []v1alpha1.Run, ref RepoRef, branch, cohort string) []se
 	var matched []seriesRun
 	for i := range runs {
 		run := &runs[i]
-		if run.Status.Phase != v1alpha1.RunPhaseCompleted {
+		if run.Status.Phase != v1alpha1.RunPhaseCompleted && run.Status.Phase != v1alpha1.RunPhaseFailed {
 			continue
 		}
 		if !strings.HasPrefix(run.Name, "base-") {
@@ -3228,12 +3228,10 @@ func (s *Server) renderSeriesDetailWithList(w http.ResponseWriter, r *http.Reque
 					if tc == "" {
 						tc = v1alpha1.DefaultCohort
 					}
-					if tc == c && t.Phase == v1alpha1.TaskPhaseCompleted && t.Samples > 0 {
-						succ := t.Successes
-						if succ == 0 && t.SuccessRate != nil && *t.SuccessRate > 0 {
-							succ = int(math.Round(*t.SuccessRate * float64(t.Samples)))
+					if tc == c {
+						if counts, ok := pooling.ExtractTaskCounts(t); ok {
+							cTasks = append(cTasks, counts)
 						}
-						cTasks = append(cTasks, stats.TaskCounts{Successes: succ, Samples: t.Samples})
 					}
 				}
 				if len(cTasks) > 0 {
@@ -3264,12 +3262,8 @@ func (s *Server) renderSeriesDetailWithList(w http.ResponseWriter, r *http.Reque
 			for idx, m := range matched {
 				var allTasks []stats.TaskCounts
 				for _, t := range m.run.Status.Tasks {
-					if t.Phase == v1alpha1.TaskPhaseCompleted && t.Samples > 0 {
-						succ := t.Successes
-						if succ == 0 && t.SuccessRate != nil && *t.SuccessRate > 0 {
-							succ = int(math.Round(*t.SuccessRate * float64(t.Samples)))
-						}
-						allTasks = append(allTasks, stats.TaskCounts{Successes: succ, Samples: t.Samples})
+					if counts, ok := pooling.ExtractTaskCounts(t); ok {
+						allTasks = append(allTasks, counts)
 					}
 				}
 				if len(allTasks) > 0 {
@@ -3358,34 +3352,21 @@ func (s *Server) renderSeriesDetailWithList(w http.ResponseWriter, r *http.Reque
 				RunLink:        runLink(ref, run.Name, linkNS, run.Namespace),
 			}
 
-			if matchedTask != nil && matchedTask.Phase == v1alpha1.TaskPhaseCompleted && matchedTask.SuccessRate != nil {
-				item.HasPoint = true
-				item.SuccessRate = matchedTask.SuccessRate
-				item.CI = matchedTask.SuccessRateCI
-				item.SD = matchedTask.SuccessRateSD
-				item.SamplesCount = matchedTask.Samples
-				item.Phase = matchedTask.Phase
-				item.PhaseChip = "good"
-				item.Samples = strconv.Itoa(matchedTask.Samples)
-				item.RateStr = fmt.Sprintf("%.2f", *matchedTask.SuccessRate)
-				if matchedTask.SuccessRateCI != nil {
-					item.CIStr = fmt.Sprintf("[%.2f, %.2f]", matchedTask.SuccessRateCI.Lower, matchedTask.SuccessRateCI.Upper)
-				}
-				if matchedTask.Tokens != nil {
-					item.TokensStr = FormatTokens(matchedTask.Tokens.Total)
-				}
-				if matchedTask.CostUSD != nil {
-					item.CostStr = fmt.Sprintf("$%.2f", *matchedTask.CostUSD)
-					item.CostSource = matchedTask.CostSource
-					item.CostTooltip = FormatCostTooltip(matchedTask.CostSource)
-				}
-			} else {
-				item.HasPoint = false
-				if matchedTask != nil && matchedTask.Phase != "" {
-					item.Phase = matchedTask.Phase
-					item.PhaseChip = taskPhaseChipClass(matchedTask.Phase)
-					if matchedTask.Samples > 0 {
-						item.Samples = strconv.Itoa(matchedTask.Samples)
+			if matchedTask != nil {
+				if tc, ok := pooling.ExtractTaskCounts(*matchedTask); ok {
+					item.HasPoint = true
+					rate := float64(tc.Successes) / float64(tc.Samples)
+					if matchedTask.SuccessRate != nil {
+						rate = *matchedTask.SuccessRate
+					}
+					item.SuccessRate = &rate
+					item.CI = matchedTask.SuccessRateCI
+					item.SD = matchedTask.SuccessRateSD
+					item.SamplesCount = tc.Samples
+					item.Samples = strconv.Itoa(tc.Samples)
+					item.RateStr = fmt.Sprintf("%.2f", rate)
+					if matchedTask.SuccessRateCI != nil {
+						item.CIStr = fmt.Sprintf("[%.2f, %.2f]", matchedTask.SuccessRateCI.Lower, matchedTask.SuccessRateCI.Upper)
 					}
 					if matchedTask.Tokens != nil {
 						item.TokensStr = FormatTokens(matchedTask.Tokens.Total)
@@ -3395,10 +3376,39 @@ func (s *Server) renderSeriesDetailWithList(w http.ResponseWriter, r *http.Reque
 						item.CostSource = matchedTask.CostSource
 						item.CostTooltip = FormatCostTooltip(matchedTask.CostSource)
 					}
+					item.Phase = matchedTask.Phase
+					if matchedTask.Phase == v1alpha1.TaskPhaseFailed {
+						item.PhaseChip = "bad"
+						item.PhaseLabel = fmt.Sprintf("failed after %d samples", tc.Samples)
+					} else {
+						item.PhaseChip = "good"
+					}
+					item.ObsCount = 1
 				} else {
-					item.Phase = v1alpha1.TaskPhase(run.Status.Phase)
-					item.PhaseChip = phaseChipClass(run.Status.Phase)
+					item.HasPoint = false
+					if matchedTask.Phase != "" {
+						item.Phase = matchedTask.Phase
+						item.PhaseChip = taskPhaseChipClass(matchedTask.Phase)
+						if matchedTask.Samples > 0 {
+							item.Samples = strconv.Itoa(matchedTask.Samples)
+						}
+						if matchedTask.Tokens != nil {
+							item.TokensStr = FormatTokens(matchedTask.Tokens.Total)
+						}
+						if matchedTask.CostUSD != nil {
+							item.CostStr = fmt.Sprintf("$%.2f", *matchedTask.CostUSD)
+							item.CostSource = matchedTask.CostSource
+							item.CostTooltip = FormatCostTooltip(matchedTask.CostSource)
+						}
+					} else {
+						item.Phase = v1alpha1.TaskPhase(run.Status.Phase)
+						item.PhaseChip = phaseChipClass(run.Status.Phase)
+					}
 				}
+			} else {
+				item.HasPoint = false
+				item.Phase = v1alpha1.TaskPhase(run.Status.Phase)
+				item.PhaseChip = phaseChipClass(run.Status.Phase)
 			}
 
 			items = append(items, item)

@@ -47,10 +47,14 @@ func TaskSuccesses(t v1alpha1.TaskStatus) int {
 	return succ
 }
 
-// ExtractTaskCounts extracts sample and success counts from a completed TaskStatus.
-// Returns false if the task is not completed or has no samples.
+// ExtractTaskCounts extracts sample and success counts from a completed or failed TaskStatus.
+// Returns false if the task is not in a terminal phase (Completed or Failed), has no samples,
+// or a success count is not derivable (for Failed tasks, neither Successes > 0 nor SuccessRate is set).
 func ExtractTaskCounts(t v1alpha1.TaskStatus) (stats.TaskCounts, bool) {
-	if t.Phase != v1alpha1.TaskPhaseCompleted || t.Samples <= 0 {
+	if (t.Phase != v1alpha1.TaskPhaseCompleted && t.Phase != v1alpha1.TaskPhaseFailed) || t.Samples <= 0 {
+		return stats.TaskCounts{}, false
+	}
+	if t.Phase == v1alpha1.TaskPhaseFailed && t.Successes == 0 && t.SuccessRate == nil {
 		return stats.TaskCounts{}, false
 	}
 	return stats.TaskCounts{
@@ -70,6 +74,7 @@ type CommitObservationPool struct {
 	AllTasks       []stats.TaskCounts // flattened task counts for overall pooling
 	TotalCostUSD   float64
 	HasCost        bool
+	ObsCount       int
 }
 
 // PoolCommitRuns pools completed task observations from runs matching the given commit.
@@ -115,6 +120,7 @@ func PoolCommitRuns(runs []*v1alpha1.Run, commitSHA string) *CommitObservationPo
 			pool.TotalSamples += tc.Samples
 			pool.TotalSuccesses += tc.Successes
 			pool.AllTasks = append(pool.AllTasks, tc)
+			pool.ObsCount++
 		}
 	}
 

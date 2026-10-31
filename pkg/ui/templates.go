@@ -2151,7 +2151,7 @@ const seriesDetailTemplate = `
               <tr>
                 <td><span class="mono" style="font-size:13px">{{ .CommitSHAShort }}</span></td>
                 <td><span style="color:var(--muted);font-size:13px">{{ .CommitTimeStr }}</span></td>
-                <td><span class="chip {{ .PhaseChip }}"><span class="dot"></span>{{ .Phase }}</span></td>
+                <td><span class="chip {{ .PhaseChip }}"><span class="dot"></span>{{ if .PhaseLabel }}{{ .PhaseLabel }}{{ else }}{{ .Phase }}{{ end }}</span></td>
                 <td class="num">{{ .Samples }}</td>
                 <td class="num">{{ .RateStr }}</td>
                 <td class="num" style="font-size:13px">{{ .CIStr }}</td>

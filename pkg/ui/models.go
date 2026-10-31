@@ -1486,6 +1486,7 @@ type SeriesItem struct {
 	Namespace      string
 	Phase          v1alpha1.TaskPhase
 	PhaseChip      string
+	PhaseLabel     string
 	Samples        string
 	RateStr        string
 	CIStr          string

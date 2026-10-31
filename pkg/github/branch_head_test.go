@@ -134,6 +134,43 @@ func TestCheckRunStateForBranchHead_FullCycle(t *testing.T) {
 	if failState.Title != "evals failed: 1 task failed" {
 		t.Errorf("failure Title = %q, want 'evals failed: 1 task failed'", failState.Title)
 	}
+
+	// 4. failed seed but scored samples
+	rateFailScored := 1.0
+	failScoredRun := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "base-failed-scored",
+			Labels: map[string]string{
+				"evalrunner.gke-labs.dev/head-sha": "abc1234",
+			},
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseFailed,
+			Tasks: []v1alpha1.TaskStatus{
+				{
+					ID:          "task-1",
+					Phase:       v1alpha1.TaskPhaseFailed,
+					Samples:     8,
+					Successes:   8,
+					SuccessRate: &rateFailScored,
+				},
+			},
+		},
+	}
+	failScoredPool := pooling.PoolRunsForCommit([]*v1alpha1.Run{failScoredRun})
+	failScoredState := CheckRunStateForBranchHead(failScoredPool, nil, "https://dotevals.com", ref, "main", v1alpha1.RunPhaseFailed, false, 0)
+	if failScoredState.Status != "completed" || failScoredState.Conclusion != "neutral" {
+		t.Errorf("unexpected failure-scored state: %+v (want completed/neutral)", failScoredState)
+	}
+	if !strings.Contains(failScoredState.Title, "100%") || !strings.Contains(failScoredState.Title, "n=8") {
+		t.Errorf("expected Title with score and n=8, got %q", failScoredState.Title)
+	}
+	if !strings.Contains(failScoredState.Summary, "failed after 8 samples") {
+		t.Errorf("expected Summary to contain 'failed after 8 samples', got:\n%s", failScoredState.Summary)
+	}
+	if !strings.Contains(failScoredState.Text, "failed after 8 samples") {
+		t.Errorf("expected Text to contain 'failed after 8 samples', got:\n%s", failScoredState.Text)
+	}
 }
 
 func TestHashCheckRunState_NoCountdownChurn(t *testing.T) {

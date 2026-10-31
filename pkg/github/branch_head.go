@@ -97,11 +97,15 @@ func formatTaskRateWithCI(t pooling.PooledTask) string {
 		return "—"
 	}
 	pct := int(math.Round(*t.SuccessRate * 100))
+	rateStr := fmt.Sprintf("%d%%", pct)
 	if t.Estimate.CI.Upper > t.Estimate.CI.Lower || t.Samples > 0 {
 		halfWidth := int(math.Round(((t.Estimate.CI.Upper - t.Estimate.CI.Lower) / 2.0) * 100))
-		return fmt.Sprintf("%d%% ± %d", pct, halfWidth)
+		rateStr = fmt.Sprintf("%d%% ± %d", pct, halfWidth)
 	}
-	return fmt.Sprintf("%d%%", pct)
+	if t.Phase == v1alpha1.TaskPhaseFailed {
+		return fmt.Sprintf("%s (failed after %d samples)", rateStr, t.Samples)
+	}
+	return rateStr
 }
 
 type branchHeadCol struct {
@@ -285,9 +289,9 @@ func CheckRunStateForBranchHead(
 
 	state.Status = "completed"
 
-	// Failure: every task failed to run (or 0 completed tasks)
+	// Failure: every task failed to run (no observations scored)
 	// Keeps raw internal error messages/paths out of the check run.
-	if pool == nil || pool.CompletedTasks == 0 {
+	if pool == nil || pool.OverallEstimate == nil {
 		state.Conclusion = "failure"
 		if pool != nil && pool.TotalTasks > 0 {
 			if pool.TotalTasks == 1 {

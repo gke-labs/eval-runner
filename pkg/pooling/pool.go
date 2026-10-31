@@ -34,6 +34,7 @@ type PooledTask struct {
 	Phase       v1alpha1.TaskPhase
 	Message     string
 	RunName     string
+	ObsCount    int
 }
 
 // CommitPool contains pooled evaluation observations across all Runs for a single commit,
@@ -48,6 +49,7 @@ type CommitPool struct {
 	TotalTasks      int
 	FailedTasks     int
 	ObsPool         *CommitObservationPool
+	ObsCount        int
 }
 
 // PoolRunsForCommit combines task results across all Runs (seed and top-up) for a single commit,
@@ -120,8 +122,7 @@ func PoolRunsForCommit(runs []*v1alpha1.Run) *CommitPool {
 					lastMsg = t.Message
 				}
 
-				if t.Phase == v1alpha1.TaskPhaseCompleted {
-					allFailed = false
+				if t.Phase == v1alpha1.TaskPhaseCompleted || t.Phase == v1alpha1.TaskPhaseFailed {
 					if t.Tokens != nil {
 						if totalTokens == nil {
 							totalTokens = &v1alpha1.TaskTokens{}
@@ -142,6 +143,9 @@ func PoolRunsForCommit(runs []*v1alpha1.Run) *CommitPool {
 						singleRunRate = t.SuccessRate
 						singleRunSD = t.SuccessRateSD
 					}
+				}
+				if t.Phase == v1alpha1.TaskPhaseCompleted {
+					allFailed = false
 				} else if t.Phase != v1alpha1.TaskPhaseFailed {
 					allFailed = false
 					lastPhase = t.Phase
@@ -161,10 +165,17 @@ func PoolRunsForCommit(runs []*v1alpha1.Run) *CommitPool {
 				totalSuccesses += tc.Successes
 			}
 			rate := float64(totalSuccesses) / float64(totalSamples)
-			pt.Phase = v1alpha1.TaskPhaseCompleted
+			if allFailed {
+				pt.Phase = v1alpha1.TaskPhaseFailed
+				pool.FailedTasks++
+			} else {
+				pt.Phase = v1alpha1.TaskPhaseCompleted
+				pool.CompletedTasks++
+			}
 			pt.Samples = totalSamples
 			pt.Successes = totalSuccesses
 			pt.SuccessRate = &rate
+			pt.ObsCount = len(counts)
 
 			if singleRunCI != nil && singleRunRate != nil {
 				pt.Estimate = stats.Estimate{
@@ -180,7 +191,6 @@ func PoolRunsForCommit(runs []*v1alpha1.Run) *CommitPool {
 			}
 			pt.Tokens = totalTokens
 			pt.CostUSD = totalCostUSD
-			pool.CompletedTasks++
 		} else if allFailed {
 			pt.Phase = v1alpha1.TaskPhaseFailed
 			pool.FailedTasks++
@@ -195,6 +205,7 @@ func PoolRunsForCommit(runs []*v1alpha1.Run) *CommitPool {
 		overall := obsPool.OverallEstimate()
 		pool.OverallEstimate = &overall
 	}
+	pool.ObsCount = obsPool.ObsCount
 
 	return pool
 }
