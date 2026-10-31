@@ -115,7 +115,7 @@ The `Run` custom resource represents an evaluation execution against a specific 
 
 ### The `Comparison` CRD (`evalrunner.gke-labs.dev/v1alpha1`)
 
-The `Comparison` custom resource pairs two `Run` resources, evaluates statistical stopping rules, manages adaptive batch extension, and drives GitHub PR reporting (ADR-018, ADR-021, ADR-025, ADR-026):
+The `Comparison` custom resource pairs two `Run` resources, evaluates statistical stopping rules, manages adaptive batch extension, and drives GitHub PR reporting (ADR-018, ADR-021, ADR-025, ADR-026, ADR-037):
 - **Group/Version**: `evalrunner.gke-labs.dev/v1alpha1`
 - **Kind**: `Comparison` (short name: `comp`)
 - **Scope**: Namespaced (`eval-runner`)
@@ -133,6 +133,8 @@ The `Comparison` custom resource pairs two `Run` resources, evaluates statistica
   - `pImprovement`: Aggregate posterior probability of net improvement.
   - `tasks`: Per-task paired metrics (`ComparisonTaskStatus`): `baseRate`, `candidateRate`, `delta`, `deltaCI` (95% bootstrap percentile interval with normal-approximation fallback), `pairs`, `wins`, `losses`, `ties`, `dropped: {candidate, baseline}`, `label`, `decision`, `samplesRun`, `suggestedNext`, and `tokens`.
   - `batches`: List of completed and in-flight evaluation batch records (`ComparisonBatchStatus` structs with `index`, `sampleRange`, `candidateRun`, `baselineRun`, and `phase`).
+  - `observedCandidateRun`: Name of candidate Run from which current status was computed.
+  - `observedBaselineRun`: Name of baseline Run from which current status was computed.
   - `summaryPath`: Storage path or URI where `comparisons/<name>.json` was written to the artifact sink.
   - `message`: Human-readable summary of verdicts, task notes, or candidate-task failure caps.
 
@@ -329,6 +331,7 @@ The `Comparison` reconciler pairs candidate and baseline Runs across batches (AD
 - **Stopping Rule Evaluation**: Per-task differences are evaluated using `pkg/stats.Decide`. Stopping rules require a minimum of $n \ge 8$ pairs (`MinPairsToDecide = 8`) before CI stopping rules can fire. If the 95% CI on Δ (bootstrap percentile interval by default, normal approximation as fallback) excludes zero, the task stops as `improved` or `regressed`; if the CI lies entirely within $\pm \text{equivalenceMargin}$, the task stops as `unchanged`; if `maxSamplesPerTask` is reached, it stops as `inconclusive`.
 - **Batch Extension via Immutable Runs**: If any task remains undecided and under `maxSamplesPerTask`, the `Comparison` controller schedules new immutable Run pairs (`<comp>-b<k>-cand`, `<comp>-b<k>-base`) evaluating the next sample window (`[highestPosition + 1, nextEnd]`) for undecided tasks only. Existing Completed baseline Runs targeting the same commit and window are reused across PRs (ADR-023, ADR-026).
 - **Verdict Aggregation and Capping**: Once all tasks reach a terminal stopping decision, run-level verdict and headline $P(\text{improvement})$ are aggregated with tie splitting (ADR-019). If a candidate task failed while the baseline completed (or was not planned), the failure caps any `UNCHANGED` or `IMPROVED` verdict to `INCONCLUSIVE` with $P(\text{improvement})$ capped at 0.50 (issue #141). The complete comparison table is written to `comparisons/<name>.json` in the artifact sink.
+- **Head Move and Re-Scoring Lifecycle**: When a pull request receives a new head commit (or its base branch moves), the forge consumer updates `spec.candidate.run` (or `spec.baseline.run`) and `spec.pullRequest.headSHA`. The `Comparison` reconciler detects this transition by comparing the spec runs against `status.observedCandidateRun` and `status.observedBaselineRun`. The controller deletes any existing batch extension Runs (`<comp>-b<k>-cand`, etc.), resets the Comparison scoring state (`phase`, `verdict`, `summary`, `batches`, `completionTime`, `extraSamplesApplied`, per-task results) back to `Running`, and immediately creates an `in_progress` check run on the new head SHA while updating the existing PR comment in place. For baseline-only moves (base branch advances while the candidate head remains unchanged), the existing check run on the head SHA is preserved and patched back to `in_progress` while re-pairing against the new baseline Run without duplicating work (ADR-037).
 
 ### Artifact Layout
 
