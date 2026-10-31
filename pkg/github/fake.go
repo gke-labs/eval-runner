@@ -20,6 +20,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -229,6 +230,9 @@ func (f *FakeGitHubServer) CheckRuns() []*FakeCheckRun {
 	for _, cr := range f.checkRuns {
 		res = append(res, cr)
 	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].ID < res[j].ID
+	})
 	return res
 }
 
