@@ -400,9 +400,6 @@ func BuildComparisonFooter(comp *v1alpha1.Comparison, baseRun, candRun *v1alpha1
 		footerParts = append(footerParts, fmt.Sprintf("[trajectories](%s%s)", trimmedUIBaseURL, trajectoriesPath))
 	}
 	footerParts = append(footerParts, linkStr)
-	if comp.Status.SummaryPath != "" {
-		footerParts = append(footerParts, EscapeCell(comp.Status.SummaryPath))
-	}
 
 	footerBuilder.WriteString(strings.Join(footerParts, " · "))
 	footerBuilder.WriteString("\n")
