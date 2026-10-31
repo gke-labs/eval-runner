@@ -253,8 +253,9 @@ func TestHeadTopUp_StopCondition_USDBudget(t *testing.T) {
 	}
 }
 
-// TestHeadTopUp_StopCondition_LatestRunFailed verifies that top-up stops if the latest run at head failed.
-func TestHeadTopUp_StopCondition_LatestRunFailed(t *testing.T) {
+// TestHeadTopUp_StopCondition_TwoConsecutiveFailedRunsZeroSamples verifies that top-up stops
+// if the last two runs at head failed and contributed zero scored samples, logging the existing skip line.
+func TestHeadTopUp_StopCondition_TwoConsecutiveFailedRunsZeroSamples(t *testing.T) {
 	s := setupScheme(t)
 	now := time.Now()
 
@@ -263,15 +264,123 @@ func TestHeadTopUp_StopCondition_LatestRunFailed(t *testing.T) {
 		[]v1alpha1.TaskStatus{{ID: "task1", Phase: v1alpha1.TaskPhaseCompleted, Samples: 8, Successes: 4}},
 		&v1alpha1.SampleRange{Start: 1, End: 8})
 
-	// Top-up run 2 failed
+	// Top-up run 2 failed with 0 samples
 	run2Failed := makeBaseRun("base-1111111-2", "gke-labs/eval-runner", "main", "1111111", now.Add(time.Minute), "2",
 		v1alpha1.RunPhaseFailed,
 		nil,
 		&v1alpha1.SampleRange{Start: 9, End: 16})
 
+	// Top-up run 3 also failed with 0 samples
+	run3Failed := makeBaseRun("base-1111111-3", "gke-labs/eval-runner", "main", "1111111", now.Add(2*time.Minute), "3",
+		v1alpha1.RunPhaseFailed,
+		nil,
+		&v1alpha1.SampleRange{Start: 9, End: 16})
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(runSeed, run2Failed, run3Failed).Build()
+	cfg := DefaultClusterConfig()
+	cfg.HeadTopUpInterval = 6 * time.Hour
+
+	sink := &testLogSink{}
+	logger := logr.New(sink)
+
+	runner := NewHeadTopUpRunner(HeadTopUpRunnerOptions{
+		Client:    fakeClient,
+		Namespace: "eval-runner",
+		Logger:    logger,
+		Config:    cfg,
+	})
+
+	created, err := runner.RunTopUpPass(t.Context())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(created) != 0 {
+		t.Fatalf("expected 0 runs created because two consecutive top-ups failed with zero samples, got %d", len(created))
+	}
+
+	foundLog := false
+	for _, entry := range sink.entries {
+		if strings.Contains(entry, "skipping head top-up: latest run failed at commit") {
+			foundLog = true
+			break
+		}
+	}
+	if !foundLog {
+		t.Fatalf("expected log 'skipping head top-up: latest run failed at commit', got logs: %v", sink.entries)
+	}
+}
+
+// TestHeadTopUp_LatestRunFailed_WithScoredSamples_CreatesNextTopUp verifies that when the latest run
+// is Failed but scored samples, top-up is not halted and the next run is created with the next window.
+func TestHeadTopUp_LatestRunFailed_WithScoredSamples_CreatesNextTopUp(t *testing.T) {
+	s := setupScheme(t)
+	now := time.Now()
+
+	runSeed := makeBaseRun("base-1111111", "gke-labs/eval-runner", "main", "1111111", now, "",
+		v1alpha1.RunPhaseCompleted,
+		[]v1alpha1.TaskStatus{{ID: "task1", Phase: v1alpha1.TaskPhaseCompleted, Samples: 8, Successes: 4}},
+		&v1alpha1.SampleRange{Start: 1, End: 8})
+
+	// Top-up run 2 failed, but scored 8 samples (e.g. restart rescued or one task hit deadline)
+	run2Failed := makeBaseRun("base-1111111-2", "gke-labs/eval-runner", "main", "1111111", now.Add(time.Minute), "2",
+		v1alpha1.RunPhaseFailed,
+		[]v1alpha1.TaskStatus{
+			{ID: "task1", Phase: v1alpha1.TaskPhaseCompleted, Samples: 8, Successes: 5},
+			{ID: "task2", Phase: v1alpha1.TaskPhaseFailed, Samples: 0},
+		},
+		&v1alpha1.SampleRange{Start: 9, End: 16})
+
 	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(runSeed, run2Failed).Build()
 	cfg := DefaultClusterConfig()
 	cfg.HeadTopUpInterval = 6 * time.Hour
+	cfg.DefaultBatchSize = 8
+
+	runner := NewHeadTopUpRunner(HeadTopUpRunnerOptions{
+		Client:    fakeClient,
+		Namespace: "eval-runner",
+		Logger:    logr.Discard(),
+		Config:    cfg,
+	})
+
+	created, err := runner.RunTopUpPass(t.Context())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("expected 1 run created because failed run scored samples, got %d", len(created))
+	}
+	if created[0].Name != "base-1111111-3" {
+		t.Errorf("expected run name base-1111111-3, got %s", created[0].Name)
+	}
+	if created[0].Labels[consumer.LabelTopUp] != "3" {
+		t.Errorf("expected topUp label '3', got %s", created[0].Labels[consumer.LabelTopUp])
+	}
+	if created[0].Spec.SampleRange == nil || created[0].Spec.SampleRange.Start != 17 || created[0].Spec.SampleRange.End != 24 {
+		t.Errorf("expected sample range 17..24, got %v", created[0].Spec.SampleRange)
+	}
+}
+
+// TestHeadTopUp_LatestRunFailed_WithScoredSamples_SeenByStopConditions verifies that Failed-but-scored
+// runs are pooled so stop conditions (CI half-width, sample cap) see all observations.
+func TestHeadTopUp_LatestRunFailed_WithScoredSamples_SeenByStopConditions(t *testing.T) {
+	s := setupScheme(t)
+	now := time.Now()
+
+	runSeed := makeBaseRun("base-1111111", "gke-labs/eval-runner", "main", "1111111", now, "",
+		v1alpha1.RunPhaseCompleted,
+		[]v1alpha1.TaskStatus{{ID: "task1", Phase: v1alpha1.TaskPhaseCompleted, Samples: 8, Successes: 4}},
+		&v1alpha1.SampleRange{Start: 1, End: 8})
+
+	// Top-up run 2 failed, but scored 8 samples
+	run2Failed := makeBaseRun("base-1111111-2", "gke-labs/eval-runner", "main", "1111111", now.Add(time.Minute), "2",
+		v1alpha1.RunPhaseFailed,
+		[]v1alpha1.TaskStatus{{ID: "task1", Phase: v1alpha1.TaskPhaseCompleted, Samples: 8, Successes: 5}},
+		&v1alpha1.SampleRange{Start: 9, End: 16})
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(runSeed, run2Failed).Build()
+	cfg := DefaultClusterConfig()
+	cfg.HeadTopUpInterval = 6 * time.Hour
+	cfg.HeadMaxSamplesPerTask = 16 // pooled samples (8 + 8 = 16) reaches this cap!
 
 	runner := NewHeadTopUpRunner(HeadTopUpRunnerOptions{
 		Client:    fakeClient,
@@ -285,7 +394,52 @@ func TestHeadTopUp_StopCondition_LatestRunFailed(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(created) != 0 {
-		t.Fatalf("expected 0 runs created because latest top-up failed, got %d", len(created))
+		t.Fatalf("expected 0 runs created because sample cap reached (including Failed run's samples), got %d", len(created))
+	}
+}
+
+// TestHeadTopUp_LatestRunFailed_SingleFailureZeroSamples_RetriesWindow verifies that a single Failed
+// run with zero samples does not halt the loop and the un-evaluated window is retried.
+func TestHeadTopUp_LatestRunFailed_SingleFailureZeroSamples_RetriesWindow(t *testing.T) {
+	s := setupScheme(t)
+	now := time.Now()
+
+	runSeed := makeBaseRun("base-1111111", "gke-labs/eval-runner", "main", "1111111", now, "",
+		v1alpha1.RunPhaseCompleted,
+		[]v1alpha1.TaskStatus{{ID: "task1", Phase: v1alpha1.TaskPhaseCompleted, Samples: 8, Successes: 4}},
+		&v1alpha1.SampleRange{Start: 1, End: 8})
+
+	// Top-up run 2 failed with 0 samples
+	run2Failed := makeBaseRun("base-1111111-2", "gke-labs/eval-runner", "main", "1111111", now.Add(time.Minute), "2",
+		v1alpha1.RunPhaseFailed,
+		nil,
+		&v1alpha1.SampleRange{Start: 9, End: 16})
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(runSeed, run2Failed).Build()
+	cfg := DefaultClusterConfig()
+	cfg.HeadTopUpInterval = 6 * time.Hour
+	cfg.DefaultBatchSize = 8
+
+	runner := NewHeadTopUpRunner(HeadTopUpRunnerOptions{
+		Client:    fakeClient,
+		Namespace: "eval-runner",
+		Logger:    logr.Discard(),
+		Config:    cfg,
+	})
+
+	created, err := runner.RunTopUpPass(t.Context())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("expected 1 run created for single failure retry, got %d", len(created))
+	}
+	if created[0].Name != "base-1111111-3" {
+		t.Errorf("expected run name base-1111111-3, got %s", created[0].Name)
+	}
+	// Window 9..16 should be retried because run2 contributed zero samples
+	if created[0].Spec.SampleRange == nil || created[0].Spec.SampleRange.Start != 9 || created[0].Spec.SampleRange.End != 16 {
+		t.Errorf("expected retried sample range 9..16, got %v", created[0].Spec.SampleRange)
 	}
 }
 

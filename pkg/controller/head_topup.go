@@ -223,25 +223,29 @@ func (r *HeadTopUpRunner) RunTopUpPass(ctx context.Context) ([]*v1alpha1.Run, er
 			continue
 		}
 
-		// Stop if the latest Run at this commit failed: do not retry failed top-ups forever.
-		latestRun := findLatestRun(commitRuns)
-		if latestRun != nil && latestRun.Status.Phase == v1alpha1.RunPhaseFailed {
-			r.logger.Info("skipping head top-up: latest run failed at commit", "commit", headCommit, "branch", target.branch, "run", latestRun.Name)
-			continue
-		}
-
-		var completedRuns []*v1alpha1.Run
-		for _, run := range commitRuns {
-			if run.Status.Phase == v1alpha1.RunPhaseCompleted {
-				completedRuns = append(completedRuns, run)
+		// Stop only if the last two runs at this commit failed and contributed zero scored samples.
+		sortedCommitRuns := sortRunsDescending(commitRuns)
+		if len(sortedCommitRuns) >= 2 {
+			r0, r1 := sortedCommitRuns[0], sortedCommitRuns[1]
+			if r0.Status.Phase == v1alpha1.RunPhaseFailed && r1.Status.Phase == v1alpha1.RunPhaseFailed &&
+				runScoredSamples(r0) == 0 && runScoredSamples(r1) == 0 {
+				r.logger.Info("skipping head top-up: latest run failed at commit", "commit", headCommit, "branch", target.branch, "run", r0.Name)
+				continue
 			}
 		}
-		if len(completedRuns) == 0 {
-			// No completed runs at head yet
+
+		var candidateRuns []*v1alpha1.Run
+		for _, run := range commitRuns {
+			if run.Status.Phase == v1alpha1.RunPhaseCompleted || run.Status.Phase == v1alpha1.RunPhaseFailed {
+				candidateRuns = append(candidateRuns, run)
+			}
+		}
+		if len(candidateRuns) == 0 {
+			// No completed or failed runs at head yet
 			continue
 		}
 
-		pool := pooling.PoolCommitRuns(completedRuns, headCommit)
+		pool := pooling.PoolCommitRuns(candidateRuns, headCommit)
 		if pool.TotalSamples == 0 {
 			r.logger.Info("skipping head top-up: zero completed samples across completed runs", "commit", headCommit, "branch", target.branch)
 			continue
@@ -314,7 +318,14 @@ func (r *HeadTopUpRunner) RunTopUpPass(ctx context.Context) ([]*v1alpha1.Run, er
 			batchSize = 8
 		}
 
-		prevRun := findLatestCompletedRun(completedRuns)
+		var progressRuns []*v1alpha1.Run
+		for _, run := range candidateRuns {
+			if run.Status.Phase == v1alpha1.RunPhaseCompleted || runScoredSamples(run) > 0 {
+				progressRuns = append(progressRuns, run)
+			}
+		}
+
+		prevRun := findLatestCompletedRun(progressRuns)
 		nextSampleRange := determineNextSampleRange(prevRun, batchSize)
 
 		labels := make(map[string]string)
@@ -586,7 +597,23 @@ func findSeedRun(runs []*v1alpha1.Run) *v1alpha1.Run {
 	return sorted[0]
 }
 
-func findLatestRun(runs []*v1alpha1.Run) *v1alpha1.Run {
+func runScoredSamples(run *v1alpha1.Run) int {
+	if run == nil {
+		return 0
+	}
+	total := 0
+	for _, t := range run.Status.Tasks {
+		if t.ID == "" {
+			continue
+		}
+		if tc, ok := pooling.ExtractTaskCounts(t); ok {
+			total += tc.Samples
+		}
+	}
+	return total
+}
+
+func sortRunsDescending(runs []*v1alpha1.Run) []*v1alpha1.Run {
 	if len(runs) == 0 {
 		return nil
 	}
@@ -600,23 +627,14 @@ func findLatestRun(runs []*v1alpha1.Run) *v1alpha1.Run {
 		}
 		return sorted[i].CreationTimestamp.After(sorted[j].CreationTimestamp.Time)
 	})
-	return sorted[0]
+	return sorted
 }
 
 func findLatestCompletedRun(runs []*v1alpha1.Run) *v1alpha1.Run {
-	if len(runs) == 0 {
+	sorted := sortRunsDescending(runs)
+	if len(sorted) == 0 {
 		return nil
 	}
-	sorted := make([]*v1alpha1.Run, len(runs))
-	copy(sorted, runs)
-	sort.Slice(sorted, func(i, j int) bool {
-		idxI := runTopUpIndex(sorted[i])
-		idxJ := runTopUpIndex(sorted[j])
-		if idxI != idxJ {
-			return idxI > idxJ
-		}
-		return sorted[i].CreationTimestamp.After(sorted[j].CreationTimestamp.Time)
-	})
 	return sorted[0]
 }
 
