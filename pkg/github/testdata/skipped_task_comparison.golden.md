@@ -8,4 +8,4 @@ skipped (not planned): docs/readme\_comprehension\_blind
 | --- | --- | --- | --- | --- | --- | --- |
 | docs/readme\_comprehension | 0.20 | 1.00 | +0.80 [+0.60, +1.00] | improved | 20 | 16/0/4 |
 
-80 run · 20 paired · paired against base commit 05ce4d8 · `/comparisons/eval-runner/docs-eval-skipped-task` · gs://eval-bucket/comparisons/docs-eval-skipped-task.json
+80 run · 20 paired · paired against base commit 05ce4d8 · `/comparisons/eval-runner/docs-eval-skipped-task`

@@ -335,6 +335,9 @@ func TestRenderComparisonMarkdown_Golden(t *testing.T) {
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
 	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
+	}
 }
 
 func TestRenderComparisonMarkdown_Golden_CandidateTaskFailed(t *testing.T) {
@@ -351,6 +354,9 @@ func TestRenderComparisonMarkdown_Golden_CandidateTaskFailed(t *testing.T) {
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
 	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
+	}
 }
 
 func TestRenderComparisonMarkdown_Golden_SkippedTask(t *testing.T) {
@@ -366,6 +372,9 @@ func TestRenderComparisonMarkdown_Golden_SkippedTask(t *testing.T) {
 
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
+	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
 	}
 }
 
@@ -390,6 +399,9 @@ func TestRenderComparisonMarkdown_Golden_RunMoreSamples(t *testing.T) {
 
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
+	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
 	}
 }
 
@@ -422,6 +434,9 @@ func TestRenderComparisonMarkdown_Golden_BudgetReached(t *testing.T) {
 
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
+	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
 	}
 }
 
@@ -617,6 +632,9 @@ func TestRenderComparisonMarkdown_Golden_BatchesAndTokens(t *testing.T) {
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
 	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
+	}
 }
 
 func statisticsComparisonFixture() (*v1alpha1.Comparison, *v1alpha1.Run, *v1alpha1.Run) {
@@ -787,6 +805,41 @@ func TestRenderComparisonMarkdown_Golden_StatisticsParity(t *testing.T) {
 
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
+	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
+	}
+}
+
+func TestBuildComparisonFooter_OmitsSummaryPath(t *testing.T) {
+	comp := &v1alpha1.Comparison{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "eval-runner",
+			Name:      "pr-456-eval",
+		},
+		Status: v1alpha1.ComparisonStatus{
+			SummaryPath: "gs://some-bucket/comparisons/pr-456-9db7196.json",
+		},
+	}
+
+	footer := BuildComparisonFooter(comp, nil, nil, "")
+	if strings.Contains(footer, comp.Status.SummaryPath) {
+		t.Errorf("expected footer to omit SummaryPath %q, got: %q", comp.Status.SummaryPath, footer)
+	}
+	if strings.Contains(footer, "gs://") {
+		t.Errorf("expected footer to omit storage URI, got: %q", footer)
+	}
+
+	// Verify check-run text also omits SummaryPath
+	checkRunText := RenderCheckRunText(comp, nil, nil, "")
+	if strings.Contains(checkRunText, comp.Status.SummaryPath) {
+		t.Errorf("expected check-run text to omit SummaryPath %q, got: %q", comp.Status.SummaryPath, checkRunText)
+	}
+
+	// Verify PR markdown comment also omits SummaryPath
+	markdown := RenderComparisonMarkdown(comp, nil, nil, "")
+	if strings.Contains(markdown, comp.Status.SummaryPath) {
+		t.Errorf("expected markdown comment to omit SummaryPath %q, got: %q", comp.Status.SummaryPath, markdown)
 	}
 }
 
@@ -2553,6 +2606,9 @@ func TestRenderComparisonMarkdown_3Tasks_ByteIdenticalToGolden(t *testing.T) {
 
 	if got != want {
 		t.Errorf("RenderComparisonMarkdown mismatch (-got +want):\nGOT:\n%s\nWANT:\n%s", got, want)
+	}
+	if strings.Contains(got, comp.Status.SummaryPath) {
+		t.Errorf("expected SummaryPath %q to be absent from rendered markdown, got:\n%s", comp.Status.SummaryPath, got)
 	}
 }
 

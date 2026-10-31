@@ -7,4 +7,4 @@
 | docs/readme\_comprehension | 1.00 | 1.00 | +0.00 [+0.00, +0.00] | unchanged | 20 | 0/0/20 |
 | docs/readme\_comprehension\_blind | 0.20 | 0.15 | -0.05 [-0.15, +0.00] | inconclusive | 20 | 0/1/19 |
 
-80 run · 40 paired · paired against base commit 05ce4d8 · `/comparisons/eval-runner/docs-eval-same-commit` · gs://eval-bucket/comparisons/docs-eval-same-commit.json
+80 run · 40 paired · paired against base commit 05ce4d8 · `/comparisons/eval-runner/docs-eval-same-commit`

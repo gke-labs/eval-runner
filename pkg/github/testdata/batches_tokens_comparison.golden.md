@@ -10,6 +10,6 @@ Running batch 2 (1 tasks continuing)
 | docs/readme\_comprehension\_blind | 0.20 | 0.15 | -0.05 [-0.15, +0.00] | inconclusive | 16 | — | 1/2/13 |
 | docs/readme\_summary | — | — | — | running | — | — | — |
 
-$0.01 spent (default prices), 32 of 100 possible samples · paired against base commit a81d0c4 · `/comparisons/eval-runner/docs-eval-batches-tokens` · gs://eval-bucket/comparisons/docs-eval-batches-tokens.json
+$0.01 spent (default prices), 32 of 100 possible samples · paired against base commit a81d0c4 · `/comparisons/eval-runner/docs-eval-batches-tokens`
 
 - comment `/eval more 16` to run 16 more samples (docs/readme\_comprehension\_blind)
