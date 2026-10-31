@@ -17803,6 +17803,379 @@ func TestComparisonReconciler_HeadMove_RescoresAgainstNewCandidate(t *testing.T)
 	}
 }
 
+func TestComparisonReconciler_HeadMove_PostsNewCheckRun(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, true)
+
+	// 1. Initial reconcile: cand1 is evaluated and completes
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	var curComp v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	if curComp.Status.Phase != v1alpha1.ComparisonPhaseCompleted {
+		t.Fatalf("expected phase Completed on first run, got %v", curComp.Status.Phase)
+	}
+	checkRuns := f.server.CheckRuns()
+	if len(checkRuns) != 1 {
+		t.Fatalf("expected 1 check run after first reconcile, got %d", len(checkRuns))
+	}
+	cand1CheckRunID := checkRuns[0].ID
+	cand1Title := checkRuns[0].Title
+	cand1Conclusion := checkRuns[0].Conclusion
+	if checkRuns[0].Status != "completed" {
+		t.Fatalf("expected cand1 check run completed, got %s", checkRuns[0].Status)
+	}
+	if curComp.Status.Reporting == nil || curComp.Status.Reporting.CheckRunIDs[f.cand1SHA] != cand1CheckRunID {
+		t.Fatalf("expected cand1 check run ID %d in CheckRunIDs, got %v", cand1CheckRunID, curComp.Status.Reporting)
+	}
+
+	// 2. Head moves to cand2, but cand2 is not completed yet (still running)
+	f.cand2Run.Status.Phase = v1alpha1.RunPhaseRunning
+	f.cand2Run.Status.Tasks[0].Phase = v1alpha1.TaskPhaseRunning
+	f.cand2Run.Status.Summary = nil
+	if err := f.client.Status().Update(ctx, f.cand2Run); err != nil {
+		t.Fatalf("failed updating cand2 status: %v", err)
+	}
+
+	curComp.Spec.Candidate.Run = "cand2-run"
+	curComp.Spec.PullRequest.HeadSHA = f.cand2SHA
+	if err := f.client.Update(ctx, &curComp); err != nil {
+		t.Fatalf("update comp failed: %v", err)
+	}
+
+	// Reconcile head move: should detect head change, reset status, create new check run on cand2SHA
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("head move reconcile failed: %v", err)
+	}
+
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp after head-move failed: %v", err)
+	}
+
+	checkRuns = f.server.CheckRuns()
+	if len(checkRuns) != 2 {
+		t.Fatalf("expected 2 check runs after head move, got %d", len(checkRuns))
+	}
+	// Old SHA completed, untouched (status, title, and conclusion unchanged)
+	if checkRuns[0].ID != cand1CheckRunID || checkRuns[0].HeadSHA != f.cand1SHA || checkRuns[0].Status != "completed" || checkRuns[0].Title != cand1Title || checkRuns[0].Conclusion != cand1Conclusion {
+		t.Errorf("cand1 check run corrupted: %+v", checkRuns[0])
+	}
+	// New SHA in_progress with title "re-running for <sha7>"
+	cand2CheckRunID := checkRuns[1].ID
+	if checkRuns[1].HeadSHA != f.cand2SHA {
+		t.Errorf("expected cand2 head SHA %s, got %s", f.cand2SHA, checkRuns[1].HeadSHA)
+	}
+	if checkRuns[1].Status != "in_progress" {
+		t.Errorf("expected cand2 check run status in_progress, got %s", checkRuns[1].Status)
+	}
+	expectedTitle := fmt.Sprintf("re-running for %s", f.cand2SHA[:7])
+	if checkRuns[1].Title != expectedTitle {
+		t.Errorf("expected cand2 check run title %q, got %q", expectedTitle, checkRuns[1].Title)
+	}
+
+	// Both IDs recorded in status.reporting.checkRunIDs
+	if curComp.Status.Reporting.CheckRunIDs[f.cand1SHA] != cand1CheckRunID {
+		t.Errorf("expected CheckRunIDs[%s] = %d, got %d", f.cand1SHA, cand1CheckRunID, curComp.Status.Reporting.CheckRunIDs[f.cand1SHA])
+	}
+	if curComp.Status.Reporting.CheckRunIDs[f.cand2SHA] != cand2CheckRunID {
+		t.Errorf("expected CheckRunIDs[%s] = %d, got %d", f.cand2SHA, cand2CheckRunID, curComp.Status.Reporting.CheckRunIDs[f.cand2SHA])
+	}
+
+	// 3. Candidate 2 completes; re-score completes
+	f.cand2Run.Status.Phase = v1alpha1.RunPhaseCompleted
+	f.cand2Run.Status.Tasks[0].Phase = v1alpha1.TaskPhaseCompleted
+	f.cand2Run.Status.Summary = &v1alpha1.RunSummary{TotalSamples: 1}
+	if err := f.client.Status().Update(ctx, f.cand2Run); err != nil {
+		t.Fatalf("failed updating cand2 status: %v", err)
+	}
+
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("rescore reconcile failed: %v", err)
+	}
+
+	checkRuns = f.server.CheckRuns()
+	if len(checkRuns) != 2 {
+		t.Fatalf("expected still 2 check runs after rescore, got %d", len(checkRuns))
+	}
+	// Old SHA still completed and untouched (status, title, and conclusion unchanged)
+	if checkRuns[0].ID != cand1CheckRunID || checkRuns[0].Status != "completed" || checkRuns[0].Title != cand1Title || checkRuns[0].Conclusion != cand1Conclusion {
+		t.Errorf("old SHA check run was modified: %+v", checkRuns[0])
+	}
+	// New SHA is completed
+	if checkRuns[1].ID != cand2CheckRunID || checkRuns[1].Status != "completed" {
+		t.Errorf("new SHA check run was not completed: %+v", checkRuns[1])
+	}
+}
+
+func TestComparisonReconciler_HeadMove_EagerCreateFailure_FallsBackToCreateOnMiss(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, true)
+
+	// 1. Initial reconcile: cand1 completes
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	checkRuns := f.server.CheckRuns()
+	if len(checkRuns) != 1 {
+		t.Fatalf("expected 1 check run, got %d", len(checkRuns))
+	}
+	cand1CheckRunID := checkRuns[0].ID
+	cand1Title := checkRuns[0].Title
+	cand1Conclusion := checkRuns[0].Conclusion
+
+	var curComp v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+
+	// 2. Head moves to cand2, but eager create check-run call fails with HTTP 500
+	f.server.InjectPathError("POST", "/repos/gke-labs/eval-runner/check-runs", http.StatusInternalServerError, `{"message":"internal error"}`)
+
+	curComp.Spec.Candidate.Run = "cand2-run"
+	curComp.Spec.PullRequest.HeadSHA = f.cand2SHA
+	if err := f.client.Update(ctx, &curComp); err != nil {
+		t.Fatalf("update comp failed: %v", err)
+	}
+
+	// Reconcile: eager create fails, but status reset clears CheckRunID for new head.
+	// When candidate completes and reportToGitHub runs, missing checkRunID creates a new check run on cand2SHA.
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("head move reconcile failed: %v", err)
+	}
+
+	checkRuns = f.server.CheckRuns()
+	if len(checkRuns) != 2 {
+		t.Fatalf("expected 2 check runs (fallback created new check run on miss), got %d", len(checkRuns))
+	}
+	// Old SHA check run untouched
+	if checkRuns[0].ID != cand1CheckRunID || checkRuns[0].HeadSHA != f.cand1SHA || checkRuns[0].Status != "completed" || checkRuns[0].Title != cand1Title || checkRuns[0].Conclusion != cand1Conclusion {
+		t.Errorf("cand1 check run was modified: %+v", checkRuns[0])
+	}
+	// New SHA check run created on cand2SHA and completed
+	if checkRuns[1].ID == cand1CheckRunID {
+		t.Errorf("new check run should have a distinct ID from old check run %d", cand1CheckRunID)
+	}
+	if checkRuns[1].HeadSHA != f.cand2SHA {
+		t.Errorf("expected cand2 head SHA %s, got %s", f.cand2SHA, checkRuns[1].HeadSHA)
+	}
+	if checkRuns[1].Status != "completed" {
+		t.Errorf("expected cand2 check run status completed, got %s", checkRuns[1].Status)
+	}
+
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	if curComp.Status.Reporting.CheckRunIDs[f.cand2SHA] != checkRuns[1].ID {
+		t.Errorf("expected CheckRunIDs[%s] = %d, got %v", f.cand2SHA, checkRuns[1].ID, curComp.Status.Reporting.CheckRunIDs)
+	}
+}
+
+func TestComparisonReconciler_HeadMove_OldRunDeleted_CreatesNewCheckRun(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, true)
+
+	// 1. Initial reconcile: cand1 completes
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	checkRuns := f.server.CheckRuns()
+	if len(checkRuns) != 1 {
+		t.Fatalf("expected 1 check run, got %d", len(checkRuns))
+	}
+	cand1CheckRunID := checkRuns[0].ID
+	cand1Title := checkRuns[0].Title
+	cand1Conclusion := checkRuns[0].Conclusion
+
+	var curComp v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+
+	// Simulate pre-upgrade object where only legacy CheckRunID is set
+	curComp.Status.Reporting.CheckRunID = cand1CheckRunID
+	curComp.Status.Reporting.CheckRunIDs = nil
+	if err := f.client.Status().Update(ctx, &curComp); err != nil {
+		t.Fatalf("failed updating comp to pre-upgrade status: %v", err)
+	}
+
+	// Delete old candidate run so oldHeadSHA cannot be resolved from observedCandidateRun
+	if err := f.client.Delete(ctx, f.cand1Run); err != nil {
+		t.Fatalf("failed deleting old cand1 run: %v", err)
+	}
+
+	// 2. Head moves to cand2
+	curComp.Spec.Candidate.Run = "cand2-run"
+	curComp.Spec.PullRequest.HeadSHA = f.cand2SHA
+	if err := f.client.Update(ctx, &curComp); err != nil {
+		t.Fatalf("update comp failed: %v", err)
+	}
+
+	// Reconcile
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("head move reconcile failed: %v", err)
+	}
+
+	checkRuns = f.server.CheckRuns()
+	if len(checkRuns) != 2 {
+		t.Fatalf("expected 2 check runs, got %d", len(checkRuns))
+	}
+	// Old SHA check run untouched
+	if checkRuns[0].ID != cand1CheckRunID || checkRuns[0].HeadSHA != f.cand1SHA || checkRuns[0].Status != "completed" || checkRuns[0].Title != cand1Title || checkRuns[0].Conclusion != cand1Conclusion {
+		t.Errorf("cand1 check run was modified: %+v", checkRuns[0])
+	}
+	// New SHA check run created on cand2SHA and completed
+	if checkRuns[1].ID == cand1CheckRunID {
+		t.Errorf("new check run should have a distinct ID from old check run %d", cand1CheckRunID)
+	}
+	if checkRuns[1].HeadSHA != f.cand2SHA {
+		t.Errorf("expected cand2 head SHA %s, got %s", f.cand2SHA, checkRuns[1].HeadSHA)
+	}
+	if checkRuns[1].Status != "completed" {
+		t.Errorf("expected cand2 check run status completed, got %s", checkRuns[1].Status)
+	}
+
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	if curComp.Status.Reporting.CheckRunIDs[f.cand2SHA] != checkRuns[1].ID {
+		t.Errorf("expected CheckRunIDs[%s] = %d, got %v", f.cand2SHA, checkRuns[1].ID, curComp.Status.Reporting.CheckRunIDs)
+	}
+	if curComp.Status.Reporting.CheckRunIDs[f.cand2SHA] == cand1CheckRunID {
+		t.Errorf("CheckRunIDs for new head must not equal old check run ID %d", cand1CheckRunID)
+	}
+}
+
+func TestComparisonReconciler_BaselineOnly_PatchesExistingCheckRun(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, true)
+
+	// Create second baseline run
+	base2Run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "base2-run", Namespace: "eval-runner"},
+		Spec: v1alpha1.RunSpec{
+			Repo:  v1alpha1.RepoSpec{URL: "git://repo", Commit: "base2-commit"},
+			Model: "mockllm/model",
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseRunning,
+			Tasks: []v1alpha1.TaskStatus{
+				{ID: f.taskID, Phase: v1alpha1.TaskPhaseRunning},
+			},
+		},
+	}
+	if err := f.client.Create(ctx, base2Run); err != nil {
+		t.Fatalf("failed creating base2 run: %v", err)
+	}
+
+	// 1. Initial reconcile: base1 and cand1 complete
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	var curComp v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	if curComp.Status.Phase != v1alpha1.ComparisonPhaseCompleted {
+		t.Fatalf("expected phase Completed, got %v", curComp.Status.Phase)
+	}
+	checkRuns := f.server.CheckRuns()
+	if len(checkRuns) != 1 {
+		t.Fatalf("expected 1 check run, got %d", len(checkRuns))
+	}
+	origCheckRunID := checkRuns[0].ID
+	if checkRuns[0].Status != "completed" {
+		t.Fatalf("expected check run completed, got %s", checkRuns[0].Status)
+	}
+
+	// 2. Baseline changes to base2-run; candidate run and headSHA do NOT change
+	curComp.Spec.Baseline.Run = "base2-run"
+	if err := f.client.Update(ctx, &curComp); err != nil {
+		t.Fatalf("update comp baseline failed: %v", err)
+	}
+
+	// Reconcile: baseline-only reset
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("baseline-only reconcile failed: %v", err)
+	}
+
+	// Verify: still one check run on the head SHA, patched back to in_progress
+	checkRuns = f.server.CheckRuns()
+	if len(checkRuns) != 1 {
+		t.Fatalf("expected still exactly 1 check run for baseline-only change, got %d", len(checkRuns))
+	}
+	if checkRuns[0].ID != origCheckRunID {
+		t.Errorf("expected same check run ID %d, got %d", origCheckRunID, checkRuns[0].ID)
+	}
+	if checkRuns[0].HeadSHA != f.cand1SHA {
+		t.Errorf("expected head SHA %s, got %s", f.cand1SHA, checkRuns[0].HeadSHA)
+	}
+	if checkRuns[0].Status != "in_progress" {
+		t.Errorf("expected check run patched to in_progress, got %s", checkRuns[0].Status)
+	}
+}
+
+func TestComparisonReconciler_PreUpgradeMigration(t *testing.T) {
+	ctx := t.Context()
+	f := newHeadMoveFixture(t, true)
+
+	// Inject a legacy check run into fake server pretending it was created pre-upgrade
+	client := f.server.Client("token")
+	legacyID, err := client.CreateCheckRun(ctx, "gke-labs", "eval-runner", f.cand1SHA, github.CheckRunState{
+		Name:   github.CheckRunName,
+		Status: "in_progress",
+		Title:  "legacy check run",
+	})
+	if err != nil {
+		t.Fatalf("create legacy check run failed: %v", err)
+	}
+
+	// Comparison has only legacy CheckRunID set, and CheckRunIDs is nil
+	var curComp v1alpha1.Comparison
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	curComp.Status.Phase = v1alpha1.ComparisonPhaseRunning
+	curComp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{
+		CheckRunID:  legacyID,
+		CheckRunIDs: nil,
+	}
+	if err := f.client.Status().Update(ctx, &curComp); err != nil {
+		t.Fatalf("update comp status failed: %v", err)
+	}
+
+	// Reconcile
+	if _, err := f.reconciler.Reconcile(ctx, f.req); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	// Check fake GitHub server: still exactly 1 check run (the legacy one, updated in place without duplicate)
+	checkRuns := f.server.CheckRuns()
+	if len(checkRuns) != 1 {
+		t.Fatalf("expected exactly 1 check run (migrated in place without duplicates), got %d", len(checkRuns))
+	}
+	if checkRuns[0].ID != legacyID {
+		t.Errorf("expected check run ID %d, got %d", legacyID, checkRuns[0].ID)
+	}
+
+	// Check Comparison status: CheckRunIDs map is populated
+	if err := f.client.Get(ctx, f.req.NamespacedName, &curComp); err != nil {
+		t.Fatalf("get comp failed: %v", err)
+	}
+	if curComp.Status.Reporting == nil {
+		t.Fatalf("expected non-nil Status.Reporting")
+	}
+	if curComp.Status.Reporting.CheckRunIDs[f.cand1SHA] != legacyID {
+		t.Errorf("expected CheckRunIDs[%s] = %d, got %v", f.cand1SHA, legacyID, curComp.Status.Reporting.CheckRunIDs)
+	}
+}
+
 func TestComparisonReconciler_BatchDiscovery_StaleExtensionRunWithDifferentCommitNotAdopted(t *testing.T) {
 	ctx := t.Context()
 	f := newHeadMoveFixture(t, false)

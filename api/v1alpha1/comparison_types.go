@@ -381,9 +381,15 @@ type ComparisonReportingStatus struct {
 	// +optional
 	CommentID int64 `json:"commentID,omitempty"`
 
-	// CheckRunID is the GitHub check run ID created or updated for this comparison.
+	// CheckRunID is the legacy GitHub check run ID created or updated for this comparison.
+	// Deprecated: use CheckRunIDs.
 	// +optional
 	CheckRunID int64 `json:"checkRunID,omitempty"`
+
+	// CheckRunIDs maps commit SHA to GitHub check run ID created or updated for this comparison.
+	// Bounded by pushes to the pull request; entries are preserved to track historical check runs.
+	// +optional
+	CheckRunIDs map[string]int64 `json:"checkRunIDs,omitempty"`
 
 	// LastPostedHash is the hash of the last successfully posted content and state.
 	// +optional

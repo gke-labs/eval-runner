@@ -465,10 +465,19 @@ spec:
                       attempted to report to GitHub.
                     type: integer
                   checkRunID:
-                    description: CheckRunID is the GitHub check run ID created or
-                      updated for this comparison.
+                    description: |-
+                      CheckRunID is the legacy GitHub check run ID created or updated for this comparison.
+                      Deprecated: use CheckRunIDs.
                     format: int64
                     type: integer
+                  checkRunIDs:
+                    additionalProperties:
+                      format: int64
+                      type: integer
+                    description: |-
+                      CheckRunIDs maps commit SHA to GitHub check run ID created or updated for this comparison.
+                      Bounded by pushes to the pull request; entries are preserved to track historical check runs.
+                    type: object
                   commentID:
                     description: CommentID is the GitHub issue comment ID created
                       or updated for this comparison.

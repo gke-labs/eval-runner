@@ -546,26 +546,41 @@ func CheckRunStateForComparison(comp *v1alpha1.Comparison, baseRun, candRun *v1a
 		state.Status = "in_progress"
 		state.Conclusion = ""
 
-		// Calculate N (completed samples) and M (total planned samples: limit x tasks)
-		completed := 0
-		total := 0
-		if candRun != nil {
-			if candRun.Status.Summary != nil {
-				completed += candRun.Status.Summary.TotalSamples
-			}
-			total += PlannedSamples(candRun)
-		}
-		if baseRun != nil {
-			if baseRun.Status.Summary != nil {
-				completed += baseRun.Status.Summary.TotalSamples
-			}
-			total += PlannedSamples(baseRun)
+		candSamples := 0
+		if candRun != nil && candRun.Status.Summary != nil {
+			candSamples = candRun.Status.Summary.TotalSamples
 		}
 
-		if total > 0 {
-			state.Title = fmt.Sprintf("running · %d of %d samples", completed, total)
-		} else if completed > 0 {
-			state.Title = fmt.Sprintf("running · %d samples", completed)
+		if candSamples > 0 {
+			completed := candSamples
+			total := PlannedSamples(candRun)
+			if baseRun != nil {
+				if baseRun.Status.Summary != nil {
+					completed += baseRun.Status.Summary.TotalSamples
+				}
+				total += PlannedSamples(baseRun)
+			}
+			if total > 0 {
+				state.Title = fmt.Sprintf("running · %d of %d samples", completed, total)
+			} else {
+				state.Title = fmt.Sprintf("running · %d samples", completed)
+			}
+		} else if comp.Status.Reporting != nil && len(comp.Status.Reporting.CheckRunIDs) > 1 {
+			sha := ""
+			if comp.Spec.PullRequest != nil {
+				sha = comp.Spec.PullRequest.HeadSHA
+			}
+			if sha == "" && candRun != nil {
+				sha = candRun.Spec.Repo.Commit
+			}
+			if len(sha) > 7 {
+				sha = sha[:7]
+			}
+			if sha != "" {
+				state.Title = fmt.Sprintf("re-running for %s", sha)
+			} else {
+				state.Title = "running"
+			}
 		} else {
 			state.Title = "running"
 		}

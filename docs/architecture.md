@@ -139,7 +139,7 @@ The `Comparison` custom resource pairs two `Run` resources, evaluates statistica
   - `message`: Human-readable summary of verdicts, task notes, or candidate-task failure caps.
 
 **Comparison Re-scoring on Head Move**:
-When a pull request gets a new head commit, forge consumers create a candidate Run for the new commit and update `spec.candidate.run` (and `spec.pullRequest.headSHA`) on the existing Comparison. The Comparison controller detects the change against `status.observedCandidateRun` (or initial batch records), resets the scoring state (phase, verdict, summary, batches, completion time, extra samples applied, and per-task results), and re-scores against the new candidate Run while preserving `status.reporting.commentID` to edit the existing PR comment in place. Existing completed baseline Runs are reused without re-execution.
+When a pull request gets a new head commit, forge consumers create a candidate Run for the new commit and update `spec.candidate.run` (and `spec.pullRequest.headSHA`) on the existing Comparison. The Comparison controller detects the change against `status.observedCandidateRun` (or initial batch records), resets the scoring state (phase, verdict, summary, batches, completion time, extra samples applied, and per-task results), and re-scores against the new candidate Run while preserving `status.reporting.commentID` to edit the existing PR comment in place. Check runs are tracked per head commit in `status.reporting.checkRunIDs`, posting a new `in_progress` check run on each new head commit while leaving prior check runs intact. Existing completed baseline Runs are reused without re-execution.
 
 ### Webhook Service (`cmd/eval-runner-webhook`)
 

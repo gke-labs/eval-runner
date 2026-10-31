@@ -756,6 +756,63 @@ func pullRequestRepoRef(repo string) (forge.RepoRef, bool) {
 	return forge.ParseRepoURL(repo)
 }
 
+// migrateReportingCheckRunIDs ensures CheckRunIDs is populated from legacy CheckRunID if needed.
+func migrateReportingCheckRunIDs(reporting *v1alpha1.ComparisonReportingStatus, headSHA string) {
+	if reporting == nil {
+		return
+	}
+	if reporting.CheckRunIDs == nil {
+		reporting.CheckRunIDs = make(map[string]int64)
+	}
+	if reporting.CheckRunID != 0 && headSHA != "" && len(reporting.CheckRunIDs) == 0 {
+		reporting.CheckRunIDs[headSHA] = reporting.CheckRunID
+	}
+}
+
+func (r *ComparisonReconciler) getReporter(ctx context.Context, comp *v1alpha1.Comparison) (forge.Reporter, forge.RepoRef, error) {
+	if comp == nil || comp.Spec.PullRequest == nil {
+		return nil, forge.RepoRef{}, nil
+	}
+	repoRef, ok := pullRequestRepoRef(comp.Spec.PullRequest.Repository)
+	if !ok {
+		return nil, forge.RepoRef{}, &github.PermanentError{
+			StatusCode: 400,
+			Message:    fmt.Sprintf("invalid pullRequest.repository %q: expected owner/name", comp.Spec.PullRequest.Repository),
+		}
+	}
+	if r.ForgeRegistry == nil {
+		r.ForgeRegistry = forge.NewDefaultRegistry(forgegithub.New(), gitremote.New())
+	}
+	f := r.ForgeRegistry.ForRepo(repoRef)
+	if f == nil {
+		return nil, repoRef, nil
+	}
+	if ghForge, ok := f.(*forgegithub.Forge); ok {
+		client := ghForge.Client()
+		if client == nil || !client.HasCredentials() {
+			ghClient, err := r.getGitHubClient(ctx)
+			if err != nil {
+				return nil, repoRef, err
+			}
+			if ghClient == nil {
+				return nil, repoRef, nil
+			}
+			if hc, ok := ghClient.(*github.HTTPClient); ok {
+				if !hc.HasCredentials() {
+					return nil, repoRef, nil
+				}
+				f = forgegithub.New(forgegithub.WithClient(hc))
+			}
+		}
+	}
+	rep, ok := f.(forge.Reporter)
+	if !ok {
+		log.FromContext(ctx).Info("reporting disabled: forge does not implement Reporter", "kind", f.Kind())
+		return nil, repoRef, nil
+	}
+	return rep, repoRef, nil
+}
+
 // reportToGitHub handles PR comment and check run reporting via the forge Reporter interface.
 // Errors not matching github.PermanentError (5xx, token endpoint errors, rate limits, transport errors, or secret Get errors)
 // are treated as transient.
@@ -776,77 +833,22 @@ func (r *ComparisonReconciler) reportToGitHub(
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	repoRef, ok := pullRequestRepoRef(comp.Spec.PullRequest.Repository)
-	if !ok {
-		permErr := &github.PermanentError{
-			StatusCode: 400,
-			Message:    fmt.Sprintf("invalid pullRequest.repository %q: expected owner/name", comp.Spec.PullRequest.Repository),
-		}
-		if comp.Status.Reporting == nil {
-			comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
-		}
-		comp.Status.Reporting.Message = permErr.Error()
-		comp.Status.Reporting.NextAttemptAt = nil
-		return nil
-	}
-
-	if r.ForgeRegistry == nil {
-		r.ForgeRegistry = forge.NewDefaultRegistry(forgegithub.New(), gitremote.New())
-	}
-	f := r.ForgeRegistry.ForRepo(repoRef)
-	if f == nil {
-		if comp.Status.Reporting == nil {
-			comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
-		}
-		comp.Status.Reporting.Message = "disabled"
-		comp.Status.Reporting.NextAttemptAt = nil
-		return nil
-	}
-
-	// If using the github forge, verify client has credentials
-	if ghForge, ok := f.(*forgegithub.Forge); ok {
-		client := ghForge.Client()
-		if client == nil || !client.HasCredentials() {
-			ghClient, err := r.getGitHubClient(ctx)
-			if err != nil {
-				if github.IsPermanent(err) {
-					if comp.Status.Reporting == nil {
-						comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
-					}
-					comp.Status.Reporting.Message = err.Error()
-					comp.Status.Reporting.NextAttemptAt = nil
-					return nil
-				}
-				if !isTerminalComparisonPhase(comp.Status.Phase) {
-					return err
-				}
-				return r.handleTransientReportingError(comp, err)
+	rep, repoRef, err := r.getReporter(ctx, comp)
+	if err != nil {
+		if github.IsPermanent(err) {
+			if comp.Status.Reporting == nil {
+				comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
 			}
-			if ghClient == nil {
-				if comp.Status.Reporting == nil {
-					comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
-				}
-				comp.Status.Reporting.Message = "disabled"
-				comp.Status.Reporting.NextAttemptAt = nil
-				return nil
-			}
-			if hc, ok := ghClient.(*github.HTTPClient); ok {
-				if !hc.HasCredentials() {
-					if comp.Status.Reporting == nil {
-						comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
-					}
-					comp.Status.Reporting.Message = "disabled"
-					comp.Status.Reporting.NextAttemptAt = nil
-					return nil
-				}
-				f = forgegithub.New(forgegithub.WithClient(hc))
-			}
+			comp.Status.Reporting.Message = err.Error()
+			comp.Status.Reporting.NextAttemptAt = nil
+			return nil
 		}
+		if !isTerminalComparisonPhase(comp.Status.Phase) {
+			return err
+		}
+		return r.handleTransientReportingError(comp, err)
 	}
-
-	rep, ok := f.(forge.Reporter)
-	if !ok {
-		log.FromContext(ctx).Info("reporting disabled: forge does not implement Reporter", "kind", f.Kind())
+	if rep == nil {
 		if comp.Status.Reporting == nil {
 			comp.Status.Reporting = &v1alpha1.ComparisonReportingStatus{}
 		}
@@ -859,11 +861,19 @@ func (r *ComparisonReconciler) reportToGitHub(
 	checkState := github.CheckRunStateForComparison(comp, baseRun, candRun, r.inconclusivePolicy(), r.uiBaseURL())
 	baseHash := github.HashContent(markdown, checkState)
 
+	headSHA := comp.Spec.PullRequest.HeadSHA
+	if headSHA == "" && candRun != nil {
+		headSHA = candRun.Spec.Repo.Commit
+	}
+
 	commentID := int64(0)
 	checkRunID := int64(0)
 	if comp.Status.Reporting != nil {
+		migrateReportingCheckRunIDs(comp.Status.Reporting, headSHA)
 		commentID = comp.Status.Reporting.CommentID
-		checkRunID = comp.Status.Reporting.CheckRunID
+		if comp.Status.Reporting.CheckRunIDs != nil && headSHA != "" {
+			checkRunID = comp.Status.Reporting.CheckRunIDs[headSHA]
+		}
 		if comp.Status.Reporting.LastPostedHash == baseHash && commentID != 0 {
 			// If not in a terminal phase, or if annotations have already been posted, short-circuit immediately.
 			if !isTerminalComparisonPhase(comp.Status.Phase) || comp.Status.Reporting.AnnotationsPosted {
@@ -905,16 +915,13 @@ func (r *ComparisonReconciler) reportToGitHub(
 	}
 	comp.Status.Reporting.CommentID = commentID
 
-	headSHA := comp.Spec.PullRequest.HeadSHA
-	if headSHA == "" && candRun != nil {
-		headSHA = candRun.Spec.Repo.Commit
-	}
 	if headSHA != "" {
 		st := forge.Status{
 			Status:      checkState.Status,
 			Conclusion:  checkState.Conclusion,
 			State:       checkState.Conclusion,
 			Context:     checkState.Name,
+			Title:       checkState.Title,
 			Description: checkState.Summary,
 			Text:        checkState.Text,
 			TargetURL:   checkState.DetailsURL,
@@ -926,6 +933,9 @@ func (r *ComparisonReconciler) reportToGitHub(
 		if err != nil {
 			if errors.Is(err, forgegithub.ErrCheckRunsUnavailable) {
 				comp.Status.Reporting.Message = "check runs unavailable with token auth; comment posted"
+				if comp.Status.Reporting.CheckRunIDs != nil {
+					delete(comp.Status.Reporting.CheckRunIDs, headSHA)
+				}
 				comp.Status.Reporting.CheckRunID = 0
 			} else if github.IsPermanent(err) {
 				comp.Status.Reporting.Message = err.Error()
@@ -938,6 +948,10 @@ func (r *ComparisonReconciler) reportToGitHub(
 				return r.handleTransientReportingError(comp, err)
 			}
 		} else {
+			if comp.Status.Reporting.CheckRunIDs == nil {
+				comp.Status.Reporting.CheckRunIDs = make(map[string]int64)
+			}
+			comp.Status.Reporting.CheckRunIDs[headSHA] = newCheckRunID
 			comp.Status.Reporting.CheckRunID = newCheckRunID
 			comp.Status.Reporting.Message = ""
 			if isTerminalComparisonPhase(comp.Status.Phase) {
@@ -1852,6 +1866,67 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			msg = "waiting for candidate run"
 		}
 
+		var oldCandRunObj v1alpha1.Run
+		oldHeadSHA := ""
+		if observedCandidate != "" {
+			if err := r.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: observedCandidate}, &oldCandRunObj); err == nil {
+				oldHeadSHA = oldCandRunObj.Spec.Repo.Commit
+			} else if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("failed looking up observed candidate run %s: %w", observedCandidate, err)
+			}
+		}
+
+		newHeadSHA := ""
+		if comp.Spec.PullRequest != nil {
+			newHeadSHA = comp.Spec.PullRequest.HeadSHA
+		}
+		if newHeadSHA == "" && cRun != nil {
+			newHeadSHA = cRun.Spec.Repo.Commit
+		}
+
+		headChanged := false
+		if oldHeadSHA != "" && newHeadSHA != "" && oldHeadSHA != newHeadSHA {
+			headChanged = true
+		} else if newHeadSHA != "" && comp.Status.Reporting != nil && len(comp.Status.Reporting.CheckRunIDs) > 0 && comp.Status.Reporting.CheckRunIDs[newHeadSHA] == 0 {
+			headChanged = true
+		} else if candChanged && newHeadSHA != "" && oldHeadSHA == "" {
+			headChanged = true
+		}
+		if comp.Status.Reporting != nil && comp.Status.Reporting.CheckRunIDs != nil && comp.Status.Reporting.CheckRunIDs[newHeadSHA] != 0 {
+			headChanged = false
+		}
+
+		var newCheckRunID int64
+		if headChanged && comp.Spec.PullRequest != nil && newHeadSHA != "" {
+			repCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			rep, repoRef, repErr := r.getReporter(repCtx, &comp)
+			if repErr == nil && rep != nil {
+				sha7 := newHeadSHA
+				if len(sha7) > 7 {
+					sha7 = sha7[:7]
+				}
+				title := fmt.Sprintf("re-running for %s", sha7)
+				st := forge.Status{
+					Status:      "in_progress",
+					State:       "in_progress",
+					Context:     github.CheckRunName,
+					Title:       title,
+					Description: title,
+					Text:        title,
+					TargetURL:   github.CheckRunDetailsURL(&comp, r.uiBaseURL(), bRun, cRun),
+				}
+				id, err := rep.SetStatus(repCtx, repoRef, newHeadSHA, st)
+				if err == nil {
+					newCheckRunID = id
+				} else if errors.Is(err, forgegithub.ErrCheckRunsUnavailable) {
+					// Check runs unavailable with token auth
+				} else {
+					logger.Error(err, "failed creating check run on new head", "headSHA", newHeadSHA)
+				}
+			}
+			cancel()
+		}
+
 		if _, err := r.updateComparisonStatus(ctx, &comp, bRun, cRun, func(status *v1alpha1.ComparisonStatus) {
 			// Reset all scoring state for the new head commit while preserving reporting.commentID to edit in place.
 			status.Phase = v1alpha1.ComparisonPhaseRunning
@@ -1869,7 +1944,19 @@ func (r *ComparisonReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			status.Message = msg
 			status.ObservedCandidateRun = comp.Spec.Candidate.Run
 			status.ObservedBaselineRun = comp.Spec.Baseline.Run
-			if status.Reporting != nil {
+			if status.Reporting != nil || newCheckRunID != 0 {
+				if status.Reporting == nil {
+					status.Reporting = &v1alpha1.ComparisonReportingStatus{}
+				}
+				migrateReportingCheckRunIDs(status.Reporting, oldHeadSHA)
+				if newCheckRunID != 0 {
+					status.Reporting.CheckRunIDs[newHeadSHA] = newCheckRunID
+					status.Reporting.CheckRunID = newCheckRunID
+				} else if headChanged {
+					status.Reporting.CheckRunID = 0
+				}
+				status.Reporting.AnnotationsPosted = false
+				status.Reporting.AnnotationsHash = ""
 				status.Reporting.LastPostedHash = ""
 			}
 		}); err != nil {

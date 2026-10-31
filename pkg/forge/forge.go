@@ -136,6 +136,7 @@ type Status struct {
 	Conclusion  string               `json:"conclusion,omitempty"`
 	State       string               `json:"state,omitempty"`
 	Context     string               `json:"context"`
+	Title       string               `json:"title,omitempty"`
 	Description string               `json:"description"`
 	Text        string               `json:"text,omitempty"`
 	TargetURL   string               `json:"target_url"`

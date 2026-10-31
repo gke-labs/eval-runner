@@ -421,7 +421,7 @@ spec:
 | `summaryPath` | `string` | Storage path or URI where the complete paired table was stored (`comparisons/<name>.json`). |
 | `message` | `string` | Human-readable explanation of the aggregate verdict or failure. In addition to the aggregate verdict summary, the controller emits policy notes: `missing batch run: <ids>` (or `runs`, batch Runs not found), `failed batch run: <ids>` (or `runs`, batch Runs that failed or whose task logs did not match the artifact sink's commit prefix), `candidate task failed: <ids>` (caps UNCHANGED or IMPROVED verdicts to INCONCLUSIVE with $P(\text{improvement}) \le 0.50$), `failed in both runs: <ids>` (tasks that failed in both runs), `tasks not executed: <ids>` (tasks in scope executed by neither run), `tasks not executed by both runs: <ids>` (tasks executed by only one run), `skipped (not planned): <ids>` (tasks discovered in the manifest but not planned by either run), and `skipped (unmatched): <ids>` (tasks whose declared paths did not match PR changed files when affinityMode=prune). |
 | `conditions` | `[]metav1.Condition` | Standard Kubernetes condition list. Includes conditions `ExtraSamples` (reasons: `ArtifactPrefixMismatch`, `ArtifactNotFound`, `NoEligibleTasks`, `Scheduled`) and `ArtifactsReadable` (reasons: `PrefixMismatch`, `NotFound`). |
-| `reporting` | `*ComparisonReportingStatus` | GitHub PR comment and Check Run reporting state (`commentID`, `checkRunID`, `lastPostedHash`, `message`). |
+| `reporting` | `*ComparisonReportingStatus` | GitHub PR comment and Check Run reporting state (`commentID`, `checkRunIDs`, `checkRunID`, `lastPostedHash`, `message`). |
 
 ### TaskTokens (`status.tasks[].tokens`)
 
@@ -471,7 +471,8 @@ Inspect log provider-specific totals are dropped so that `total` is strictly and
 | Field | Type | Description |
 |---|---|---|
 | `commentID` | `int64` | GitHub PR comment ID updated in-place for this comparison. |
-| `checkRunID` | `int64` | GitHub check run ID created and updated for this comparison. |
+| `checkRunIDs` | `map[string]int64` | GitHub check run IDs keyed by commit SHA created and updated for this comparison. |
+| `checkRunID` | `int64` | Legacy GitHub check run ID created and updated for this comparison (deprecated). |
 | `lastPostedHash` | `string` | Idempotency SHA-256 hash across markdown comment body and check run state. |
 | `message` | `string` | Informational status message (e.g. `"disabled"`, permanent error message). |
 | `attempts` | `int` | Number of times the controller has attempted to report to GitHub for the current update. |

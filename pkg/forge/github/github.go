@@ -604,9 +604,13 @@ func (f *Forge) SetStatus(ctx context.Context, ref forge.RepoRef, sha string, st
 		return 0, forge.ErrUnauthorized
 	}
 
+	title := status.Title
+	if title == "" {
+		title = status.Description
+	}
 	checkState := gh.CheckRunState{
 		Name:        status.Context,
-		Title:       status.Description,
+		Title:       title,
 		Summary:     status.Description,
 		Text:        status.Text,
 		DetailsURL:  status.TargetURL,
