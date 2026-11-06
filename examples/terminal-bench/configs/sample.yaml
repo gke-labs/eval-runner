@@ -1,0 +1,39 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Adapted from kubernetes-sigs/agent-sandbox examples/harbor-terminal-bench (Apache-2.0)
+#
+# Smoke run: the oracle agent (applies the reference solution) on the 10-task
+# Terminal-Bench 2.0 sample. Every trial must score 1.0; the run proves the
+# cluster, the images, DNS egress and the exec path, not a model.
+#
+#   harbor run -c examples/terminal-bench/configs/sample.yaml
+#
+# Override anything on the command line, e.g. --ek namespace=other -n 2.
+jobs_dir: jobs/harbor-terminal-bench
+n_attempts: 1
+n_concurrent_trials: 4
+environment:
+  import_path: k8s_agent_sandbox_harbor:AgentSandboxEnvironment
+  delete: true
+  kwargs:
+    namespace: eval-runner-sandbox
+    ready_timeout_s: "600" # first pull of each image on a fresh node
+    # Optional Artifact Registry image mirror:
+    # image_mirror: us-central1-docker.pkg.dev/<PROJECT_ID>/terminal-bench-mirror
+agents:
+  - name: oracle
+datasets:
+  - name: terminal-bench-sample
+    version: "2.0"
