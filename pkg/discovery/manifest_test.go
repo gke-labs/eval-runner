@@ -16,6 +16,7 @@ package discovery
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -475,16 +476,15 @@ func assertTerminalBenchTask(t *testing.T, task *v1alpha1.ManifestTask, taskName
 	if task.ID != expectedID {
 		t.Errorf("task ID = %q, want %q", task.ID, expectedID)
 	}
-	expectedImage := "ghcr.io/laude-institute/terminal-bench/" + taskName + ":2.0"
+	expectedImage := "alexgshaw/" + taskName + ":20251031"
 	if task.Image != expectedImage {
 		t.Errorf("task %s Image = %q, want %q", task.ID, task.Image, expectedImage)
 	}
-	if task.TimeoutSeconds == nil || *task.TimeoutSeconds <= 0 {
-		t.Errorf("task %s expected positive timeoutSeconds, got %v", task.ID, task.TimeoutSeconds)
+	if task.TimeoutSeconds == nil || *task.TimeoutSeconds < 1 || *task.TimeoutSeconds > 7200 {
+		t.Errorf("task %s expected timeoutSeconds in [1, 7200], got %v", task.ID, task.TimeoutSeconds)
 	}
-	expectedCommand := []string{"bash", "examples/terminal-bench/run-task.sh", taskName, "oracle"}
-	if strings.Join(task.Command, " ") != strings.Join(expectedCommand, " ") {
-		t.Errorf("task %s Command = %v, want %v", task.ID, task.Command, expectedCommand)
+	if len(task.Command) != 5 || task.Command[0] != "bash" || task.Command[1] != "examples/terminal-bench/run-task.sh" || task.Command[2] != taskName || task.Command[3] != "oracle" || task.Command[4] == "" {
+		t.Errorf("task %s Command = %v, want [bash examples/terminal-bench/run-task.sh %s oracle <workdir>]", task.ID, task.Command, taskName)
 	}
 	if len(task.Resources) != 1 || task.Resources[0].Type != v1alpha1.ResourceTypeSandbox {
 		t.Errorf("task %s Resources = %v, want [{Type: 'sandbox'}]", task.ID, task.Resources)
@@ -514,9 +514,13 @@ func parseAndValidateScriptOutput(t *testing.T, scriptRelativePath string) *v1al
 }
 
 func TestTerminalBenchManifest(t *testing.T) {
+	if os.Getenv("OFFLINE") != "" || os.Getenv("SKIP_NETWORK_TESTS") != "" {
+		t.Skip("skipping manifest test requiring network in offline mode")
+	}
+
 	manifest := parseAndValidateScriptOutput(t, "../../examples/terminal-bench/.evals/list")
-	if len(manifest.Tasks) != 10 {
-		t.Fatalf("expected 10 tasks in terminal-bench manifest, got %d", len(manifest.Tasks))
+	if len(manifest.Tasks) != 89 {
+		t.Fatalf("expected 89 tasks in terminal-bench manifest, got %d", len(manifest.Tasks))
 	}
 	for _, task := range manifest.Tasks {
 		taskName := strings.TrimPrefix(task.ID, "terminal-bench/")
@@ -524,14 +528,19 @@ func TestTerminalBenchManifest(t *testing.T) {
 	}
 
 	rootManifest := parseAndValidateScriptOutput(t, "../../.evals/list")
+	foundTerminalBenchCount := 0
 	for i := range rootManifest.Tasks {
-		if rootManifest.Tasks[i].ID == "terminal-bench/regex-log" {
-			assertTerminalBenchTask(t, &rootManifest.Tasks[i], "regex-log")
-			if len(rootManifest.Tasks[i].Paths) != 1 || rootManifest.Tasks[i].Paths[0] != "examples/terminal-bench/**" {
-				t.Errorf("root regex-log Paths = %v, want ['examples/terminal-bench/**']", rootManifest.Tasks[i].Paths)
+		task := &rootManifest.Tasks[i]
+		if strings.HasPrefix(task.ID, "terminal-bench/") {
+			foundTerminalBenchCount++
+			taskName := strings.TrimPrefix(task.ID, "terminal-bench/")
+			assertTerminalBenchTask(t, task, taskName)
+			if len(task.Paths) != 1 || task.Paths[0] != "examples/terminal-bench/**" {
+				t.Errorf("root %s Paths = %v, want ['examples/terminal-bench/**']", task.ID, task.Paths)
 			}
-			return
 		}
 	}
-	t.Fatalf("terminal-bench/regex-log not found in root .evals/list")
+	if foundTerminalBenchCount == 0 {
+		t.Fatalf("no terminal-bench tasks found in root .evals/list")
+	}
 }

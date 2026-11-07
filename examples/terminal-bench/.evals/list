@@ -15,46 +15,124 @@
 
 set -e
 
-script_directory="$(cd "$(dirname "$0")" && pwd)"
-tasks_json_file=""
+unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 
-if [ -f "${script_directory}/../tasks.json" ]; then
-  tasks_json_file="${script_directory}/../tasks.json"
-elif [ -f "${script_directory}/tasks.json" ]; then
-  tasks_json_file="${script_directory}/tasks.json"
-elif [ -f "examples/terminal-bench/tasks.json" ]; then
-  tasks_json_file="examples/terminal-bench/tasks.json"
-elif [ -f "tasks.json" ]; then
-  tasks_json_file="tasks.json"
+if [ -z "${PINNED_COMMIT:-}" ]; then
+  script_directory="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "${script_directory}/../version.sh" ]; then
+    # shellcheck source=/dev/null
+    . "${script_directory}/../version.sh"
+  elif [ -f "${script_directory}/version.sh" ]; then
+    # shellcheck source=/dev/null
+    . "${script_directory}/version.sh"
+  elif [ -f "examples/terminal-bench/version.sh" ]; then
+    # shellcheck source=/dev/null
+    . "examples/terminal-bench/version.sh"
+  fi
 fi
 
-if [ -z "${tasks_json_file}" ] || [ ! -f "${tasks_json_file}" ]; then
-  echo '{"tasks": []}'
-  exit 0
+if [ -z "${PINNED_COMMIT:-}" ]; then
+  echo "PINNED_COMMIT not set: version.sh not found" >&2
+  exit 1
 fi
 
-awk '
-  BEGIN { count = 0 }
-  /"name"[[:space:]]*:/ {
-    split($0, a, "\"")
-    task_name = a[4]
+REPOSITORY_URL="https://github.com/laude-institute/terminal-bench-2.git"
+
+temporary_directory="$(mktemp -d)"
+trap 'rm -rf "${temporary_directory}"' EXIT
+
+checkout_directory="${temporary_directory}/checkout"
+mkdir -p "${checkout_directory}"
+(
+  cd "${checkout_directory}"
+  git init -q
+  git remote add origin "${REPOSITORY_URL}"
+  git fetch -q --depth 1 origin "${PINNED_COMMIT}"
+  git checkout -q FETCH_HEAD
+)
+
+find "${checkout_directory}" -maxdepth 1 -mindepth 1 -type d ! -name '.git' -exec basename {} \; | sort | awk -v commit="${PINNED_COMMIT}" -v checkout="${checkout_directory}" '
+  BEGIN {
+    count = 0
+    has_error = 0
   }
-  /"agentTimeoutSeconds"[[:space:]]*:/ {
-    split($0, a, ":")
-    gsub(/[^0-9]/, "", a[2])
-    agent_timeout = a[2] + 0
-  }
-  /"verifierTimeoutSeconds"[[:space:]]*:/ {
-    split($0, a, ":")
-    gsub(/[^0-9]/, "", a[2])
-    verifier_timeout = a[2] + 0
-    timeout = agent_timeout + verifier_timeout
+  {
+    task_name = $1
+    task_path = checkout "/" task_name
+    toml_file = task_path "/task.toml"
+    dockerfile = task_path "/environment/Dockerfile"
+
+    section = ""
+    agent_timeout = 900
+    verifier_timeout = 900
+    docker_image = ""
+    cpus = 1
+    memory = "2G"
+
+    while ((getline line < toml_file) > 0) {
+      if (line ~ /^\[.*\]/) {
+        sub(/^\[/, "", line)
+        sub(/\].*/, "", line)
+        section = line
+        continue
+      }
+      if (section == "agent" && line ~ /timeout_sec/) {
+        split(line, parts, "=")
+        gsub(/[^0-9.]/, "", parts[2])
+        agent_timeout = parts[2] + 0
+      }
+      if (section == "verifier" && line ~ /timeout_sec/) {
+        split(line, parts, "=")
+        gsub(/[^0-9.]/, "", parts[2])
+        verifier_timeout = parts[2] + 0
+      }
+      if (section == "environment" && line ~ /docker_image/) {
+        split(line, parts, "\"")
+        docker_image = parts[2]
+      }
+      if (section == "environment" && line ~ /^[[:space:]]*cpus[[:space:]]*=/) {
+        split(line, parts, "=")
+        gsub(/[^0-9]/, "", parts[2])
+        cpus = parts[2] + 0
+      }
+      if (section == "environment" && line ~ /^[[:space:]]*memory[[:space:]]*=/) {
+        split(line, parts, "\"")
+        memory = parts[2]
+      }
+    }
+    close(toml_file)
+
+    if (docker_image == "") {
+      printf "task %s has no docker_image in task.toml\n", task_name > "/dev/stderr"
+      has_error = 1
+      exit 1
+    }
+
+    workdir = "/app"
+    while ((getline line < dockerfile) > 0) {
+      if (line ~ /^WORKDIR/) {
+        split(line, parts)
+        workdir = parts[2]
+      }
+    }
+    close(dockerfile)
+
+    timeout = int(agent_timeout + verifier_timeout)
+    if (timeout > 7200) timeout = 7200
     if (timeout <= 0) timeout = 1800
+
     names[count] = task_name
+    images[count] = docker_image
+    workdirs[count] = workdir
     timeouts[count] = timeout
+    cpus_list[count] = cpus
+    memory_list[count] = memory
     count++
   }
   END {
+    if (has_error) {
+      exit 1
+    }
     print "{"
     print "  \"tasks\": ["
     for (i = 0; i < count; i++) {
@@ -62,13 +140,17 @@ awk '
       print "    {"
       printf "      \"id\": \"terminal-bench/%s\",\n", names[i]
       printf "      \"spec\": \"terminal-bench/%s\",\n", names[i]
-      printf "      \"image\": \"ghcr.io/laude-institute/terminal-bench/%s:2.0\",\n", names[i]
-      printf "      \"command\": [\"bash\", \"examples/terminal-bench/run-task.sh\", \"%s\", \"oracle\"],\n", names[i]
+      printf "      \"image\": \"%s\",\n", images[i]
+      printf "      \"command\": [\"bash\", \"examples/terminal-bench/run-task.sh\", \"%s\", \"oracle\", \"%s\"],\n", names[i], workdirs[i]
       printf "      \"timeoutSeconds\": %d,\n", timeouts[i]
-      print  "      \"resources\": [{\"type\": \"sandbox\"}]"
+      print  "      \"resources\": [{\"type\": \"sandbox\"}],"
+      print  "      \"metadata\": {"
+      printf "        \"cpus\": %d,\n", cpus_list[i]
+      printf "        \"memory\": \"%s\"\n", memory_list[i]
+      print  "      }"
       print "    }" comma
     }
     print "  ]"
     print "}"
   }
-' "${tasks_json_file}"
+'

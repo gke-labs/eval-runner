@@ -34,24 +34,14 @@ func runScriptInEnvironment(t *testing.T, taskName string, testScriptBody string
 		t.Fatalf("failed to create working directory: %v", err)
 	}
 
-	sampleDirectory := filepath.Join(temporaryDirectory, "sample", taskName)
-	solutionDirectory := filepath.Join(sampleDirectory, "solution")
-	testsDirectory := filepath.Join(sampleDirectory, "tests")
+	taskDirectory := filepath.Join(temporaryDirectory, taskName)
+	solutionDirectory := filepath.Join(taskDirectory, "solution")
+	testsDirectory := filepath.Join(taskDirectory, "tests")
 	if err := os.MkdirAll(solutionDirectory, 0755); err != nil {
 		t.Fatalf("failed to create solution directory: %v", err)
 	}
 	if err := os.MkdirAll(testsDirectory, 0755); err != nil {
 		t.Fatalf("failed to create tests directory: %v", err)
-	}
-
-	tasksDirectory := filepath.Join(temporaryDirectory, "examples", "terminal-bench")
-	if err := os.MkdirAll(tasksDirectory, 0755); err != nil {
-		t.Fatalf("failed to create examples/terminal-bench directory: %v", err)
-	}
-
-	tasksJSON := `{"commit":"fake-commit","tasks":[{"name":"` + taskName + `","workdir":"` + workingDirectory + `","agentTimeoutSeconds":900,"verifierTimeoutSeconds":900}]}`
-	if err := os.WriteFile(filepath.Join(tasksDirectory, "tasks.json"), []byte(tasksJSON), 0644); err != nil {
-		t.Fatalf("failed to write tasks.json: %v", err)
 	}
 
 	solveScript := "#!/bin/bash\necho 'running solution'\n"
@@ -73,11 +63,11 @@ func runScriptInEnvironment(t *testing.T, taskName string, testScriptBody string
 		t.Fatalf("failed to resolve run-task.sh path: %v", err)
 	}
 
-	command := exec.Command("bash", runTaskScript, taskName, "oracle")
+	command := exec.Command("bash", runTaskScript, taskName, "oracle", workingDirectory)
 	command.Dir = temporaryDirectory
 	command.Env = append(
 		os.Environ(),
-		"SAMPLE_DIRECTORY="+temporaryDirectory,
+		"TASK_DIRECTORY="+temporaryDirectory,
 		"LOGS_DIRECTORY="+logsDirectory,
 		"OUT_DIRECTORY="+outputDirectory,
 		"SOLUTION_DIRECTORY="+targetSolutionDirectory,
@@ -157,6 +147,23 @@ func TestRunTask(t *testing.T) {
 			wantScore:       0.0,
 			wantMessagePart: "failed with color",
 		},
+		{
+			name: "reward.json preferred over reward.txt",
+			testScript: "#!/bin/bash\n" +
+				"mkdir -p \"${LOGS_DIRECTORY}/verifier\"\n" +
+				"echo 0 > \"${LOGS_DIRECTORY}/verifier/reward.txt\"\n" +
+				"echo '{\"reward\": 1.0}' > \"${LOGS_DIRECTORY}/verifier/reward.json\"\n",
+			wantPassed: true,
+			wantScore:  1.0,
+		},
+		{
+			name: "reward.json multi-metric dict parses reward key",
+			testScript: "#!/bin/bash\n" +
+				"mkdir -p \"${LOGS_DIRECTORY}/verifier\"\n" +
+				"echo '{\"accuracy\": 0.5, \"reward\": 1}' > \"${LOGS_DIRECTORY}/verifier/reward.json\"\n",
+			wantPassed: true,
+			wantScore:  1.0,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -184,15 +191,6 @@ func TestRunTask(t *testing.T) {
 
 func TestRunTask_FetchFailureNoTools(t *testing.T) {
 	temporaryDirectory := t.TempDir()
-	tasksDirectory := filepath.Join(temporaryDirectory, "examples", "terminal-bench")
-	if err := os.MkdirAll(tasksDirectory, 0755); err != nil {
-		t.Fatalf("failed to create examples/terminal-bench directory: %v", err)
-	}
-
-	tasksJSON := `{"commit":"fake-commit","tasks":[{"name":"sample-task","workdir":"/app","agentTimeoutSeconds":900,"verifierTimeoutSeconds":900}]}`
-	if err := os.WriteFile(filepath.Join(tasksDirectory, "tasks.json"), []byte(tasksJSON), 0644); err != nil {
-		t.Fatalf("failed to write tasks.json: %v", err)
-	}
 
 	restrictedBinDirectory := filepath.Join(temporaryDirectory, "bin")
 	if err := os.MkdirAll(restrictedBinDirectory, 0755); err != nil {
@@ -218,10 +216,11 @@ func TestRunTask_FetchFailureNoTools(t *testing.T) {
 		t.Fatalf("failed to resolve run-task.sh path: %v", err)
 	}
 
-	command := exec.Command(filepath.Join(restrictedBinDirectory, "bash"), runTaskScript, "sample-task", "oracle")
+	command := exec.Command(filepath.Join(restrictedBinDirectory, "bash"), runTaskScript, "sample-task", "oracle", "/app")
 	command.Dir = temporaryDirectory
 	command.Env = []string{
 		"PATH=" + restrictedBinDirectory,
+		"PINNED_COMMIT=fake-commit",
 		"LOGS_DIRECTORY=" + logsDirectory,
 		"OUT_DIRECTORY=" + outputDirectory,
 		"SOLUTION_DIRECTORY=" + targetSolutionDirectory,
@@ -251,7 +250,66 @@ func TestRunTask_FetchFailureNoTools(t *testing.T) {
 	if sample.Passed == nil || *sample.Passed {
 		t.Errorf("expected passed: false, got %v", sample.Passed)
 	}
-	if !strings.Contains(sample.Message, "failed to fetch sample repository") {
-		t.Errorf("expected message to mention 'failed to fetch sample repository', got %q", sample.Message)
+	if !strings.Contains(sample.Message, "failed to fetch repository") {
+		t.Errorf("expected message to mention 'failed to fetch repository', got %q", sample.Message)
+	}
+}
+
+func TestRunTask_PinnedCommitMissingFails(t *testing.T) {
+	temporaryDirectory := t.TempDir()
+	logsDirectory := filepath.Join(temporaryDirectory, "logs")
+	outputDirectory := filepath.Join(temporaryDirectory, "out")
+	targetSolutionDirectory := filepath.Join(temporaryDirectory, "solution")
+	targetTestsDirectory := filepath.Join(temporaryDirectory, "tests")
+
+	// Copy run-task.sh to temporaryDirectory without version.sh so PINNED_COMMIT cannot be resolved
+	runTaskSourcePath, err := filepath.Abs("run-task.sh")
+	if err != nil {
+		t.Fatalf("failed to resolve run-task.sh path: %v", err)
+	}
+	runTaskScript := filepath.Join(temporaryDirectory, "run-task.sh")
+	scriptContent, err := os.ReadFile(runTaskSourcePath)
+	if err != nil {
+		t.Fatalf("failed to read run-task.sh: %v", err)
+	}
+	if err := os.WriteFile(runTaskScript, scriptContent, 0755); err != nil {
+		t.Fatalf("failed to copy run-task.sh: %v", err)
+	}
+
+	command := exec.Command("bash", runTaskScript, "sample-task", "oracle", "/app")
+	command.Dir = temporaryDirectory
+	command.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LOGS_DIRECTORY=" + logsDirectory,
+		"OUT_DIRECTORY=" + outputDirectory,
+		"SOLUTION_DIRECTORY=" + targetSolutionDirectory,
+		"TESTS_DIRECTORY=" + targetTestsDirectory,
+	}
+
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run-task.sh exited with non-zero status: %v\noutput: %s", err, string(output))
+	}
+
+	resultsPath := filepath.Join(outputDirectory, "results.json")
+	resultsBytes, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatalf("expected results.json to exist, but read failed: %v", err)
+	}
+
+	var results artifacts.ResultsFile
+	if err := json.Unmarshal(resultsBytes, &results); err != nil {
+		t.Fatalf("failed to parse results.json: %v\ncontent: %s", err, string(resultsBytes))
+	}
+
+	if len(results.Samples) != 1 {
+		t.Fatalf("expected 1 sample in results.json, got %d", len(results.Samples))
+	}
+	sample := results.Samples[0]
+	if sample.Passed == nil || *sample.Passed {
+		t.Errorf("expected passed: false, got %v", sample.Passed)
+	}
+	if !strings.Contains(sample.Message, "PINNED_COMMIT not set: version.sh not found") {
+		t.Errorf("expected message to mention 'PINNED_COMMIT not set: version.sh not found', got %q", sample.Message)
 	}
 }
