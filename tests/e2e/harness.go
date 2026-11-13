@@ -116,6 +116,7 @@ func (h *Harness) DeployEvalRunner() {
 		"--set", "webhookRepositories=gke-labs/eval-runner",
 		"--set", "pollProgressInterval=2s",
 		"--set", "allowedCloneHosts=github.com,git-server.eval-runner-sandbox.svc",
+		"--set", "sandboxPortalPolicy=*",
 	)
 
 	// Apply Secret for eval-runner-webhook HMAC signature verification

@@ -659,6 +659,20 @@ func TestResolveConfig_UIBaseURL(t *testing.T) {
 	}
 }
 
+func TestResolveConfig_SandboxPortalPolicy(t *testing.T) {
+	if def := DefaultClusterConfig().SandboxPortalPolicy; def != "" {
+		t.Errorf("expected default SandboxPortalPolicy empty, got %q", def)
+	}
+	cm := &corev1.ConfigMap{Data: map[string]string{ConfigMapKeySandboxPortalPolicy: "*"}}
+	if cfg, err := ResolveConfig(cm, RawFlags{}); err != nil || cfg.SandboxPortalPolicy != "*" {
+		t.Errorf("expected SandboxPortalPolicy '*', got %q (err: %v)", cfg.SandboxPortalPolicy, err)
+	}
+	cmNone := &corev1.ConfigMap{Data: map[string]string{ConfigMapKeySandboxPortalPolicy: "none"}}
+	if cfg, err := ResolveConfig(cmNone, RawFlags{}); err != nil || cfg.SandboxPortalPolicy != "" {
+		t.Errorf("expected empty SandboxPortalPolicy for 'none', got %q (err: %v)", cfg.SandboxPortalPolicy, err)
+	}
+}
+
 func TestResolveConfig_InconclusivePolicy(t *testing.T) {
 	// 1. Built-in default is "neutral"
 	defCfg := DefaultClusterConfig()
@@ -1053,6 +1067,7 @@ func TestUnknownConfigMapKeys(t *testing.T) {
 			ConfigMapKeyExecutionDeadline:                   "30m",
 			ConfigMapKeyMaxParallelTasks:                    "4",
 			ConfigMapKeyModelSecret:                         "sec",
+			ConfigMapKeySandboxPortalPolicy:                 "*",
 			ConfigMapKeySandboxdImage:                       "img:tag",
 			ConfigMapKeyTaskGracePeriod:                     "30s",
 			ConfigMapKeyGitHubTokenSecret:                   "gh-token",
@@ -1257,17 +1272,18 @@ func TestResolveConfig_EmptyValueSemantics(t *testing.T) {
 				Name:      DefaultConfigMapName,
 			},
 			Data: map[string]string{
-				ConfigMapKeyArtifactBucket:    "",
-				ConfigMapKeyArtifactDir:       "",
-				ConfigMapKeyDiscoveryDeadline: "",
-				ConfigMapKeyExecutionDeadline: "",
-				ConfigMapKeyMaxParallelTasks:  "",
-				ConfigMapKeyModelSecret:       "",
-				ConfigMapKeySandboxdImage:     "",
-				ConfigMapKeyTaskGracePeriod:   "",
-				ConfigMapKeyGitHubTokenSecret: "",
-				ConfigMapKeyGitHubAppSecret:   "",
-				ConfigMapKeyUIBaseURL:         "",
+				ConfigMapKeyArtifactBucket:      "",
+				ConfigMapKeyArtifactDir:         "",
+				ConfigMapKeyDiscoveryDeadline:   "",
+				ConfigMapKeyExecutionDeadline:   "",
+				ConfigMapKeyMaxParallelTasks:    "",
+				ConfigMapKeyModelSecret:         "",
+				ConfigMapKeySandboxPortalPolicy: "",
+				ConfigMapKeySandboxdImage:       "",
+				ConfigMapKeyTaskGracePeriod:     "",
+				ConfigMapKeyGitHubTokenSecret:   "",
+				ConfigMapKeyGitHubAppSecret:     "",
+				ConfigMapKeyUIBaseURL:           "",
 			},
 		}
 
@@ -1288,9 +1304,10 @@ func TestResolveConfig_EmptyValueSemantics(t *testing.T) {
 				Name:      DefaultConfigMapName,
 			},
 			Data: map[string]string{
-				ConfigMapKeyModelSecret:       "   ",
-				ConfigMapKeyGitHubTokenSecret: " \t ",
-				ConfigMapKeyDiscoveryDeadline: " ",
+				ConfigMapKeyModelSecret:         "   ",
+				ConfigMapKeySandboxPortalPolicy: "   ",
+				ConfigMapKeyGitHubTokenSecret:   " \t ",
+				ConfigMapKeyDiscoveryDeadline:   " ",
 			},
 		}
 
@@ -1300,6 +1317,9 @@ func TestResolveConfig_EmptyValueSemantics(t *testing.T) {
 		}
 		if cfg.ModelSecret != defaults.ModelSecret {
 			t.Errorf("expected ModelSecret default %q, got %q", defaults.ModelSecret, cfg.ModelSecret)
+		}
+		if cfg.SandboxPortalPolicy != defaults.SandboxPortalPolicy {
+			t.Errorf("expected SandboxPortalPolicy default %q, got %q", defaults.SandboxPortalPolicy, cfg.SandboxPortalPolicy)
 		}
 		if cfg.GitHubTokenSecret != defaults.GitHubTokenSecret {
 			t.Errorf("expected GitHubTokenSecret default %q, got %q", defaults.GitHubTokenSecret, cfg.GitHubTokenSecret)

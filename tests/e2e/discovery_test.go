@@ -484,16 +484,29 @@ spec:
 		// Assert that the regex-log sandbox pod's task container has limits cpu: 1, memory: 2G
 		sandboxName := discovery.TaskSandboxNameForRun(runName, "terminal-bench/regex-log")
 		var observedCPULimit, observedMemoryLimit string
+		var observedLabels, observedAnnotations map[string]string
+		var observedEnv, observedCheckoutEnv []corev1.EnvVar
+		var observedEnvFrom []corev1.EnvFromSource
 		podObservedDeadline := time.Now().Add(180 * time.Second)
 		for time.Now().Before(podObservedDeadline) {
 			out, err := exec.Command("kubectl", "get", "pod", sandboxName, "-n", "eval-runner-sandbox", "-o", "json").CombinedOutput()
 			if err == nil {
 				var pod corev1.Pod
 				if json.Unmarshal(out, &pod) == nil && len(pod.Spec.Containers) > 0 {
+					observedLabels = pod.Labels
+					observedAnnotations = pod.Annotations
+					for _, c := range pod.Spec.InitContainers {
+						if c.Name == discovery.RepoCheckoutInitContainerName {
+							observedCheckoutEnv = c.Env
+							break
+						}
+					}
 					for _, c := range pod.Spec.Containers {
 						if c.Name == discovery.TaskContainerName {
 							observedCPULimit = c.Resources.Limits.Cpu().String()
 							observedMemoryLimit = c.Resources.Limits.Memory().String()
+							observedEnv = c.Env
+							observedEnvFrom = c.EnvFrom
 							break
 						}
 					}
@@ -506,6 +519,45 @@ spec:
 		}
 		if observedCPULimit != "1" || observedMemoryLimit != "2G" {
 			t.Errorf("Expected regex-log sandbox pod task container limits cpu: 1, memory: 2G; got cpu: %s, memory: %s", observedCPULimit, observedMemoryLimit)
+		}
+		if observedLabels[discovery.LabelServicePortalIntercept] != "true" {
+			t.Errorf("Expected sandbox pod label %s=%q, got %q", discovery.LabelServicePortalIntercept, "true", observedLabels[discovery.LabelServicePortalIntercept])
+		}
+		if observedAnnotations[discovery.AnnotationServicePortalPolicy] != "*" {
+			t.Errorf("Expected sandbox pod annotation %s=%q, got %q", discovery.AnnotationServicePortalPolicy, "*", observedAnnotations[discovery.AnnotationServicePortalPolicy])
+		}
+		expectedIdentity := fmt.Sprintf("%s/%s", runName, "terminal-bench/regex-log")
+		if observedAnnotations[discovery.AnnotationServicePortalIdentity] != expectedIdentity {
+			t.Errorf("Expected sandbox pod annotation %s=%q, got %q", discovery.AnnotationServicePortalIdentity, expectedIdentity, observedAnnotations[discovery.AnnotationServicePortalIdentity])
+		}
+		if len(observedEnvFrom) != 0 {
+			t.Errorf("Expected no envFrom on sandbox pod task container, got: %v", observedEnvFrom)
+		}
+		actualEnv := make(map[string]string, len(observedEnv))
+		for _, envVar := range observedEnv {
+			actualEnv[envVar.Name] = envVar.Value
+		}
+		for envName, expectedValue := range map[string]string{
+			discovery.EnvGeminiAPIKey:     "placeholder",
+			discovery.EnvGoogleAPIKey:     "placeholder",
+			discovery.EnvRequestsCABundle: discovery.ServicePortalCACertPath,
+			discovery.EnvCurlCABundle:     discovery.ServicePortalCACertPath,
+			discovery.EnvGitSSLCAInfo:     discovery.ServicePortalCACertPath,
+			discovery.EnvPipCert:          discovery.ServicePortalCACertPath,
+			discovery.EnvNodeExtraCACerts: discovery.ServicePortalCACertPath,
+		} {
+			if actualValue, ok := actualEnv[envName]; !ok || actualValue != expectedValue {
+				t.Errorf("Expected env %s=%q, got %q (present=%v)", envName, expectedValue, actualValue, ok)
+			}
+		}
+		actualCheckoutEnv := make(map[string]string, len(observedCheckoutEnv))
+		for _, envVar := range observedCheckoutEnv {
+			actualCheckoutEnv[envVar.Name] = envVar.Value
+		}
+		for _, caEnv := range discovery.ServicePortalCAEnvVars() {
+			if actualValue, ok := actualCheckoutEnv[caEnv.Name]; !ok || actualValue != caEnv.Value {
+				t.Errorf("Expected init container env %s=%q, got %q (present=%v)", caEnv.Name, caEnv.Value, actualValue, ok)
+			}
 		}
 
 		// Wait for Run to complete

@@ -383,6 +383,62 @@ func TestBuildTaskSandbox_WithAndWithoutModelSecret(t *testing.T) {
 	if cWithSecret.EnvFrom[0].SecretRef == nil || cWithSecret.EnvFrom[0].SecretRef.Name != "gemini-credentials" {
 		t.Errorf("Expected SecretRef 'gemini-credentials', got: %+v", cWithSecret.EnvFrom[0].SecretRef)
 	}
+
+	// Case 3: With sandbox portal policy (suppresses model Secret, adds label and annotations, sets environment variables)
+	runWithRepo := run.DeepCopy()
+	runWithRepo.Spec.Repo.URL = "https://github.com/example/repo.git"
+	sbWithPortal := BuildTaskSandbox(runWithRepo, "docs/readme_comprehension", TaskSandboxConfig{
+		Namespace:           "eval-runner-sandbox",
+		SampleRunnerImage:   "sample-runner:e2e",
+		ModelSecret:         "gemini-credentials",
+		SandboxPortalPolicy: "*",
+		CloneRepo:           true,
+		AuthTokenDigest:     digest,
+	})
+
+	if sbWithPortal.Labels[LabelServicePortalIntercept] != "true" {
+		t.Errorf("Expected intercept label 'true', got %s", sbWithPortal.Labels[LabelServicePortalIntercept])
+	}
+	if sbWithPortal.Annotations[AnnotationServicePortalPolicy] != "*" {
+		t.Errorf("Expected policy annotation '*', got %s", sbWithPortal.Annotations[AnnotationServicePortalPolicy])
+	}
+	expectedIdentity := "test-run/docs/readme_comprehension"
+	if sbWithPortal.Annotations[AnnotationServicePortalIdentity] != expectedIdentity {
+		t.Errorf("Expected identity annotation %q, got %s", expectedIdentity, sbWithPortal.Annotations[AnnotationServicePortalIdentity])
+	}
+
+	cWithPortal := sbWithPortal.Spec.PodTemplate.Spec.Containers[0]
+	if len(cWithPortal.EnvFrom) != 0 {
+		t.Fatalf("Expected 0 EnvFrom sources when SandboxPortalPolicy is set, got %d", len(cWithPortal.EnvFrom))
+	}
+	actualEnv := make(map[string]string, len(cWithPortal.Env))
+	for _, envVar := range cWithPortal.Env {
+		actualEnv[envVar.Name] = envVar.Value
+	}
+	for envName, expectedValue := range map[string]string{
+		EnvGeminiAPIKey:     "placeholder",
+		EnvGoogleAPIKey:     "placeholder",
+		EnvRequestsCABundle: ServicePortalCACertPath,
+		EnvCurlCABundle:     ServicePortalCACertPath,
+		EnvGitSSLCAInfo:     ServicePortalCACertPath,
+		EnvPipCert:          ServicePortalCACertPath,
+		EnvNodeExtraCACerts: ServicePortalCACertPath,
+	} {
+		if actualValue, ok := actualEnv[envName]; !ok || actualValue != expectedValue {
+			t.Errorf("Expected env %s=%q, got %q (present=%v)", envName, expectedValue, actualValue, ok)
+		}
+	}
+
+	initCheckout := sbWithPortal.Spec.PodTemplate.Spec.InitContainers[1]
+	actualInitEnv := make(map[string]string, len(initCheckout.Env))
+	for _, envVar := range initCheckout.Env {
+		actualInitEnv[envVar.Name] = envVar.Value
+	}
+	for _, caEnv := range ServicePortalCAEnvVars() {
+		if actualInitEnv[caEnv.Name] != caEnv.Value {
+			t.Errorf("Expected init container env %s=%q, got %q", caEnv.Name, caEnv.Value, actualInitEnv[caEnv.Name])
+		}
+	}
 }
 
 func TestBuildTaskSandbox_EmptyAuthTokenPanics(t *testing.T) {

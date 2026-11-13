@@ -221,6 +221,9 @@ type RunReconciler struct {
 	// ModelSecret is the name of a Secret in SandboxNamespace containing model credentials.
 	ModelSecret string
 
+	// SandboxPortalPolicy is the policy binding opting task sandboxes into service-portals interception.
+	SandboxPortalPolicy string
+
 	// SampleRunnerImage is the image used for sample execution sandboxes.
 	SampleRunnerImage string
 
@@ -746,6 +749,12 @@ func (r *RunReconciler) modelSecret() string {
 	return r.ModelSecret
 }
 
+func (r *RunReconciler) sandboxPortalPolicy() string {
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
+	return r.SandboxPortalPolicy
+}
+
 func (r *RunReconciler) lookupModelPrice(model string) (ModelPrice, v1alpha1.CostSource, bool) {
 	r.cfgMu.RLock()
 	defer r.cfgMu.RUnlock()
@@ -772,6 +781,7 @@ func (r *RunReconciler) UpdateConfig(cfg ClusterConfig) {
 	r.MaxParallelTasks = cfg.MaxParallelTasks
 	r.PollProgressInterval = cfg.PollProgressInterval
 	r.ModelSecret = cfg.ModelSecret
+	r.SandboxPortalPolicy = cfg.SandboxPortalPolicy
 	r.ModelPrices = cfg.ModelPrices
 	r.ModelPriceSources = cfg.ModelPriceSources
 	r.ModelPricesDisabled = cfg.ModelPricesDisabled
@@ -2400,27 +2410,34 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 		}
 
 		if len(tasksToStart) > 0 {
-			reader := client.Reader(r.Client)
-			if r.APIReader != nil {
-				reader = r.APIReader
-			}
+			effSandboxPortalPolicy := r.sandboxPortalPolicy()
 			effModelSecret := r.modelSecret()
-			secretExists, err := CheckModelSecretExists(ctx, reader, r.sandboxNamespace(), effModelSecret)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to check model secret %s/%s: %w", r.sandboxNamespace(), effModelSecret, err)
+			secretExists := false
+			if effSandboxPortalPolicy == "" {
+				reader := client.Reader(r.Client)
+				if r.APIReader != nil {
+					reader = r.APIReader
+				}
+				var err error
+				secretExists, err = CheckModelSecretExists(ctx, reader, r.sandboxNamespace(), effModelSecret)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to check model secret %s/%s: %w", r.sandboxNamespace(), effModelSecret, err)
+				}
 			}
 
 			var started []string
 			failedTasks := make(map[string]string)
 			for _, taskID := range tasksToStart {
 				effectiveModelSecret := ""
-				if secretExists {
-					effectiveModelSecret = effModelSecret
-				} else if !IsMockModel(run.Spec.Model) {
-					msg := ModelCredentialsMissingMessage(r.sandboxNamespace(), effModelSecret)
-					logger.Info("Rejecting task launch due to missing model credentials", "task", taskID, "model", run.Spec.Model, "message", msg)
-					failedTasks[taskID] = msg
-					continue
+				if effSandboxPortalPolicy == "" {
+					if secretExists {
+						effectiveModelSecret = effModelSecret
+					} else if !IsMockModel(run.Spec.Model) {
+						msg := ModelCredentialsMissingMessage(r.sandboxNamespace(), effModelSecret)
+						logger.Info("Rejecting task launch due to missing model credentials", "task", taskID, "model", run.Spec.Model, "message", msg)
+						failedTasks[taskID] = msg
+						continue
+					}
 				}
 
 				sbName := discovery.TaskSandboxNameForRun(run.Name, taskID)
@@ -2456,18 +2473,19 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 				}
 
 				desiredSandbox := discovery.BuildTaskSandbox(run, taskID, discovery.TaskSandboxConfig{
-					Namespace:          r.sandboxNamespace(),
-					SampleRunnerImage:  r.sampleRunnerImage(),
-					Image:              taskImage,
-					ModelSecret:        effectiveModelSecret,
-					AuthTokenDigest:    discovery.AuthTokenDigest(token),
-					ServerCertSecret:   pki.ServerSecretName(sbName),
-					CAConfigMap:        pki.DefaultCAConfigMapName,
-					SandboxdImage:      r.sandboxdImage(),
-					CloneRepo:          isSandboxTask && run.Spec.Repo.URL != "",
-					StepTimeoutSeconds: int(r.executionStepTimeout().Seconds()),
-					SandboxTask:        isSandboxTask,
-					Limits:             taskLimits,
+					Namespace:           r.sandboxNamespace(),
+					SampleRunnerImage:   r.sampleRunnerImage(),
+					Image:               taskImage,
+					ModelSecret:         effectiveModelSecret,
+					SandboxPortalPolicy: effSandboxPortalPolicy,
+					AuthTokenDigest:     discovery.AuthTokenDigest(token),
+					ServerCertSecret:    pki.ServerSecretName(sbName),
+					CAConfigMap:         pki.DefaultCAConfigMapName,
+					SandboxdImage:       r.sandboxdImage(),
+					CloneRepo:           isSandboxTask && run.Spec.Repo.URL != "",
+					StepTimeoutSeconds:  int(r.executionStepTimeout().Seconds()),
+					SandboxTask:         isSandboxTask,
+					Limits:              taskLimits,
 				})
 				if err := r.Create(ctx, desiredSandbox); err != nil && !apierrors.IsAlreadyExists(err) {
 					logger.Error(err, "Failed to create task sandbox", "task", taskID)

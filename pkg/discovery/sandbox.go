@@ -17,6 +17,7 @@ package discovery
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -84,7 +85,39 @@ const (
 
 	// AnnotationTaskID tracks the original task ID on the sandbox.
 	AnnotationTaskID = "evalrunner.gke-labs.dev/task-id"
+
+	// LabelServicePortalIntercept is the pod label opting into service-portals NRI interception.
+	LabelServicePortalIntercept = "service-portal.gke.io/intercept"
+
+	// AnnotationServicePortalPolicy is the pod annotation binding intercepted traffic to rules.
+	AnnotationServicePortalPolicy = "service-portal.gke.io/policy"
+
+	// AnnotationServicePortalIdentity is the pod annotation providing attribution for intercepted traffic.
+	AnnotationServicePortalIdentity = "service-portal.gke.io/identity"
+
+	// ServicePortalCACertPath is the filesystem path where the node agent mounts the service-portal CA cert.
+	ServicePortalCACertPath = "/etc/service-portal/ca/tls.crt"
+
+	// Environment variable names for service-portal credentials and CA bundles.
+	EnvGeminiAPIKey     = "GEMINI_API_KEY"
+	EnvGoogleAPIKey     = "GOOGLE_API_KEY"
+	EnvRequestsCABundle = "REQUESTS_CA_BUNDLE"
+	EnvCurlCABundle     = "CURL_CA_BUNDLE"
+	EnvGitSSLCAInfo     = "GIT_SSL_CAINFO"
+	EnvPipCert          = "PIP_CERT"
+	EnvNodeExtraCACerts = "NODE_EXTRA_CA_CERTS"
 )
+
+// ServicePortalCAEnvVars returns environment variables specifying the CA certificate bundle path for service-portal interception.
+func ServicePortalCAEnvVars() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: EnvRequestsCABundle, Value: ServicePortalCACertPath},
+		{Name: EnvCurlCABundle, Value: ServicePortalCACertPath},
+		{Name: EnvGitSSLCAInfo, Value: ServicePortalCACertPath},
+		{Name: EnvPipCert, Value: ServicePortalCACertPath},
+		{Name: EnvNodeExtraCACerts, Value: ServicePortalCACertPath},
+	}
+}
 
 // AuthTokenDigest calculates the hex SHA-256 digest of the given bearer token.
 func AuthTokenDigest(token string) string {
@@ -173,18 +206,19 @@ func TaskSandboxNameForRun(runName, taskID string) string {
 
 // TaskSandboxConfig configures task sandbox creation.
 type TaskSandboxConfig struct {
-	Namespace          string
-	SampleRunnerImage  string
-	Image              string
-	ModelSecret        string
-	AuthTokenDigest    string
-	ServerCertSecret   string
-	CAConfigMap        string
-	SandboxdImage      string
-	CloneRepo          bool
-	StepTimeoutSeconds int
-	SandboxTask        bool
-	Limits             corev1.ResourceList
+	Namespace           string
+	SampleRunnerImage   string
+	Image               string
+	ModelSecret         string
+	SandboxPortalPolicy string
+	AuthTokenDigest     string
+	ServerCertSecret    string
+	CAConfigMap         string
+	SandboxdImage       string
+	CloneRepo           bool
+	StepTimeoutSeconds  int
+	SandboxTask         bool
+	Limits              corev1.ResourceList
 }
 
 // BuildTaskSandbox constructs the Sandbox CR for executing an eval task for a Run.
@@ -273,7 +307,16 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 	}
 
 	var envFrom []corev1.EnvFromSource
-	if cfg.ModelSecret != "" {
+	var taskEnv []corev1.EnvVar
+	if cfg.SandboxPortalPolicy != "" {
+		labels[LabelServicePortalIntercept] = "true"
+		annotations[AnnotationServicePortalPolicy] = cfg.SandboxPortalPolicy
+		annotations[AnnotationServicePortalIdentity] = fmt.Sprintf("%s/%s", run.Name, taskID)
+		taskEnv = append([]corev1.EnvVar{
+			{Name: EnvGeminiAPIKey, Value: "placeholder"},
+			{Name: EnvGoogleAPIKey, Value: "placeholder"},
+		}, ServicePortalCAEnvVars()...)
+	} else if cfg.ModelSecret != "" {
 		envFrom = append(envFrom, corev1.EnvFromSource{
 			SecretRef: &corev1.SecretEnvSource{
 				LocalObjectReference: corev1.LocalObjectReference{
@@ -351,6 +394,9 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 				Name:  "TIMEOUT_SECONDS",
 				Value: strconv.Itoa(cfg.StepTimeoutSeconds),
 			})
+		}
+		if cfg.SandboxPortalPolicy != "" {
+			checkoutEnv = append(checkoutEnv, ServicePortalCAEnvVars()...)
 		}
 
 		checkoutScript := `status=0
@@ -454,6 +500,7 @@ fi
 							{
 								Name:    TaskContainerName,
 								Image:   image,
+								Env:     taskEnv,
 								EnvFrom: envFrom,
 								Command: cmd,
 								Ports: []corev1.ContainerPort{

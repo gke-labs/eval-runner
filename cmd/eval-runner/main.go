@@ -401,6 +401,7 @@ func main() {
 		MaxParallelTasks:     clusterConfig.MaxParallelTasks,
 		PollProgressInterval: clusterConfig.PollProgressInterval,
 		ModelSecret:          clusterConfig.ModelSecret,
+		SandboxPortalPolicy:  clusterConfig.SandboxPortalPolicy,
 		ModelPrices:          clusterConfig.ModelPrices,
 		ModelPriceSources:    clusterConfig.ModelPriceSources,
 		ModelPricesDisabled:  clusterConfig.ModelPricesDisabled,

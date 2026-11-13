@@ -65,6 +65,8 @@ const (
 	ConfigMapKeyPollProgressInterval = configkeys.ConfigMapKeyPollProgressInterval
 	// ConfigMapKeyModelSecret is the ConfigMap key for default model credentials Secret name.
 	ConfigMapKeyModelSecret = configkeys.ConfigMapKeyModelSecret
+	// ConfigMapKeySandboxPortalPolicy is the ConfigMap key for opting task sandboxes into service-portals interception.
+	ConfigMapKeySandboxPortalPolicy = configkeys.ConfigMapKeySandboxPortalPolicy
 	// ConfigMapKeySandboxdImage is the ConfigMap key for sandboxd init container image.
 	ConfigMapKeySandboxdImage = configkeys.ConfigMapKeySandboxdImage
 	// ConfigMapKeyTaskGracePeriod is the ConfigMap key for task sandbox cache grace period.
@@ -121,6 +123,7 @@ var KnownConfigMapKeys = map[string]struct{}{
 	configkeys.ConfigMapKeyMaxParallelTasks:         {},
 	configkeys.ConfigMapKeyPollProgressInterval:     {},
 	configkeys.ConfigMapKeyModelSecret:              {},
+	configkeys.ConfigMapKeySandboxPortalPolicy:      {},
 	configkeys.ConfigMapKeySandboxdImage:            {},
 	configkeys.ConfigMapKeyTaskGracePeriod:          {},
 	configkeys.ConfigMapKeyGitHubTokenSecret:        {},
@@ -191,6 +194,7 @@ type ClusterConfig struct {
 	InconclusivePolicy       string
 	MaxParallelTasks         int
 	ModelSecret              string
+	SandboxPortalPolicy      string
 	ModelPrices              map[string]ModelPrice
 	ModelPriceSources        map[string]v1alpha1.CostSource
 	ModelPricesDisabled      bool
@@ -457,6 +461,18 @@ func ResolveConfig(cm *corev1.ConfigMap, flags RawFlags) (ClusterConfig, error) 
 						return cfg, fmt.Errorf("invalid %s %q in ConfigMap %s/%s: %s", ConfigMapKeyModelSecret, val, ns, name, strings.Join(errs, "; "))
 					}
 					cfg.ModelSecret = trimmed
+				}
+			}
+		}
+
+		// 5b. sandboxPortalPolicy
+		if val, ok := cm.Data[ConfigMapKeySandboxPortalPolicy]; ok {
+			trimmed := strings.TrimSpace(val)
+			if trimmed != "" {
+				if strings.EqualFold(trimmed, ConfigSentinelDisabled) {
+					cfg.SandboxPortalPolicy = ""
+				} else {
+					cfg.SandboxPortalPolicy = trimmed
 				}
 			}
 		}
@@ -977,6 +993,7 @@ func LogEffectiveClusterSettings(logger logr.Logger, resolved ClusterConfig) {
 		"githubTokenSecret", resolved.GitHubTokenSecret,
 		"maxParallelTasks", resolved.MaxParallelTasks,
 		"modelSecret", resolved.ModelSecret,
+		"sandboxPortalPolicy", resolved.SandboxPortalPolicy,
 		"pollProgressInterval", resolved.PollProgressInterval,
 		"sandboxdImage", resolved.SandboxdImage,
 		"taskGracePeriod", resolved.TaskGracePeriod,

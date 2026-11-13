@@ -49,6 +49,8 @@ const (
 	ConfigMapKeyPollProgressInterval = "pollProgressInterval"
 	// ConfigMapKeyModelSecret is the ConfigMap key for default model credentials Secret name.
 	ConfigMapKeyModelSecret = "modelSecret"
+	// ConfigMapKeySandboxPortalPolicy is the ConfigMap key for opting task sandboxes into service-portals interception.
+	ConfigMapKeySandboxPortalPolicy = "sandboxPortalPolicy"
 	// ConfigMapKeySandboxdImage is the ConfigMap key for sandboxd init container image.
 	ConfigMapKeySandboxdImage = "sandboxdImage"
 	// ConfigMapKeyTaskGracePeriod is the ConfigMap key for task sandbox cache grace period.
