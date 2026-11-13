@@ -15,6 +15,19 @@ The task manifest in `examples/terminal-bench/.evals/list` is generated dynamica
 
 The declared `cpus` and `memory` from `task.toml` are emitted in the `sandbox` resource entry (`resources: [{"type": "sandbox", "limits": {"cpu": "<cpus>", "memory": "<memory>"}}]`) and applied as container limits on the sandbox task pod.
 
+## Execution Phases
+
+`run-task.sh` supports execution phases selected via the second positional argument:
+
+```bash
+examples/terminal-bench/run-task.sh <task-name> [oracle|prepare|verify|agent] [workdir]
+```
+
+- **`prepare`**: Fetches the task repository at the pinned commit, installs `tests/` into `${TESTS_DIRECTORY}` (default `/tests`), creates log directories, and writes the task's prompt to `${OUT_DIRECTORY}/instruction.md` (default `/out/instruction.md`). The reference solution is not installed and `/solution` is never present in the sandbox. Exits 0 on success; on failure writes a failing `/out/results.json` and exits non-zero. Safe to run once per sandbox during startup for model-driven evaluation.
+- **`verify`**: Executes the test harness at `${TESTS_DIRECTORY}/test.sh`, reads the reward (`reward.json` or `reward.txt`), and writes `/out/results.json`. Does not fetch the repository again and fails clearly if `prepare` has not been run.
+- **`oracle`**: The default phase. Runs the full one-shot evaluation pipeline (`prepare`, installs and runs the reference solution at `${SOLUTION_DIRECTORY}/solve.sh`, then `verify`).
+- **`agent`**: Kept as an alias for `prepare` followed immediately by `verify` without installing or running the solution.
+
 ## Pinned Commit and How to Bump It
 
 The benchmark repository commit is pinned in `examples/terminal-bench/version.sh`:
