@@ -884,3 +884,97 @@ func TestTaskResourceLimits(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateTaskAgent(t *testing.T) {
+	timeoutZero, timeoutExcess := 0, 7201
+	tests := []struct {
+		name          string
+		task          v1alpha1.ManifestTask
+		wantErr       bool
+		expectedField string
+	}{
+		{
+			name: "valid agent block",
+			task: v1alpha1.ManifestTask{
+				ID: "task-ok", Command: []string{"test"}, Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{
+					PrepareCommand: []string{"sh", "-c", "echo", ""}, InstructionPath: "/out/inst.md",
+				},
+			},
+		},
+		{
+			name: "rejection without sandbox resource",
+			task: v1alpha1.ManifestTask{
+				ID: "task-no-sb", Command: []string{"test"},
+				Agent: &v1alpha1.ManifestTaskAgent{InstructionPath: "/out/inst.md"},
+			},
+			wantErr: true, expectedField: "invalid agent",
+		},
+		{
+			name: "rejection without command",
+			task: v1alpha1.ManifestTask{
+				ID: "task-no-cmd", Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{InstructionPath: "/out/inst.md"},
+			},
+			wantErr: true, expectedField: "invalid command",
+		},
+		{
+			name: "rejection empty prepareCommand",
+			task: v1alpha1.ManifestTask{
+				ID: "task-empty-prep", Command: []string{"test"}, Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{PrepareCommand: []string{}, InstructionPath: "/out/inst.md"},
+			},
+			wantErr: true, expectedField: "invalid agent.prepareCommand",
+		},
+		{
+			name: "rejection missing instructionPath",
+			task: v1alpha1.ManifestTask{
+				ID: "task-no-path", Command: []string{"test"}, Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{InstructionPath: ""},
+			},
+			wantErr: true, expectedField: "invalid agent.instructionPath",
+		},
+		{
+			name: "rejection relative instructionPath",
+			task: v1alpha1.ManifestTask{
+				ID: "task-rel-path", Command: []string{"test"}, Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{InstructionPath: "out/inst.md"},
+			},
+			wantErr: true, expectedField: "invalid agent.instructionPath",
+		},
+		{
+			name: "rejection timeout below min",
+			task: v1alpha1.ManifestTask{
+				ID: "task-zero-to", Command: []string{"test"}, Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{InstructionPath: "/out/inst.md", TimeoutSeconds: &timeoutZero},
+			},
+			wantErr: true, expectedField: "invalid agent.timeoutSeconds",
+		},
+		{
+			name: "rejection timeout above max",
+			task: v1alpha1.ManifestTask{
+				ID: "task-excess-to", Command: []string{"test"}, Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+				Agent: &v1alpha1.ManifestTaskAgent{InstructionPath: "/out/inst.md", TimeoutSeconds: &timeoutExcess},
+			},
+			wantErr: true, expectedField: "invalid agent.timeoutSeconds",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateTaskAgent(tc.task)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.task.ID) || !strings.Contains(err.Error(), tc.expectedField) {
+				t.Errorf("error %q should name task %q and field %q", err.Error(), tc.task.ID, tc.expectedField)
+			}
+		})
+	}
+}

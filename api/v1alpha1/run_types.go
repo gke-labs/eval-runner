@@ -376,6 +376,33 @@ type ManifestTask struct {
 	// +kubebuilder:validation:Maximum=7200
 	// +optional
 	TimeoutSeconds *int `json:"timeoutSeconds,omitempty"`
+
+	// Agent configures an optional agent evaluation on a sandbox task.
+	// Semantics: prepareCommand runs first; the file at instructionPath inside the sandbox
+	// is the instruction given to an agent that runs outside the sandbox and drives it with
+	// shell commands for at most agent.timeoutSeconds; then command runs as today and produces
+	// /out/results.json.
+	// +optional
+	Agent *ManifestTaskAgent `json:"agent,omitempty"`
+}
+
+// ManifestTaskAgent configures an agent evaluation on a sandbox task.
+type ManifestTaskAgent struct {
+	// PrepareCommand is the optional argv run inside the sandbox before the agent starts.
+	// When present, argv must be non-empty.
+	// +optional
+	PrepareCommand []string `json:"prepareCommand,omitempty"`
+
+	// InstructionPath is the required absolute path inside the sandbox to the instruction file for the agent.
+	// +kubebuilder:validation:Required
+	InstructionPath string `json:"instructionPath"`
+
+	// TimeoutSeconds is the maximum duration in seconds the agent may drive the sandbox.
+	// The default is unspecified until execution lands.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=7200
+	// +optional
+	TimeoutSeconds *int `json:"timeoutSeconds,omitempty"`
 }
 
 const (

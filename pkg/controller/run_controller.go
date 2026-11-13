@@ -2081,6 +2081,18 @@ func (r *RunReconciler) initializeTasks(spec v1alpha1.RunSpec, manifest *v1alpha
 				continue
 			}
 
+			if err := discovery.ValidateTaskAgent(task); err != nil {
+				statuses = append(statuses, v1alpha1.TaskStatus{
+					ID:             taskID,
+					Cohort:         cohort,
+					Phase:          v1alpha1.TaskPhaseFailed,
+					Message:        err.Error(),
+					SampleRange:    effRange,
+					SamplesPlanned: planned,
+				})
+				continue
+			}
+
 			if len(task.Resources) > 0 && !isSandboxOnlyTask(task) {
 				statuses = append(statuses, v1alpha1.TaskStatus{
 					ID:             taskID,
@@ -2140,6 +2152,18 @@ func (r *RunReconciler) initializeTasks(spec v1alpha1.RunSpec, manifest *v1alpha
 			if cohort == "" {
 				cohort = v1alpha1.DefaultCohort
 			}
+			if err := discovery.ValidateTaskAgent(task); err != nil {
+				statuses = append(statuses, v1alpha1.TaskStatus{
+					ID:             task.ID,
+					Cohort:         cohort,
+					Phase:          v1alpha1.TaskPhaseFailed,
+					Message:        err.Error(),
+					SampleRange:    effRange,
+					SamplesPlanned: planned,
+				})
+				continue
+			}
+
 			if len(task.Resources) > 0 && !isSandboxOnlyTask(task) {
 				statuses = append(statuses, v1alpha1.TaskStatus{
 					ID:             task.ID,
@@ -3468,6 +3492,15 @@ func (r *RunReconciler) executeSandboxTask(
 	}
 	if err := discovery.ValidateTaskResources(targetTask); err != nil {
 		logger.Error(err, "Task invalid resources", "task", taskID)
+		return taskExecutionResult{
+			taskID:      taskID,
+			phase:       v1alpha1.TaskPhaseFailed,
+			message:     err.Error(),
+			sampleRange: effRange,
+		}
+	}
+	if err := discovery.ValidateTaskAgent(targetTask); err != nil {
+		logger.Error(err, "Task invalid agent", "task", taskID)
 		return taskExecutionResult{
 			taskID:      taskID,
 			phase:       v1alpha1.TaskPhaseFailed,

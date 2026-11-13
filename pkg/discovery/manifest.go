@@ -17,6 +17,7 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -214,4 +215,54 @@ func TaskResourceLimits(task v1alpha1.ManifestTask) corev1.ResourceList {
 	}
 
 	return limits
+}
+
+// ValidateTaskAgent validates the optional agent configuration for a task:
+// - agent is valid only on a task that has a sandbox resource.
+// - command is required when agent is set.
+// - prepareCommand is optional; when present, argv must be non-empty.
+// - instructionPath is required and must be an absolute path.
+// - agent.timeoutSeconds is optional; when present, must be between MinTaskTimeoutSeconds and MaxTaskTimeoutSeconds.
+func ValidateTaskAgent(task v1alpha1.ManifestTask) error {
+	if task.Agent == nil {
+		return nil
+	}
+
+	taskID := task.ID
+
+	hasSandboxResource := false
+	for _, manifestResource := range task.Resources {
+		if manifestResource.Type == v1alpha1.ResourceTypeSandbox {
+			hasSandboxResource = true
+			break
+		}
+	}
+	if !hasSandboxResource {
+		return fmt.Errorf("task %q has invalid agent: agent is only valid on tasks with a sandbox resource", taskID)
+	}
+
+	if len(task.Command) == 0 {
+		return fmt.Errorf("task %q has invalid command: command is required when agent is set", taskID)
+	}
+
+	if task.Agent.PrepareCommand != nil {
+		if len(task.Agent.PrepareCommand) == 0 {
+			return fmt.Errorf("task %q has invalid agent.prepareCommand: must be non-empty argv", taskID)
+		}
+	}
+
+	if strings.TrimSpace(task.Agent.InstructionPath) == "" {
+		return fmt.Errorf("task %q has invalid agent.instructionPath: instructionPath is required", taskID)
+	}
+	if !path.IsAbs(task.Agent.InstructionPath) {
+		return fmt.Errorf("task %q has invalid agent.instructionPath %q: must be an absolute path", taskID, task.Agent.InstructionPath)
+	}
+
+	if task.Agent.TimeoutSeconds != nil {
+		if *task.Agent.TimeoutSeconds < v1alpha1.MinTaskTimeoutSeconds || *task.Agent.TimeoutSeconds > v1alpha1.MaxTaskTimeoutSeconds {
+			return fmt.Errorf("task %q has invalid agent.timeoutSeconds %d: must be between %d and %d", taskID, *task.Agent.TimeoutSeconds, v1alpha1.MinTaskTimeoutSeconds, v1alpha1.MaxTaskTimeoutSeconds)
+		}
+	}
+
+	return nil
 }

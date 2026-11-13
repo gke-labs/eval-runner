@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -4834,6 +4835,117 @@ func TestRunController_SandboxTaskExecution(t *testing.T) {
 		}
 		if !foundValid {
 			t.Errorf("Expected task-valid to be present in updatedRun.Status.Tasks")
+		}
+	})
+
+	t.Run("TaskAgent_ReconcileValidAndInvalidTasks", func(t *testing.T) {
+		timeout := 900
+		manifest := &v1alpha1.Manifest{
+			Tasks: []v1alpha1.ManifestTask{
+				{
+					ID:        "task-invalid-agent",
+					Spec:      "eval.py@invalid",
+					Image:     "task-image:v1",
+					Command:   []string{"verify.sh"},
+					Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+					Agent:     &v1alpha1.ManifestTaskAgent{InstructionPath: "relative.md"},
+				},
+				{
+					ID:        "task-valid-agent",
+					Spec:      "eval.py@valid",
+					Image:     "task-image:v1",
+					Command:   []string{"verify.sh"},
+					Resources: []v1alpha1.ManifestResource{{Type: "sandbox"}},
+					Agent: &v1alpha1.ManifestTaskAgent{
+						PrepareCommand:  []string{"prepare.sh"},
+						InstructionPath: "/out/inst.md",
+						TimeoutSeconds:  &timeout,
+					},
+				},
+			},
+		}
+
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-run-agent", Namespace: "eval-runner"},
+			Spec:       v1alpha1.RunSpec{Repo: v1alpha1.RepoSpec{URL: "git://repo", Commit: "c1"}, Model: "mockllm/model"},
+			Status:     v1alpha1.RunStatus{Phase: v1alpha1.RunPhaseRunning},
+		}
+
+		var executedCommands [][]string
+		fakeClient := &sandboxclient.FakeClient{
+			ExecFn: func(call int, ctx context.Context, cfg sandboxclient.ProcessConfig) (*sandboxclient.ExecuteResult, error) {
+				if len(cfg.Command) > 0 && cfg.Command[0] == "mkdir" {
+					return &sandboxclient.ExecuteResult{ExitCode: 0}, nil
+				}
+				executedCommands = append(executedCommands, cfg.Command)
+				return &sandboxclient.ExecuteResult{ExitCode: 0}, nil
+			},
+			ReadFileFn: func(ctx context.Context, path string) ([]byte, error) {
+				if path == "/out/results.json" {
+					return []byte(`{"schemaVersion": 1, "samples": [{"id": "s1", "passed": true, "score": 1.0}]}`), nil
+				}
+				return nil, fmt.Errorf("file not found")
+			},
+		}
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).WithStatusSubresource(run).Build()
+		reconciler := &RunReconciler{
+			Client: cl, Scheme: scheme, SandboxNamespace: "eval-runner-sandbox",
+			SandboxClient: fakeClient, ArtifactSink: artifacts.NewInMemorySink(),
+		}
+		reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: run.Namespace, Name: run.Name}}
+
+		// Turn 1: initialize tasks - invalid task ends Failed, valid task is Pending and creates sandbox
+		if _, err := reconciler.Reconcile(t.Context(), req); err != nil {
+			t.Fatalf("turn 1 error: %v", err)
+		}
+
+		var updatedRun v1alpha1.Run
+		_ = cl.Get(t.Context(), req.NamespacedName, &updatedRun)
+		if updatedRun.Status.Phase != v1alpha1.RunPhaseRunning {
+			t.Errorf("expected Run to remain Running, got %s", updatedRun.Status.Phase)
+		}
+		if len(updatedRun.Status.Tasks) != 2 {
+			t.Fatalf("expected 2 tasks, got %d", len(updatedRun.Status.Tasks))
+		}
+		if t0 := updatedRun.Status.Tasks[0]; t0.Phase != v1alpha1.TaskPhaseFailed || !strings.Contains(t0.Message, "invalid agent.instructionPath") {
+			t.Errorf("expected task-invalid-agent Failed, got phase=%s msg=%q", t0.Phase, t0.Message)
+		}
+		if t1 := updatedRun.Status.Tasks[1]; t1.Phase != v1alpha1.TaskPhaseRunning {
+			t.Errorf("expected task-valid-agent Running, got %s", t1.Phase)
+		}
+
+		// Create Pod for valid task sandbox
+		var sbList sandboxv1beta1.SandboxList
+		_ = cl.List(t.Context(), &sbList, client.InNamespace("eval-runner-sandbox"))
+		if len(sbList.Items) != 1 {
+			t.Fatalf("expected 1 sandbox created, got %d", len(sbList.Items))
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: sbList.Items[0].Name, Namespace: "eval-runner-sandbox"},
+			Status: corev1.PodStatus{
+				Phase:      corev1.PodRunning,
+				PodIP:      "10.244.0.51",
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}
+		if err := cl.Create(t.Context(), pod); err != nil {
+			t.Fatalf("failed to create pod: %v", err)
+		}
+
+		// Turn 2: execute valid task - runs only command, not prepareCommand
+		if _, err := reconciler.Reconcile(t.Context(), req); err != nil {
+			t.Fatalf("turn 2 error: %v", err)
+		}
+
+		if len(executedCommands) != 1 || !reflect.DeepEqual(executedCommands[0], []string{"verify.sh"}) {
+			t.Errorf("expected only command ['verify.sh'] to execute, got %v", executedCommands)
+		}
+
+		_ = cl.Get(t.Context(), req.NamespacedName, &updatedRun)
+		if t1 := updatedRun.Status.Tasks[1]; t1.Phase != v1alpha1.TaskPhaseCompleted {
+			t.Errorf("expected task-valid-agent Completed, got %s", t1.Phase)
 		}
 	})
 }
