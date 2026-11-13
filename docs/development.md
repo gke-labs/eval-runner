@@ -665,6 +665,37 @@ Rule changes take effect when the proxy receives a SIGHUP signal, or by restarti
 kubectl -n service-portal-system rollout restart daemonset/portal-node-agent
 ```
 
+### Service Portal Pass-Through Rules (Allowed Egress Hosts)
+
+Sandbox pods intercepted by the service-portals node agent are default-deny: an external host resolves and connects only if a `PortalRule` matches it.
+
+Pass-through egress rules (for hosts that require no credential or header injection) are defined in `k8s/portal-passthrough-rules.yaml` via the `portal-passthrough-rules` ConfigMap in namespace `service-portal-system`.
+
+#### Adding an Allowed Host
+
+To allow sandbox tasks to connect to an additional external host:
+
+1. Add a `PortalRule` document to `k8s/portal-passthrough-rules.yaml` under the appropriate purpose key (or create a new `.yaml` key):
+
+   ```yaml
+   apiVersion: portals.gke.io/v1alpha1
+   kind: PortalRule
+   spec:
+     host: example.com
+   ```
+
+2. Apply the updated manifest:
+
+   ```bash
+   kubectl apply -f k8s/portal-passthrough-rules.yaml
+   ```
+
+3. Restart the node agent DaemonSet (or send `SIGHUP` to the proxy container process) to pick up the updated rules:
+
+   ```bash
+   kubectl -n service-portal-system rollout restart daemonset/portal-node-agent
+   ```
+
 ## Results in GCS
 
 By default, the controller runs with an in-memory no-op artifact sink. When `artifactBucket` is configured (via the `eval-runner-config` ConfigMap or the `--artifact-bucket` flag), the controller persists raw Inspect evaluation JSON logs alongside a per-task aggregate `summary.json` directly to Google Cloud Storage under `runs/<commit>/<task-id>/`.
