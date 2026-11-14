@@ -634,7 +634,7 @@ For evaluations requiring other model providers or custom environments, a reposi
 ### Service Portal NRI Node Agent (Model Gateway Interception)
 
 The `portal-node-agent` DaemonSet (`k8s/portal-node-agent.yaml`) runs in namespace `service-portal-system` using Node Resource Interface (NRI) per-node interception mode from `gke-labs/service-portals`. It consists of two containers:
-- `proxy` (`portal-node-proxy`): an all-in-one portal proxy that dynamically terminates and mints TLS certificates using a node-local Root CA and swaps authentication headers upstream based on `PortalRule` definitions.
+- `proxy` (`portal-node-proxy`): an all-in-one portal proxy that dynamically terminates and mints TLS certificates using a node-local Root CA and swaps authentication headers upstream based on `PortalRule` definitions. Runs as root (`runAsUser: 0`) with all capabilities dropped except `NET_BIND_SERVICE` and a read-only root filesystem to bind host port 53 for node DNS interception under least privilege.
 - `nri-plugin` (`portal-nri-plugin`): an NRI plugin connecting to containerd (`/var/run/nri/nri.sock`) that synchronously configures host network redirection for intercepted pods and injects the node CA certificate into containers.
 
 #### Node Prerequisite
