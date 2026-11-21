@@ -50,7 +50,7 @@ func TestUnavailableSink(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if !strings.Contains(err.Error(), "artifactBucket is set but credentials are unavailable") {
+		if !strings.Contains(err.Error(), "artifactBucket is set but artifact storage is unavailable") {
 			t.Errorf("unexpected error message: %v", err)
 		}
 		if !strings.Contains(err.Error(), probeErr.Error()) {
@@ -63,7 +63,7 @@ func TestUnavailableSink(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if !strings.Contains(err.Error(), "artifactBucket is set but credentials are unavailable") {
+		if !strings.Contains(err.Error(), "artifactBucket is set but artifact storage is unavailable") {
 			t.Errorf("unexpected error message: %v", err)
 		}
 	})
@@ -73,7 +73,7 @@ func TestUnavailableSink(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if !strings.Contains(err.Error(), "artifactBucket is set but credentials are unavailable") {
+		if !strings.Contains(err.Error(), "artifactBucket is set but artifact storage is unavailable") {
 			t.Errorf("unexpected error message: %v", err)
 		}
 	})
@@ -83,7 +83,7 @@ func TestUnavailableSink(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if !strings.Contains(err.Error(), "artifactBucket is set but credentials are unavailable") {
+		if !strings.Contains(err.Error(), "artifactBucket is set but artifact storage is unavailable") {
 			t.Errorf("unexpected error message: %v", err)
 		}
 	})

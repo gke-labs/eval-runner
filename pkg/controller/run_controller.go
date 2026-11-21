@@ -1033,9 +1033,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 	}
 
-	// Fail fast if artifact storage is configured but unavailable (e.g. invalid credentials).
+	// Fail fast if artifact storage is configured but unavailable.
 	if unavailErr, isUnavail := artifacts.IsUnavailable(r.artifactSink()); isUnavail {
-		msg := fmt.Sprintf("artifactBucket is set but credentials are unavailable: %v", unavailErr)
+		msg := fmt.Sprintf("artifactBucket is set but artifact storage is unavailable: %v", unavailErr)
 		logger.Error(unavailErr, "artifact storage is unavailable; failing Run", "run", run.Name)
 		return r.failRun(ctx, &run, nil, msg)
 	}

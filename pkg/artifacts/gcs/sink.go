@@ -30,6 +30,7 @@ import (
 	"github.com/gke-labs/eval-runner/pkg/artifacts"
 	"github.com/gke-labs/eval-runner/pkg/configkeys"
 	"golang.org/x/oauth2/google/externalaccount"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -58,8 +59,15 @@ type realStorageClient struct {
 }
 
 func (c *realStorageClient) CheckAccess(ctx context.Context, bucket string) error {
-	_, err := c.client.Bucket(bucket).Attrs(ctx)
-	return err
+	objectIterator := c.client.Bucket(bucket).Objects(ctx, &storage.Query{
+		Prefix: "",
+	})
+	objectIterator.PageInfo().MaxSize = 1
+	_, err := objectIterator.Next()
+	if err != nil && !errors.Is(err, iterator.Done) {
+		return err
+	}
+	return nil
 }
 
 func (c *realStorageClient) WriteObject(ctx context.Context, bucket, object, contentType string, data []byte) error {
@@ -203,7 +211,7 @@ func New(ctx context.Context, bucket string, opts ...Option) (*GCSSink, error) {
 	return sink, nil
 }
 
-// CheckAccess probes credentials and bucket access by querying Bucket.Attrs on the target bucket.
+// CheckAccess probes credentials and bucket access by querying object listing on the target bucket.
 func (s *GCSSink) CheckAccess(ctx context.Context) error {
 	if s.bucket == "" {
 		return fmt.Errorf("bucket name is empty")

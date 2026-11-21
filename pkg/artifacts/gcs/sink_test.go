@@ -18,14 +18,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/internal/fakes"
 	"github.com/gke-labs/eval-runner/pkg/artifacts"
+	"google.golang.org/api/option"
 )
 
 var _ StorageClient = (*fakes.FakeStorageClient)(nil)
@@ -728,6 +732,60 @@ func TestCheckAccess(t *testing.T) {
 	if err := sink.CheckAccess(ctx); !errors.Is(err, probeErr) {
 		t.Errorf("expected CheckAccess to return probeErr, got %v", err)
 	}
+}
+
+func TestRealStorageClient_CheckAccess(t *testing.T) {
+	ctx := t.Context()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/b/test-bucket":
+			// Bucket metadata refused with 403 (storage.buckets.get missing).
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusForbidden)
+			_, _ = writer.Write([]byte(`{"error": {"code": 403, "message": "Caller does not have storage.buckets.get access to the Google Cloud Storage bucket."}}`))
+		case "/b/test-bucket/o":
+			// Object listing succeeds.
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"kind": "storage#objects"}`))
+		case "/b/failing-bucket/o":
+			// Real failure on object listing.
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusForbidden)
+			_, _ = writer.Write([]byte(`{"error": {"code": 403, "message": "Caller does not have storage.objects.list access to the Google Cloud Storage bucket."}}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	gcsClient, err := storage.NewClient(ctx, option.WithEndpoint(server.URL), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("failed to create storage client: %v", err)
+	}
+	defer func() {
+		if closeErr := gcsClient.Close(); closeErr != nil {
+			t.Errorf("error closing gcsClient: %v", closeErr)
+		}
+	}()
+
+	client := &realStorageClient{client: gcsClient}
+
+	t.Run("passes when object listing works and bucket metadata would be refused", func(t *testing.T) {
+		if err := client.CheckAccess(ctx, "test-bucket"); err != nil {
+			t.Errorf("expected CheckAccess to succeed when object listing works, got %v", err)
+		}
+	})
+
+	t.Run("reports real failure when object listing fails", func(t *testing.T) {
+		err := client.CheckAccess(ctx, "failing-bucket")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "403") {
+			t.Errorf("expected 403 in error, got: %v", err)
+		}
+	})
 }
 
 func TestStoreManifest_ErrorNamesSinkOperation(t *testing.T) {

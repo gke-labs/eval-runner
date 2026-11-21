@@ -1230,7 +1230,7 @@ func (r *ConfigReloader) reloadInternal(ctx context.Context, cm *corev1.ConfigMa
 			if resolved.ArtifactBucket != "" && newSink != nil {
 				probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
 				if probeErr := sinkconfig.ProbeArtifactSink(probeCtx, newSink); probeErr != nil {
-					r.logger.Info(fmt.Sprintf("WARN: artifactBucket is set but credentials are unavailable: %v; ensure workload identity or pod credentials are configured, or set artifactBucket: %q in eval-runner-config to disable", probeErr, configkeys.ConfigSentinelDisabled))
+					r.logger.Info(fmt.Sprintf("WARN: artifactBucket is set but artifact storage is unavailable: %v; ensure workload identity or pod credentials are configured, or set artifactBucket: %q in eval-runner-config to disable", probeErr, configkeys.ConfigSentinelDisabled))
 					if closeErr := newSink.Close(); closeErr != nil {
 						r.logger.Error(closeErr, "closing replaced artifact sink")
 					}

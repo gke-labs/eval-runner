@@ -50,22 +50,22 @@ func (s *UnavailableSink) CheckAccess(ctx context.Context) error {
 
 // StoreArtifact implements ArtifactSink, failing immediately with the unavailability error.
 func (s *UnavailableSink) StoreArtifact(ctx context.Context, meta RunMetadata, filename string, data []byte) (string, error) {
-	return "", fmt.Errorf("artifactBucket is set but credentials are unavailable: %w", s.err)
+	return "", fmt.Errorf("artifactBucket is set but artifact storage is unavailable: %w", s.err)
 }
 
 // StoreComparison implements ArtifactSink, failing immediately with the unavailability error.
 func (s *UnavailableSink) StoreComparison(ctx context.Context, comparisonName string, data []byte) (string, error) {
-	return "", fmt.Errorf("artifactBucket is set but credentials are unavailable: %w", s.err)
+	return "", fmt.Errorf("artifactBucket is set but artifact storage is unavailable: %w", s.err)
 }
 
 // StoreManifest implements ArtifactSink, failing immediately with the unavailability error.
 func (s *UnavailableSink) StoreManifest(ctx context.Context, meta RunMetadata, data []byte) (string, error) {
-	return "", fmt.Errorf("artifactBucket is set but credentials are unavailable: %w", s.err)
+	return "", fmt.Errorf("artifactBucket is set but artifact storage is unavailable: %w", s.err)
 }
 
 // Load implements ArtifactSink, failing immediately with the unavailability error.
 func (s *UnavailableSink) Load(ctx context.Context, path string) ([]byte, error) {
-	return nil, fmt.Errorf("artifactBucket is set but credentials are unavailable: %w", s.err)
+	return nil, fmt.Errorf("artifactBucket is set but artifact storage is unavailable: %w", s.err)
 }
 
 // ArtifactPrefix implements ArtifactSink.

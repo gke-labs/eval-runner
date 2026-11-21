@@ -12360,7 +12360,7 @@ func TestReconcile_UnavailableArtifactSinkFailsFast(t *testing.T) {
 	if updatedRun.Status.Phase != v1alpha1.RunPhaseFailed {
 		t.Errorf("Expected phase Failed, got %s", updatedRun.Status.Phase)
 	}
-	expectedMsg := "artifactBucket is set but credentials are unavailable: dial tcp 169.254.169.254:80: connect: connection refused"
+	expectedMsg := "artifactBucket is set but artifact storage is unavailable: dial tcp 169.254.169.254:80: connect: connection refused"
 	if !strings.Contains(updatedRun.Status.Message, expectedMsg) {
 		t.Errorf("Expected message to contain %q, got: %s", expectedMsg, updatedRun.Status.Message)
 	}
