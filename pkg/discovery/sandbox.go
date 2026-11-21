@@ -90,7 +90,38 @@ const (
 
 	// LabelServicePortalIntercept is the pod label opting the sandbox into NRI service portal interception.
 	LabelServicePortalIntercept = "service-portal.gke.io/intercept"
+
+	// PlaceholderModelCredential is a recognisable, non-functional placeholder string injected
+	// as a plain literal value into sample-runner pods so evaluation SDKs construct and send model
+	// requests normally without hanging. Authentic credentials belong exclusively to the controller
+	// and service portals, and are never mounted into task pods. When a service portal is deployed,
+	// it swaps the placeholder for authentic credentials on egress. Without a service portal, the
+	// upstream provider promptly rejects the placeholder with an authentication error.
+	PlaceholderModelCredential = "placeholder-model-credential"
 )
+
+// PlaceholderModelCredentialEnvironmentVariables is the table of model credential environment
+// variable names injected into sample-runner pods with PlaceholderModelCredential.
+// It includes the variable(s) read by the Gemini SDK used by Inspect evals, and is easily
+// extensible for other providers.
+var PlaceholderModelCredentialEnvironmentVariables = []string{
+	"GEMINI_API_KEY",
+	"OPENAI_API_KEY",
+	"ANTHROPIC_API_KEY",
+}
+
+// SampleRunnerPlaceholderEnvironmentVariables returns the placeholder model credential environment
+// variables injected into sample-runner pods.
+func SampleRunnerPlaceholderEnvironmentVariables() []corev1.EnvVar {
+	environmentVariables := make([]corev1.EnvVar, len(PlaceholderModelCredentialEnvironmentVariables))
+	for i, name := range PlaceholderModelCredentialEnvironmentVariables {
+		environmentVariables[i] = corev1.EnvVar{
+			Name:  name,
+			Value: PlaceholderModelCredential,
+		}
+	}
+	return environmentVariables
+}
 
 // AuthTokenDigest calculates the hex SHA-256 digest of the given bearer token.
 func AuthTokenDigest(token string) string {
@@ -452,6 +483,11 @@ fi
 		})
 	}
 
+	var taskEnvironmentVariables []corev1.EnvVar
+	if !cfg.SandboxTask {
+		taskEnvironmentVariables = SampleRunnerPlaceholderEnvironmentVariables()
+	}
+
 	return &sandboxv1beta1.Sandbox{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: sandboxv1beta1.GroupVersion.String(),
@@ -479,6 +515,7 @@ fi
 							{
 								Name:    TaskContainerName,
 								Image:   image,
+								Env:     taskEnvironmentVariables,
 								Command: cmd,
 								Ports: []corev1.ContainerPort{
 									{

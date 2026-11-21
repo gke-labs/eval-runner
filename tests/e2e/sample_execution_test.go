@@ -126,7 +126,7 @@ spec:
 										var pod corev1.Pod
 										if json.Unmarshal(podOut, &pod) == nil && len(pod.Spec.Containers) > 0 {
 											podObserved = true
-											harness.AssertPodHasNoModelSecret(pod, "sample-runner task")
+											harness.AssertPodHasPlaceholderModelCredentials(pod, "sample-runner task")
 										}
 									}
 								}

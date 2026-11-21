@@ -568,10 +568,10 @@ To manually verify ingress and egress policy enforcement on an enforcing cluster
 
 ### Running Sample Evaluations with a Real Model
 
-Task sandboxes and pods NEVER receive or hold model credentials. Model credentials belong exclusively to the controller and service portals:
+Task sandboxes and pods NEVER receive or hold real model credentials. Real model credentials belong exclusively to the controller and service portals:
 
-- **Sandbox isolation**: Untrusted code running in evaluation sandboxes never has access to model API keys or provider secrets.
-- **Service Portal model interception**: Evals calling a real cloud model from inside the pod do not work until the service portal supplies credentials by intercepting and proxying outbound model traffic outside the pod.
+- **Placeholder credentials in pods**: Sample-runner pods hold recognisable placeholder credentials (plain literal values like `GEMINI_API_KEY=placeholder-model-credential`, never referencing any Secret) so that evaluation SDKs construct and dispatch requests normally without hanging.
+- **Service Portal model interception**: Authentic model credentials belong exclusively to the controller and service portals. The service portal swaps authentic credentials in on egress. On clusters where the service portal is not connected, the provider rejects the placeholder at once, and tasks fail promptly with the provider's authentication error.
 - **Mock / offline models**: For offline or mock models (e.g. `mockllm/model`), evals run directly in the sandbox without credentials.
 
 To create a Run with a model:

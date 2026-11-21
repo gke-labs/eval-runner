@@ -354,9 +354,21 @@ func TestBuildTaskSandbox_NoModelSecretInjected(t *testing.T) {
 		t.Errorf("Expected no EnvFrom in task sandbox container, got: %v", c.EnvFrom)
 	}
 	for _, envVar := range c.Env {
-		if envVar.ValueFrom != nil && envVar.ValueFrom.SecretKeyRef != nil {
-			t.Errorf("Expected no Secret-backed environment variable in task sandbox container: %s", envVar.Name)
+		if envVar.ValueFrom != nil {
+			t.Errorf("Expected literal value without ValueFrom in task sandbox container: %s", envVar.Name)
 		}
+	}
+	var foundGeminiKey bool
+	for _, envVar := range c.Env {
+		if envVar.Name == "GEMINI_API_KEY" {
+			foundGeminiKey = true
+			if envVar.Value != PlaceholderModelCredential {
+				t.Errorf("Expected GEMINI_API_KEY = %q, got %q", PlaceholderModelCredential, envVar.Value)
+			}
+		}
+	}
+	if !foundGeminiKey {
+		t.Errorf("Expected placeholder GEMINI_API_KEY in sample-runner task container")
 	}
 
 	expectedFlag := "--auth-token-sha256=" + digest
@@ -369,6 +381,70 @@ func TestBuildTaskSandbox_NoModelSecretInjected(t *testing.T) {
 	}
 	if !foundFlag {
 		t.Errorf("Expected command to contain %q, got: %v", expectedFlag, c.Command)
+	}
+}
+
+func TestBuildTaskSandbox_PlaceholderModelCredentials(t *testing.T) {
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-run-credentials",
+			Namespace: "eval-runner",
+		},
+	}
+	digest := AuthTokenDigest("dummy-token")
+
+	// Case 1: Sample-runner task gets placeholder credentials for model SDKs
+	sampleRunnerSandbox := BuildTaskSandbox(run, "docs/readme_comprehension", TaskSandboxConfig{
+		Namespace:         "eval-runner-sandbox",
+		SampleRunnerImage: "sample-runner:latest",
+		AuthTokenDigest:   digest,
+		SandboxTask:       false,
+	})
+
+	sampleContainer := sampleRunnerSandbox.Spec.PodTemplate.Spec.Containers[0]
+	if len(sampleContainer.EnvFrom) != 0 {
+		t.Errorf("Expected no EnvFrom in sample-runner container, got %v", sampleContainer.EnvFrom)
+	}
+	if len(sampleContainer.Env) != len(PlaceholderModelCredentialEnvironmentVariables) {
+		t.Fatalf("Expected %d placeholder environment variables, got %d", len(PlaceholderModelCredentialEnvironmentVariables), len(sampleContainer.Env))
+	}
+
+	envMap := make(map[string]corev1.EnvVar)
+	for _, environmentVariable := range sampleContainer.Env {
+		envMap[environmentVariable.Name] = environmentVariable
+	}
+	for _, expectedName := range PlaceholderModelCredentialEnvironmentVariables {
+		environmentVariable, exists := envMap[expectedName]
+		if !exists {
+			t.Errorf("Expected placeholder environment variable %q to be present", expectedName)
+			continue
+		}
+		if environmentVariable.Value != PlaceholderModelCredential {
+			t.Errorf("Expected environment variable %q = %q, got %q", expectedName, PlaceholderModelCredential, environmentVariable.Value)
+		}
+		if environmentVariable.ValueFrom != nil {
+			t.Errorf("Expected environment variable %q to have literal value without ValueFrom, got: %+v", expectedName, environmentVariable.ValueFrom)
+		}
+	}
+
+	// Verify no Secret volume exists
+	for _, volume := range sampleRunnerSandbox.Spec.PodTemplate.Spec.Volumes {
+		if volume.Secret != nil && strings.Contains(volume.Secret.SecretName, "model") {
+			t.Errorf("Expected no model secret volume in sample-runner pod, got: %s", volume.Secret.SecretName)
+		}
+	}
+
+	// Case 2: Sandbox task (non-sample-runner) is unchanged and has no placeholder credentials
+	sandboxTask := BuildTaskSandbox(run, "terminal-bench/regex-log", TaskSandboxConfig{
+		Namespace:       "eval-runner-sandbox",
+		Image:           "custom-sandbox:latest",
+		AuthTokenDigest: digest,
+		SandboxTask:     true,
+	})
+
+	sandboxContainer := sandboxTask.Spec.PodTemplate.Spec.Containers[0]
+	if len(sandboxContainer.Env) != 0 {
+		t.Errorf("Expected no environment variables injected for sandbox task, got: %v", sandboxContainer.Env)
 	}
 }
 

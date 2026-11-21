@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
+	"github.com/gke-labs/eval-runner/pkg/discovery"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 )
@@ -1005,5 +1006,32 @@ func (h *Harness) AssertPodHasNoModelSecret(pod corev1.Pod, podDescription strin
 				}
 			}
 		}
+	}
+}
+
+// AssertPodHasPlaceholderModelCredentials asserts that the given pod has the placeholder model credential
+// environment variable (e.g. GEMINI_API_KEY) and no Secret reference.
+func (h *Harness) AssertPodHasPlaceholderModelCredentials(pod corev1.Pod, podDescription string) {
+	h.t.Helper()
+	h.AssertPodHasNoModelSecret(pod, podDescription)
+
+	var foundGeminiKey bool
+	for _, container := range pod.Spec.Containers {
+		if container.Name == discovery.TaskContainerName {
+			for _, environmentVariable := range container.Env {
+				if environmentVariable.Name == "GEMINI_API_KEY" {
+					foundGeminiKey = true
+					if environmentVariable.Value != discovery.PlaceholderModelCredential {
+						h.t.Errorf("[%s] Container %q has GEMINI_API_KEY = %q, expected %q", podDescription, container.Name, environmentVariable.Value, discovery.PlaceholderModelCredential)
+					}
+					if environmentVariable.ValueFrom != nil {
+						h.t.Errorf("[%s] Container %q has GEMINI_API_KEY with ValueFrom, expected plain literal value", podDescription, container.Name)
+					}
+				}
+			}
+		}
+	}
+	if !foundGeminiKey {
+		h.t.Errorf("[%s] Container %q missing expected placeholder environment variable GEMINI_API_KEY", podDescription, discovery.TaskContainerName)
 	}
 }

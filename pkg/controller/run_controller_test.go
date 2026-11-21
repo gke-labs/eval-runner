@@ -6266,12 +6266,165 @@ func TestReconcile_TaskPod_NoModelSecretEnv(t *testing.T) {
 				t.Errorf("[%s] Expected no EnvFrom in container %q, got: %+v", taskID, container.Name, container.EnvFrom)
 			}
 			for _, envVar := range container.Env {
-				if envVar.ValueFrom != nil && envVar.ValueFrom.SecretKeyRef != nil {
-					t.Errorf("[%s] Expected no SecretKeyRef in container %q env %q: %+v", taskID, container.Name, envVar.Name, envVar)
+				if envVar.ValueFrom != nil {
+					t.Errorf("[%s] Expected no ValueFrom in container %q env %q: %+v", taskID, container.Name, envVar.Name, envVar)
+				}
+			}
+			if taskID == "sample-runner-task" {
+				var foundGeminiKey bool
+				for _, envVar := range container.Env {
+					if envVar.Name == "GEMINI_API_KEY" && envVar.Value == discovery.PlaceholderModelCredential {
+						foundGeminiKey = true
+					}
+				}
+				if !foundGeminiKey {
+					t.Errorf("Expected placeholder GEMINI_API_KEY in sample-runner-task container")
+				}
+			}
+			if taskID == "sandbox-only-task" {
+				if len(container.Env) != 0 {
+					t.Errorf("Expected 0 environment variables in sandbox-only-task, got: %+v", container.Env)
 				}
 			}
 		}
 	}
+}
+
+func TestExecuteTask_SampleRunnerPromptAuthFailureWithPlaceholderCredential(t *testing.T) {
+	scheme := setupScheme(t)
+
+	manifest := &v1alpha1.Manifest{
+		Tasks: []v1alpha1.ManifestTask{
+			{
+				ID:   "docs/readme_comprehension",
+				Spec: "eval.py@sample",
+			},
+		},
+	}
+
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-run-real-model-auth-fail",
+			Namespace: "eval-runner",
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/gke-labs/eval-runner.git",
+				Commit: "abcdef123456",
+			},
+			Model: "google/gemini-3.5-flash-lite",
+		},
+		Status: v1alpha1.RunStatus{
+			Phase: v1alpha1.RunPhaseRunning,
+			Discovery: &v1alpha1.RunDiscoveryStatus{
+				TaskCount:         1,
+				EligibleTaskCount: 1,
+				TaskIDs:           []string{"docs/readme_comprehension"},
+			},
+			Tasks: []v1alpha1.TaskStatus{
+				{
+					ID:    "docs/readme_comprehension",
+					Phase: v1alpha1.TaskPhasePending,
+				},
+			},
+		},
+	}
+
+	authErrorStderr := "google.genai.errors.ClientError: 400 API_KEY_INVALID: API key not valid. Please pass a valid API key."
+	fakeClient := &sandboxclient.FakeClient{
+		InspectExit:   1,
+		InspectStderr: authErrorStderr,
+	}
+
+	testClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(run).
+		WithStatusSubresource(run).
+		Build()
+
+	reconciler := &RunReconciler{
+		Client:           testClient,
+		Scheme:           scheme,
+		SandboxNamespace: "eval-runner-sandbox",
+		SandboxClient:    fakeClient,
+	}
+	reconciler.SetCachedManifest(run.Namespace, run.Name, manifest)
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "eval-runner", Name: "test-run-real-model-auth-fail"}}
+
+	// Turn 1: Starts pending task, creates sandbox with placeholder credentials
+	startTime := time.Now()
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Turn 1 error: %v", err)
+	}
+
+	var sandboxList sandboxv1beta1.SandboxList
+	if err := testClient.List(t.Context(), &sandboxList, client.InNamespace("eval-runner-sandbox")); err != nil {
+		t.Fatalf("List sandboxes error: %v", err)
+	}
+	if len(sandboxList.Items) != 1 {
+		t.Fatalf("Expected 1 sandbox created, got %d", len(sandboxList.Items))
+	}
+
+	sampleContainer := sandboxList.Items[0].Spec.PodTemplate.Spec.Containers[0]
+	var foundGeminiKey bool
+	for _, envVar := range sampleContainer.Env {
+		if envVar.Name == "GEMINI_API_KEY" && envVar.Value == discovery.PlaceholderModelCredential {
+			foundGeminiKey = true
+		}
+	}
+	if !foundGeminiKey {
+		t.Errorf("Expected GEMINI_API_KEY placeholder on sample-runner pod")
+	}
+
+	// Create running pod to simulate ready pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxList.Items[0].Name,
+			Namespace: "eval-runner-sandbox",
+			Labels: map[string]string{
+				discovery.LabelRole: discovery.RoleSample,
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.244.0.50",
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	if err := testClient.Create(t.Context(), pod); err != nil {
+		t.Fatalf("Create pod error: %v", err)
+	}
+
+	// Turn 2: Reconcile executes task, which fails promptly with provider authentication error
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Turn 2 error: %v", err)
+	}
+	elapsed := time.Since(startTime)
+
+	var updatedRun v1alpha1.Run
+	if err := testClient.Get(t.Context(), req.NamespacedName, &updatedRun); err != nil {
+		t.Fatalf("Get run error: %v", err)
+	}
+
+	task := updatedRun.Status.Tasks[0]
+	if task.Phase != v1alpha1.TaskPhaseFailed {
+		t.Fatalf("Expected task Phase Failed, got %s", task.Phase)
+	}
+	if !strings.Contains(task.Message, "API_KEY_INVALID") {
+		t.Errorf("Expected task Message to contain provider authentication error API_KEY_INVALID, got: %s", task.Message)
+	}
+	if !strings.Contains(task.Message, "step inspect eval failed with exit code 1") {
+		t.Errorf("Expected task Message to indicate inspect eval failure, got: %s", task.Message)
+	}
+	t.Logf("Simulated real-model sample-runner prompt failure completed in %v with bounded message: %s", elapsed, task.Message)
 }
 
 func TestReconcileRunningTaskWithMissingSandboxFailsFast(t *testing.T) {

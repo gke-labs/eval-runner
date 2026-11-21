@@ -321,7 +321,7 @@ The discovery sandbox pod implements deployment topology B and concept §3.2 ("e
 
 When a `Run` specifies `spec.model`, after discovery completes, the controller executes eval tasks inside sandboxes (ADR-016, ADR-025):
 - **One sandbox per task**: Each task executes in its own dedicated sandbox running `inspect eval --limit a-b` (evaluating a window specified by `spec.sampleRange`), **not one pod per sample**. The sandbox pod is reclaimed as soon as the task completes.
-- **Model Credentials**: Task sandboxes and pods NEVER receive or hold model credentials. Model credentials belong exclusively to the controller and service portals. In model-driven runs for sandbox tasks, the agent runs in the controller; evals calling a real model from inside the pod do not work until the service portal supplies the credential.
+- **Model Credentials**: Task sandboxes and pods NEVER receive or hold real model credentials; real credentials belong exclusively to the controller and service portals. Sample-runner pods hold placeholder values (set as literal environment variables like `GEMINI_API_KEY=placeholder-model-credential` by the controller) so that evaluation SDKs make requests normally; the service portal swaps in authentic credentials on egress. Sandbox tasks (non-sample-runner) are unchanged. Without a connected service portal, the provider rejects the placeholder at once and the task fails promptly with an authentication error.
 - **Inspect Execution**: The sandbox executes `inspect eval <spec> --model <model> --limit <start>-<end>` (or `1..limit`) and writes output logs to `/workspace/out/<task-log>.json`.
 - **Result Retrieval and Metrics**: The controller pulls the Inspect log via sandboxd REST `ReadFile`, parses sample scores, computes single-task success rate and 95% confidence intervals (Wilson score interval for binary scores, Student's t-interval for continuous scores), extracts token usage (`input`, `output`, `total`), writes the log and `summary.json` to the artifact sink, and updates `Run.status.tasks[]`.
 - **Terminal Immutability**: When all tasks complete, `Run.status.phase` is set to `Completed` (or `Failed`). Once terminal, Runs are strictly immutable (ADR-025); new sample windows are evaluated by spawning fresh batch Runs.
@@ -512,7 +512,7 @@ The trust model establishes strict boundaries around untrusted repository code:
 |---|---|---|---|
 | **Controller Pod** | Mounted (`eval-runner-controller` in `eval-runner`) | None mounted; uses Workload Identity (`roles/storage.objectAdmin`) when `--artifact-bucket` configured; reads GitHub token Secret in `eval-runner` when `pullRequest` reporting configured | Read-only root filesystem (`readOnlyRootFilesystem: true`) |
 | **Webhook Pod** | Mounted (`eval-runner-webhook` in `eval-runner`) | Webhook HMAC secret (`github-webhook` or `github-app`) and GitHub App credentials (`github-app`) for collaborator permission checks and check run status updates; does NOT mount cloud or model credentials | Read-only root filesystem (`readOnlyRootFilesystem: true`) |
-| **Sandbox Pod** | **None** (`automountServiceAccountToken: false`) | **None** (zero cloud credentials; cannot access GCS, bucket, or GitHub) | Ephemeral container writable layer only |
+| **Sandbox Pod** | **None** (`automountServiceAccountToken: false`) | **None** (zero cloud or real model secrets; sample-runner pods hold plain literal placeholder credentials swapped on egress by the service portal) | Ephemeral container writable layer only |
 
 ### Reachability and Containment
 
