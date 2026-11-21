@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="reuse an already pushed sandboxd image",
     )
+    p.add_argument(
+        "--skip-service-portal",
+        action="store_true",
+        help="do not deploy or connect the service portal",
+    )
     p.add_argument("--skip-deploy", action="store_true", help="provision only; do not run ./dev/tasks/deploy")
     p.add_argument("--skip-bucket", action="store_true", help="do not create the bucket or grant access to it")
     p.add_argument(
@@ -205,6 +210,8 @@ def main() -> None:
         cmd.extend(["--set", item])
     if args.skip_sandboxd_build:
         cmd.append("--skip-sandboxd-build")
+    if args.skip_service_portal:
+        cmd.append("--skip-service-portal")
     if args.skip_deploy:
         cmd.append("--skip-deploy")
     if args.restart:

@@ -135,8 +135,10 @@ func (r *RunReconciler) servicePortalPolicy() *portalsv1.EgressPolicy {
 	return BuildServicePortalEgressPolicy(servicePortal)
 }
 
-func (r *RunReconciler) bindServicePortalPolicy(ctx context.Context, podUID string) error {
-	policy := r.servicePortalPolicy()
+func (r *RunReconciler) bindServicePortalPolicy(ctx context.Context, podUID string, policy *portalsv1.EgressPolicy) error {
+	if policy == nil {
+		policy = r.servicePortalPolicy()
+	}
 	if err := r.ServicePortalClient.Bind(ctx, podUID, policy, nil); err != nil {
 		return fmt.Errorf("service portal bind failed: %w", err)
 	}

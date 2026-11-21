@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
+	"github.com/gke-labs/eval-runner/pkg/controller"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 )
@@ -162,6 +163,14 @@ func (h *Harness) DeployEvalRunner() {
 	gitRoot := h.GetGitRoot()
 
 	deployScript := filepath.Join(gitRoot, "dev/tasks/deploy-to-kube")
+	allowedServicePortalHosts := strings.Join(append([]string{
+		"git-server.eval-runner-sandbox.svc",
+		"git-server.eval-runner-sandbox.svc.cluster.local",
+	}, controller.DefaultServicePortalAllowedHosts...), ",")
+	allowedServicePortalHTTPHosts := strings.Join(append([]string{
+		"git-server.eval-runner-sandbox.svc",
+		"git-server.eval-runner-sandbox.svc.cluster.local",
+	}, controller.DefaultServicePortalAllowedHTTPHosts...), ",")
 	h.runCmd(deployScript,
 		"--set", "artifactDir=/tmp/artifacts",
 		"--set", "defaultModel=mockllm/model",
@@ -171,6 +180,8 @@ func (h *Harness) DeployEvalRunner() {
 		"--set", "webhookRepositories=gke-labs/eval-runner",
 		"--set", "pollProgressInterval=2s",
 		"--set", "allowedCloneHosts=github.com,git-server.eval-runner-sandbox.svc",
+		"--set", fmt.Sprintf("servicePortalAllowedHosts=%s", allowedServicePortalHosts),
+		"--set", fmt.Sprintf("servicePortalAllowedHTTPHosts=%s", allowedServicePortalHTTPHosts),
 	)
 
 	// Verify service portal controller and service portal node agent readiness
@@ -199,6 +210,10 @@ stringData:
 	if !reVersion.MatchString(controllerLogs) {
 		h.t.Fatalf("expected controller logs to report stamped 40-hex VCS revision, got:\n%s", controllerLogs)
 	}
+	if !strings.Contains(controllerLogs, "Service Portal enabled") {
+		h.t.Fatalf("expected controller logs to contain %q, got:\n%s", "Service Portal enabled", controllerLogs)
+	}
+	h.t.Log("Verified eval-runner-controller connected to service portal")
 
 	// Verify controller-owned sandbox egress NetworkPolicy reconciliation
 	out := h.runCmd("kubectl", "get", "networkpolicy", "eval-runner-sandbox-egress", "-n", "eval-runner-sandbox", "-o", "json")
@@ -707,6 +722,20 @@ func (h *Harness) logTimeoutDiagnostics(namespace, runName string) {
 		h.t.Logf("Controller logs (tail 100):\n%s", string(ctrlLogs))
 	} else {
 		h.t.Logf("Failed to get controller logs: %v (output: %s)", err, string(ctrlLogs))
+	}
+
+	// 6. Last ~200 lines of Service Portal Controller logs
+	if spLogs, err := exec.Command("kubectl", "logs", "-n", "service-portal-system", "deployment/service-portal-controller", "--tail=200").CombinedOutput(); err == nil {
+		h.t.Logf("Service Portal Controller logs (tail 200):\n%s", string(spLogs))
+	} else {
+		h.t.Logf("Failed to get Service Portal Controller logs: %v (output: %s)", err, string(spLogs))
+	}
+
+	// 7. Last ~200 lines of Service Portal node agent logs
+	if agentLogs, err := exec.Command("kubectl", "logs", "-n", "service-portal-system", "daemonset/portal-node-agent", "--all-containers", "--tail=200").CombinedOutput(); err == nil {
+		h.t.Logf("Service Portal node agent logs (tail 200):\n%s", string(agentLogs))
+	} else {
+		h.t.Logf("Failed to get Service Portal node agent logs: %v (output: %s)", err, string(agentLogs))
 	}
 
 	h.t.Logf("=== END TIMEOUT DIAGNOSTICS ===")

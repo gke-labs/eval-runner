@@ -34,6 +34,7 @@ GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-default}"
 DRY_RUN=false
 SKIP_SANDBOXD_BUILD=false
 SKIP_SAMPLE_RUNNER_BUILD=false
+SKIP_SERVICE_PORTAL=false
 SKIP_DEPLOY=false
 RESTART=false
 SET_ITEMS=()
@@ -54,6 +55,7 @@ Options:
                              e.g. --set artifactBucket=my-bucket --set defaultModel=gemini-2.5-flash
   --skip-sandboxd-build      Skip building and pushing sandboxd; reuse an existing image.
   --skip-sample-runner-build Skip building and loading sample-runner; reuse an existing image.
+  --skip-service-portal      Skip deploying the service portal (NRI agent and controller).
   --skip-deploy              Provision dependencies and ConfigMap only; do not run dev/tasks/deploy.
   --restart                  Restart controller/UI/webhook deployments after deploy.
   --dry-run                  Print commands without executing mutating actions.
@@ -101,6 +103,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-sample-runner-build)
       SKIP_SAMPLE_RUNNER_BUILD=true
+      shift
+      ;;
+    --skip-service-portal)
+      SKIP_SERVICE_PORTAL=true
       shift
       ;;
     --skip-deploy)
@@ -311,56 +317,14 @@ fi
 step "ConfigMap eval-runner/eval-runner-config"
 CONFIGMAP_CHANGED="false"
 
-DESIRED_JSON="$(python3 -c '
-import json, sys
-
-desired = {"sandboxdImage": sys.argv[1]}
-for item in sys.argv[2:]:
-    if "=" in item:
-        k, v = item.split("=", 1)
-        desired[k.strip()] = v
-print(json.dumps(desired))
-' "${DEFAULT_SANDBOXD_IMAGE}" "${SET_ITEMS[@]+"${SET_ITEMS[@]}"}")"
-
-ARTIFACT_BUCKET="$(python3 -c '
-import json, sys
-data = json.loads(sys.argv[1])
-print(data.get("artifactBucket", ""))
-' "${DESIRED_JSON}")"
-
-if [[ -n "${ARTIFACT_BUCKET}" ]]; then
-  echo "    Artifact bucket: gs://${ARTIFACT_BUCKET}"
-  echo "    Note: The controller and UI use Application Default Credentials (ADC) for bucket access."
-  echo "    On non-GKE clusters, ensure the node service account (or equivalent IAM provider) has"
-  echo "    roles/storage.objectAdmin granted on bucket gs://${ARTIFACT_BUCKET}."
-fi
-
-if [[ "${DRY_RUN}" == "true" ]]; then
-  MANIFEST_JSON="$(python3 -c '
-import json, sys
-desired = json.loads(sys.argv[1])
-manifest = {
-    "apiVersion": "v1",
-    "kind": "ConfigMap",
-    "metadata": {"name": "eval-runner-config", "namespace": "eval-runner"},
-    "data": desired,
-}
-print(json.dumps(manifest, indent=2))
-' "${DESIRED_JSON}")"
-  run_cmd_stdin "${MANIFEST_JSON}" kubectl apply -f -
-  python3 -c '
-import json, sys
-desired = json.loads(sys.argv[1])
-for k, v in sorted(desired.items()):
-    print(f"    {k}: {v}")
-' "${DESIRED_JSON}"
-else
-  EXISTING_RAW="$(kubectl -n eval-runner get configmap eval-runner-config -o json 2>/dev/null || echo "")"
-  MERGE_RESULT="$(python3 -c '
+EXISTING_RAW="$(kubectl -n eval-runner get configmap eval-runner-config -o json 2>/dev/null || echo "")"
+MERGE_RESULT="$(python3 -c '
 import json, sys
 
 existing_raw = sys.argv[1].strip()
-desired = json.loads(sys.argv[2])
+default_sandboxd_image = sys.argv[2]
+skip_service_portal = (sys.argv[3].lower() == "true")
+set_items = sys.argv[4:]
 
 data = {}
 if existing_raw:
@@ -369,8 +333,34 @@ if existing_raw:
     except Exception:
         data = {}
 
+user_overrides = {}
+for item in set_items:
+    if "=" in item:
+        k, v = item.split("=", 1)
+        user_overrides[k.strip()] = v
+
 merged = dict(data)
-merged.update(desired)
+
+service_portal_keys = ("servicePortalControllerAddress", "servicePortalControllerCAFile", "servicePortalTokenFile")
+service_portal_defaults = {
+    "servicePortalControllerAddress": "service-portal-controller.service-portal-system.svc:8443",
+    "servicePortalControllerCAFile": "/etc/service-portal/tls.crt",
+    "servicePortalTokenFile": "/var/run/secrets/service-portal/token",
+}
+if skip_service_portal:
+    if merged.get("servicePortalControllerAddress") == service_portal_defaults["servicePortalControllerAddress"]:
+        for k in service_portal_keys:
+            if k not in user_overrides:
+                merged.pop(k, None)
+else:
+    for k, v in service_portal_defaults.items():
+        if k not in merged:
+            merged[k] = v
+
+if "sandboxdImage" not in user_overrides:
+    merged["sandboxdImage"] = default_sandboxd_image
+
+merged.update(user_overrides)
 
 changed = (merged != data)
 manifest = {
@@ -381,20 +371,42 @@ manifest = {
 }
 print("CHANGED" if changed else "UNCHANGED")
 print(json.dumps(manifest))
-' "${EXISTING_RAW}" "${DESIRED_JSON}")"
+' "${EXISTING_RAW}" "${DEFAULT_SANDBOXD_IMAGE}" "${SKIP_SERVICE_PORTAL}" "${SET_ITEMS[@]+"${SET_ITEMS[@]}"}")"
 
-  STATUS="$(echo "${MERGE_RESULT}" | head -n 1)"
-  MANIFEST="$(echo "${MERGE_RESULT}" | tail -n +2)"
+STATUS="$(echo "${MERGE_RESULT}" | head -n 1)"
+MANIFEST="$(echo "${MERGE_RESULT}" | tail -n +2)"
 
+ARTIFACT_BUCKET="$(python3 -c '
+import json, sys
+data = json.loads(sys.argv[1]).get("data") or {}
+print(data.get("artifactBucket", ""))
+' "${MANIFEST}")"
+
+if [[ -n "${ARTIFACT_BUCKET}" ]]; then
+  echo "    Artifact bucket: gs://${ARTIFACT_BUCKET}"
+  echo "    Note: The controller and UI use Application Default Credentials (ADC) for bucket access."
+  echo "    On non-GKE clusters, ensure the node service account (or equivalent IAM provider) has"
+  echo "    roles/storage.objectAdmin granted on bucket gs://${ARTIFACT_BUCKET}."
+fi
+
+if [[ "${DRY_RUN}" == "true" ]]; then
+  run_cmd_stdin "${MANIFEST}" kubectl apply -f -
+  python3 -c '
+import json, sys
+data = json.loads(sys.argv[1]).get("data") or {}
+for k, v in sorted(data.items()):
+    print(f"    {k}: {v}")
+' "${MANIFEST}"
+else
   if [[ "${STATUS}" == "CHANGED" ]]; then
     CONFIGMAP_CHANGED="true"
     printf '%s' "${MANIFEST}" | kubectl apply -f -
     python3 -c '
 import json, sys
-desired = json.loads(sys.argv[1])
-for k, v in sorted(desired.items()):
+data = json.loads(sys.argv[1]).get("data") or {}
+for k, v in sorted(data.items()):
     print(f"    {k}: {v}")
-' "${DESIRED_JSON}"
+' "${MANIFEST}"
   else
     echo "    configmap eval-runner/eval-runner-config already up to date"
   fi
@@ -417,13 +429,16 @@ else
 fi
 
 # Step 6: Service portal TLS certificates
-step "Service portal TLS certificates"
 SERVICE_PORTAL_CERTS_GENERATED=false
-if [[ "${DRY_RUN}" == "true" ]]; then
+if [[ "${SKIP_SERVICE_PORTAL}" == "true" ]]; then
+  step "Service portal TLS certificates (skipped)"
+elif [[ "${DRY_RUN}" == "true" ]]; then
+  step "Service portal TLS certificates"
   run_cmd kubectl get secret service-portal-controller-tls -n service-portal-system
   run_cmd kubectl get secret service-portal-controller-ca -n service-portal-system
   run_cmd kubectl get secret service-portal-controller-ca -n eval-runner
 else
+  step "Service portal TLS certificates"
   kubectl create namespace service-portal-system --dry-run=client -o yaml | kubectl apply -f -
   kubectl label namespace service-portal-system pod-security.kubernetes.io/enforce=privileged --overwrite
 
@@ -475,7 +490,7 @@ EOF
 fi
 
 # Step 7: Service portal deployment
-if [[ "${SKIP_DEPLOY}" == "true" ]]; then
+if [[ "${SKIP_SERVICE_PORTAL}" == "true" ]]; then
   step "Service portal deployment (skipped)"
 else
   step "Service portal deployment (${SERVICE_PORTALS_COMMIT})"
@@ -556,12 +571,19 @@ else
     DEPLOY_ARGS+=(--skip-push)
   fi
 
+  CONTROLLER_NEEDS_RESTART=false
+  if [[ "${CONFIGMAP_CHANGED}" == "true" || "${SERVICE_PORTAL_CERTS_GENERATED}" == "true" ]]; then
+    CONTROLLER_NEEDS_RESTART=true
+  fi
+
   if [[ "${DRY_RUN}" == "true" ]]; then
     run_cmd "${REPO_ROOT}/dev/tasks/deploy" --dry-run "${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}"
     if [[ "${RESTART}" == "true" ]]; then
       for d in eval-runner-controller eval-runner-ui eval-runner-webhook; do
         run_cmd kubectl -n eval-runner rollout restart "deployment/${d}"
       done
+    elif [[ "${CONTROLLER_NEEDS_RESTART}" == "true" ]]; then
+      run_cmd kubectl -n eval-runner rollout restart deployment/eval-runner-controller
     fi
     for d in eval-runner-controller eval-runner-ui eval-runner-webhook; do
       run_cmd kubectl -n eval-runner rollout status "deployment/${d}" --timeout=300s
@@ -573,13 +595,15 @@ else
       for d in eval-runner-controller eval-runner-ui eval-runner-webhook; do
         kubectl -n eval-runner rollout restart "deployment/${d}"
       done
+    elif [[ "${CONTROLLER_NEEDS_RESTART}" == "true" ]]; then
+      kubectl -n eval-runner rollout restart deployment/eval-runner-controller
     fi
     for d in eval-runner-controller eval-runner-ui eval-runner-webhook; do
       kubectl -n eval-runner rollout status "deployment/${d}" --timeout=300s
     done
 
     SINCE_ARG=""
-    if [[ "${CONFIGMAP_CHANGED}" == "true" ]]; then
+    if [[ "${RESTART}" == "true" || "${CONTROLLER_NEEDS_RESTART}" == "true" ]]; then
       SINCE_ARG="${STARTED_TIME}"
     fi
     wait_for_effective_settings "${ARTIFACT_BUCKET}" "${SINCE_ARG}"

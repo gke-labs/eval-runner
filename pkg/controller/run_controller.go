@@ -2687,13 +2687,22 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 			if pod.Spec.NodeName == "" {
 				continue
 			}
+			r.cfgMu.RLock()
+			spOptions := r.Config.ServicePortal
+			r.cfgMu.RUnlock()
+			policy := BuildServicePortalEgressPolicy(spOptions)
+			logger.Info("Binding service portal policy", "task", t.ID, "podUID", pod.UID, "node", pod.Spec.NodeName,
+				"httpsHostsCount", len(spOptions.AllowedHosts), "httpHostsCount", len(spOptions.AllowedHTTPHosts),
+				"httpsHosts", truncateHostList(spOptions.AllowedHosts, 5), "httpHosts", truncateHostList(spOptions.AllowedHTTPHosts, 5))
 			bindContext, bindCancel := r.stepContext(ctx, run.Status.ExecutionDeadline, r.executionStepTimeout())
-			bindError := r.bindServicePortalPolicy(bindContext, string(pod.UID))
+			bindError := r.bindServicePortalPolicy(bindContext, string(pod.UID), policy)
 			bindCancel()
 			if bindError != nil {
+				logger.Error(bindError, "Failed to bind service portal policy", "task", t.ID, "podUID", pod.UID)
 				terminalFailures[t.ID] = bindError.Error()
 				continue
 			}
+			logger.Info("Successfully bound service portal policy", "task", t.ID, "podUID", pod.UID)
 			r.markServicePortalPodBound(pod.UID)
 		}
 
@@ -4595,4 +4604,12 @@ func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}),
 		).
 		Complete(r)
+}
+
+func truncateHostList(hosts []string, limit int) []string {
+	if len(hosts) <= limit {
+		return hosts
+	}
+	res := append([]string(nil), hosts[:limit]...)
+	return append(res, fmt.Sprintf("... (%d total)", len(hosts)))
 }

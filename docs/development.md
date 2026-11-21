@@ -192,6 +192,8 @@ On kind clusters (active context matching `kind-*`), `IMAGE_PREFIX` defaults to 
 Options:
 - `--set KEY=VALUE`: Merges extra ConfigMap entries (repeatable), for example `--set artifactBucket=my-bucket` or `--set defaultModel=gemini-2.5-flash`.
 - `--skip-sandboxd-build`: Skips building and pushing `sandboxd`, reusing an already pushed image index.
+- `--skip-sample-runner-build`: Skips building and loading `sample-runner`, reusing an already built image.
+- `--skip-service-portal`: Skips deploying the service portal (NRI agent and controller) and connecting the eval-runner controller to it.
 - `--skip-deploy`: Provisions namespaces, `agent-sandbox`, `sandboxd`, and ConfigMap without running `./dev/tasks/deploy`.
 - `--restart`: Restarts deployments after deploy.
 - `--dry-run`: Prints commands without executing mutating actions.
@@ -664,6 +666,10 @@ The `service-portal-controller` Deployment and `portal-node-agent` DaemonSet run
 - `service-portal-controller`: Central gRPC controller that receives egress policies from the sandbox controller and pushes them to node agents.
 - `portal-node-agent`: Per-node agent connecting to containerd (`/var/run/nri/nri.sock`) that redirects intercepted traffic to a local proxy, dynamically mints TLS certificates, and swaps authentic credentials based on bound egress policies.
 
+`dev/tasks/deploy-to-kube` installs the service portal components in the `service-portal-system` namespace, generates throwaway TLS and CA Secrets, copies the CA to the `eval-runner` namespace, and configures the eval-runner controller via `eval-runner-config` (`servicePortalControllerAddress`, `servicePortalControllerCAFile`, `servicePortalTokenFile`). Workload task sandboxes carry the `service-portal.gke.io/intercept` label and have their egress policies bound by the controller before running tasks.
+
+To deploy without the service portal, pass `--skip-service-portal` to `dev/tasks/deploy-to-kube`. When deployed without the service portal, the controller logs `Service Portal disabled (no controller address configured)` and task sandboxes run without service portal interception.
+
 #### Node Prerequisite
 
 The node agent requires containerd with NRI enabled (configured via `containerdConfigPatches` on kind, or default in containerd 2.0+).
@@ -824,6 +830,7 @@ Both the controller and UI watch `eval-runner-config` and dynamically apply conf
 Settings that bind to host interfaces, define process identity, or configure webhook startup cannot change at runtime and require restarting the corresponding Deployment or pod:
 - **Listen and Probe Addresses**: Controller and UI bind addresses (e.g. `--health-probe-bind-address`, `--listen-addr`).
 - **Namespaces**: Target Kubernetes namespaces (e.g. `--namespace`, `--sandbox-namespace`).
+- **Service Portal Settings**: `servicePortalControllerAddress`, `servicePortalControllerCAFile`, and `servicePortalTokenFile` configure the gRPC client connection at controller startup and require restarting `eval-runner-controller` if modified.
 - **Webhook Settings**: Keys consumed by `eval-runner-webhook` (`githubWebhookSecret`, `webhookRepositories`, `allowedCloneHosts`, `defaultBatchSize`, `defaultMaxSamplesPerTask`, `defaultModel`) are read once at webhook startup and remain restart-only.
 
 ### Empty-Value Semantics and Feature Disabling
