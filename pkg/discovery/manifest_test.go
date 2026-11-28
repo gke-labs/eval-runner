@@ -1470,3 +1470,582 @@ func TestValidateTaskAgent(t *testing.T) {
 		})
 	}
 }
+
+func TestParseManifest_Prebuilds(t *testing.T) {
+	manifestJSON := []byte(`{
+		"prebuilds": {
+			"kind-images": {
+				"image": "kube-agents-builder:v1",
+				"command": ["bash", "hack/prebuild-images.sh"],
+				"timeoutSeconds": 900,
+				"paths": ["cmd/**", "pkg/**", "Dockerfile"],
+				"resources": [
+					{ "type": "sandbox", "limits": { "cpu": "4", "memory": "8Gi" } },
+					{ "type": "kind-cluster", "limits": { "cpu": "6", "memory": "12Gi" } }
+				]
+			},
+			"unit-fixtures": {
+				"image": "golang:1.27",
+				"command": ["go", "build", "./..."]
+			}
+		},
+		"tasks": [
+			{
+				"id": "kube-agents/task-with-prebuild",
+				"spec": "eval.py@kind_task",
+				"image": "kube-agents-eval:v1",
+				"command": ["./run.sh"],
+				"resources": [
+					{ "type": "sandbox" },
+					{ "type": "kind-cluster" }
+				],
+				"prebuild": "kind-images"
+			},
+			{
+				"id": "kube-agents/task-without-prebuild",
+				"spec": "eval.py@simple_task"
+			}
+		]
+	}`)
+
+	manifest, err := ParseManifest(manifestJSON)
+	if err != nil {
+		t.Fatalf("ParseManifest failed: %v", err)
+	}
+	if err := ValidateManifest(manifest); err != nil {
+		t.Fatalf("ValidateManifest failed: %v", err)
+	}
+
+	if len(manifest.Prebuilds) != 2 {
+		t.Fatalf("len(manifest.Prebuilds) = %d, want 2", len(manifest.Prebuilds))
+	}
+
+	kindPrebuild, exists := manifest.Prebuilds["kind-images"]
+	if !exists {
+		t.Fatalf("expected prebuild %q in manifest.Prebuilds", "kind-images")
+	}
+	if kindPrebuild.Image != "kube-agents-builder:v1" {
+		t.Errorf("kindPrebuild.Image = %q, want %q", kindPrebuild.Image, "kube-agents-builder:v1")
+	}
+	if len(kindPrebuild.Command) != 2 || kindPrebuild.Command[0] != "bash" || kindPrebuild.Command[1] != "hack/prebuild-images.sh" {
+		t.Errorf("kindPrebuild.Command = %v, want [bash hack/prebuild-images.sh]", kindPrebuild.Command)
+	}
+	if kindPrebuild.TimeoutSeconds != 900 {
+		t.Errorf("kindPrebuild.TimeoutSeconds = %d, want 900", kindPrebuild.TimeoutSeconds)
+	}
+	if len(kindPrebuild.Paths) != 3 || kindPrebuild.Paths[0] != "cmd/**" || kindPrebuild.Paths[2] != "Dockerfile" {
+		t.Errorf("kindPrebuild.Paths = %v, want [cmd/** pkg/** Dockerfile]", kindPrebuild.Paths)
+	}
+	if len(kindPrebuild.Resources) != 2 {
+		t.Fatalf("len(kindPrebuild.Resources) = %d, want 2", len(kindPrebuild.Resources))
+	}
+	if kindPrebuild.Resources[0].Type != v1alpha1.ResourceTypeSandbox {
+		t.Errorf("kindPrebuild.Resources[0].Type = %q, want %q", kindPrebuild.Resources[0].Type, v1alpha1.ResourceTypeSandbox)
+	}
+	if kindPrebuild.Resources[1].Type != v1alpha1.ResourceTypeKindCluster {
+		t.Errorf("kindPrebuild.Resources[1].Type = %q, want %q", kindPrebuild.Resources[1].Type, v1alpha1.ResourceTypeKindCluster)
+	}
+
+	if manifest.Tasks[0].Prebuild != "kind-images" {
+		t.Errorf("manifest.Tasks[0].Prebuild = %q, want %q", manifest.Tasks[0].Prebuild, "kind-images")
+	}
+	if manifest.Tasks[1].Prebuild != "" {
+		t.Errorf("manifest.Tasks[1].Prebuild = %q, want empty string", manifest.Tasks[1].Prebuild)
+	}
+
+	copied := manifest.DeepCopy()
+	copiedPrebuild := copied.Prebuilds["kind-images"]
+	copiedPrebuild.Command[0] = "sh"
+	copiedPrebuild.Paths[0] = "other/**"
+	copiedPrebuild.Resources[0].Limits[corev1.ResourceCPU] = resource.MustParse("1")
+	if manifest.Prebuilds["kind-images"].Command[0] != "bash" {
+		t.Errorf("DeepCopy shared Command slice with original manifest")
+	}
+	if manifest.Prebuilds["kind-images"].Paths[0] != "cmd/**" {
+		t.Errorf("DeepCopy shared Paths slice with original manifest")
+	}
+	originalCPU := manifest.Prebuilds["kind-images"].Resources[0].Limits[corev1.ResourceCPU]
+	if originalCPU.Cmp(resource.MustParse("4")) != 0 {
+		t.Errorf("DeepCopy shared Resources Limits with original manifest: got %s, want 4", originalCPU.String())
+	}
+}
+
+func TestValidateManifest_Prebuilds(t *testing.T) {
+	validPrebuild := v1alpha1.ManifestPrebuild{
+		Image:   "builder:v1",
+		Command: []string{"./scripts/prebuild.sh"},
+	}
+
+	tests := []struct {
+		name               string
+		manifest           *v1alpha1.Manifest
+		expectError        bool
+		expectedSubstrings []string
+	}{
+		{
+			name: "backward compatible manifest without prebuilds",
+			manifest: &v1alpha1.Manifest{
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@task1"},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "backward compatible manifest with empty prebuilds map",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@task1"},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid manifest with prebuilds and tasks with and without prebuild",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"a": {
+						Image:          "builder:v1",
+						Command:        []string{"make", "images"},
+						TimeoutSeconds: 0,
+					},
+					"kind-images": {
+						Image:          "kube-agents-builder:v1",
+						Command:        []string{"bash", "-c", "echo build"},
+						TimeoutSeconds: 1800,
+						Paths:          []string{"cmd/**", "pkg/**", "go.mod"},
+						Resources: []v1alpha1.ManifestResource{
+							{
+								Type: v1alpha1.ResourceTypeSandbox,
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("16"),
+									corev1.ResourceMemory: resource.MustParse("64Gi"),
+								},
+							},
+							{
+								Type: v1alpha1.ResourceTypeKindCluster,
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("6"),
+									corev1.ResourceMemory: resource.MustParse("12Gi"),
+								},
+							},
+						},
+					},
+					strings.Repeat("b", 63): validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-with-kind-prebuild", Spec: "eval.py@t1", Prebuild: "kind-images"},
+					{ID: "task-with-single-char-prebuild", Spec: "eval.py@t2", Prebuild: "a"},
+					{ID: "task-without-prebuild", Spec: "eval.py@t3"},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "undefined task prebuild with nil prebuilds map",
+			manifest: &v1alpha1.Manifest{
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-missing-prebuild", Spec: "eval.py@t1", Prebuild: "kind-images"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"task-missing-prebuild", "undefined prebuild", "kind-images"},
+		},
+		{
+			name: "undefined task prebuild when other prebuilds exist",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"existing-prebuild": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-wrong-prebuild", Spec: "eval.py@t1", Prebuild: "other-prebuild"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"task-wrong-prebuild", "undefined prebuild", "other-prebuild"},
+		},
+		{
+			name: "whitespace task prebuild fails validation",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"existing-prebuild": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-whitespace-prebuild", Spec: "eval.py@t1", Prebuild: "   "},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"task-whitespace-prebuild", "undefined prebuild"},
+		},
+		{
+			name: "empty prebuild image",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"no-image": {
+						Image:   "",
+						Command: []string{"./build.sh"},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1", Prebuild: "no-image"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"no-image", "image"},
+		},
+		{
+			name: "whitespace prebuild image",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"blank-image": {
+						Image:   "   ",
+						Command: []string{"./build.sh"},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"blank-image", "image"},
+		},
+		{
+			name: "nil prebuild command",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"nil-command": {
+						Image: "builder:v1",
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"nil-command", "command"},
+		},
+		{
+			name: "empty prebuild command slice",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"empty-command": {
+						Image:   "builder:v1",
+						Command: []string{},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"empty-command", "command"},
+		},
+		{
+			name: "blank executable in prebuild command",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"blank-executable": {
+						Image:   "builder:v1",
+						Command: []string{"   "},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"blank-executable", "command"},
+		},
+		{
+			name: "negative prebuild timeoutSeconds",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"neg-timeout": {
+						Image:          "builder:v1",
+						Command:        []string{"./build.sh"},
+						TimeoutSeconds: -1,
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"neg-timeout", "timeoutSeconds", "-1"},
+		},
+		{
+			name: "invalid prebuild name empty",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"invalid name"},
+		},
+		{
+			name: "invalid prebuild name uppercase",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"Kind-Images": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"Kind-Images", "invalid name"},
+		},
+		{
+			name: "invalid prebuild name underscore",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"kind_images": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"kind_images", "invalid name"},
+		},
+		{
+			name: "invalid prebuild name leading dash",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"-kind": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"-kind", "invalid name"},
+		},
+		{
+			name: "invalid prebuild name trailing dash",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"kind-": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"kind-", "invalid name"},
+		},
+		{
+			name: "invalid prebuild name slash",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"kind/images": validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"kind/images", "invalid name"},
+		},
+		{
+			name: "invalid prebuild name exceeding 63 chars",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					strings.Repeat("a", 64): validPrebuild,
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"invalid name"},
+		},
+		{
+			name: "invalid prebuild resource empty type",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"bad-resource-type": {
+						Image:     "builder:v1",
+						Command:   []string{"./build.sh"},
+						Resources: []v1alpha1.ManifestResource{{Type: ""}},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"bad-resource-type", "empty type"},
+		},
+		{
+			name: "invalid prebuild resource limits on non-sandbox resource",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"bad-gcp-limits": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Resources: []v1alpha1.ManifestResource{
+							{
+								Type:   v1alpha1.ResourceTypeGCPProject,
+								Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+							},
+						},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"bad-gcp-limits", "limits"},
+		},
+		{
+			name: "invalid prebuild resource unsupported limit key",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"bad-limit-key": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Resources: []v1alpha1.ManifestResource{
+							{
+								Type:   v1alpha1.ResourceTypeSandbox,
+								Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+							},
+						},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"bad-limit-key", "nvidia.com/gpu"},
+		},
+		{
+			name: "invalid prebuild resource cpu over cap",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"over-cpu": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Resources: []v1alpha1.ManifestResource{
+							{
+								Type:   v1alpha1.ResourceTypeKindCluster,
+								Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("17")},
+							},
+						},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"over-cpu", "cpu", "17"},
+		},
+		{
+			name: "invalid prebuild resource memory over cap",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"over-memory": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Resources: []v1alpha1.ManifestResource{
+							{
+								Type:   v1alpha1.ResourceTypeSandbox,
+								Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("65Gi")},
+							},
+						},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"over-memory", "memory", "65Gi"},
+		},
+		{
+			name: "invalid prebuild resource zero cpu",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"zero-cpu": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Resources: []v1alpha1.ManifestResource{
+							{
+								Type:   v1alpha1.ResourceTypeSandbox,
+								Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+							},
+						},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"zero-cpu", "cpu", "0"},
+		},
+		{
+			name: "invalid prebuild path pattern",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"bad-path": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Paths:   []string{"cmd/["},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"bad-path", "path pattern"},
+		},
+		{
+			name: "empty prebuild path pattern",
+			manifest: &v1alpha1.Manifest{
+				Prebuilds: map[string]v1alpha1.ManifestPrebuild{
+					"empty-path": {
+						Image:   "builder:v1",
+						Command: []string{"./build.sh"},
+						Paths:   []string{""},
+					},
+				},
+				Tasks: []v1alpha1.ManifestTask{
+					{ID: "task-1", Spec: "eval.py@t1"},
+				},
+			},
+			expectError:        true,
+			expectedSubstrings: []string{"empty-path", "empty path pattern"},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := ValidateManifest(testCase.manifest)
+			if !testCase.expectError {
+				if err != nil {
+					t.Fatalf("ValidateManifest unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateManifest expected error, got nil")
+			}
+			errorMessage := err.Error()
+			for _, expectedSubstring := range testCase.expectedSubstrings {
+				if !strings.Contains(errorMessage, expectedSubstring) {
+					t.Errorf("error %q should contain %q", errorMessage, expectedSubstring)
+				}
+			}
+		})
+	}
+}

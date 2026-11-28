@@ -17,15 +17,18 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/pkg/affinity"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 var (
@@ -73,6 +76,7 @@ func ParseManifest(data []byte) (*v1alpha1.Manifest, error) {
 
 // ValidateManifest validates the discovered manifest:
 // - Manifest must not be nil
+// - Prebuilds (if present) must have valid DNS-1123 label names, non-blank image, non-empty command, timeoutSeconds >= 0, valid paths, and valid resources
 // - tasks must not be empty
 // - tasks must not exceed MaxTasks
 // - Each task must have a non-empty, unique ID
@@ -81,9 +85,14 @@ func ParseManifest(data []byte) (*v1alpha1.Manifest, error) {
 // - Each task specifying command requires a non-blank image
 // - Each task specifying sandbox resource requires a non-blank image
 // - Each task specifying gcp-project resource must not set limits (limits are only valid on sandbox or kind-cluster)
+// - Each task's Prebuild (if set) must reference an existing key in Manifest.Prebuilds
 func ValidateManifest(m *v1alpha1.Manifest) error {
 	if m == nil {
 		return fmt.Errorf("manifest cannot be nil")
+	}
+
+	if err := validateManifestPrebuilds(m.Prebuilds); err != nil {
+		return err
 	}
 
 	if len(m.Tasks) == 0 {
@@ -133,18 +142,13 @@ func ValidateManifest(m *v1alpha1.Manifest) error {
 			}
 		}
 
-		if len(task.Paths) > MaxTaskPaths {
-			return fmt.Errorf("task %q has %d paths, exceeding maximum allowed (%d)", id, len(task.Paths), MaxTaskPaths)
+		if err := validatePathPatterns(fmt.Sprintf("task %q", id), task.Paths); err != nil {
+			return err
 		}
-		for _, p := range task.Paths {
-			if len(p) == 0 {
-				return fmt.Errorf("task %q has empty path pattern", id)
-			}
-			if len(p) > MaxPathLength {
-				return fmt.Errorf("task %q path pattern exceeds maximum length (%d)", id, MaxPathLength)
-			}
-			if err := affinity.ValidatePattern(p); err != nil {
-				return fmt.Errorf("task %q has invalid path pattern %q: %w", id, p, err)
+
+		if task.Prebuild != "" {
+			if _, exists := m.Prebuilds[task.Prebuild]; !exists {
+				return fmt.Errorf("task %q references undefined prebuild %q", id, task.Prebuild)
 			}
 		}
 
@@ -163,32 +167,89 @@ func ValidateManifest(m *v1alpha1.Manifest) error {
 	return nil
 }
 
+func validateManifestPrebuilds(prebuilds map[string]v1alpha1.ManifestPrebuild) error {
+	for _, prebuildName := range slices.Sorted(maps.Keys(prebuilds)) {
+		prebuild := prebuilds[prebuildName]
+		if validationErrors := validation.IsDNS1123Label(prebuildName); len(validationErrors) > 0 {
+			return fmt.Errorf("prebuild %q has invalid name: %s", prebuildName, strings.Join(validationErrors, "; "))
+		}
+		if strings.TrimSpace(prebuild.Image) == "" {
+			return fmt.Errorf("prebuild %q has empty image: image is required", prebuildName)
+		}
+		if len(prebuild.Command) == 0 || strings.TrimSpace(prebuild.Command[0]) == "" {
+			return fmt.Errorf("prebuild %q has empty command: command is required", prebuildName)
+		}
+		if prebuild.TimeoutSeconds < 0 {
+			return fmt.Errorf("prebuild %q has invalid timeoutSeconds %d: must be >= 0", prebuildName, prebuild.TimeoutSeconds)
+		}
+		if err := validatePathPatterns(fmt.Sprintf("prebuild %q", prebuildName), prebuild.Paths); err != nil {
+			return err
+		}
+		if err := ValidatePrebuildResources(prebuildName, prebuild); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePathPatterns(subject string, paths []string) error {
+	if len(paths) > MaxTaskPaths {
+		return fmt.Errorf("%s has %d paths, exceeding maximum allowed (%d)", subject, len(paths), MaxTaskPaths)
+	}
+	for _, pattern := range paths {
+		if len(pattern) == 0 {
+			return fmt.Errorf("%s has empty path pattern", subject)
+		}
+		if len(pattern) > MaxPathLength {
+			return fmt.Errorf("%s path pattern exceeds maximum length (%d)", subject, MaxPathLength)
+		}
+		if err := affinity.ValidatePattern(pattern); err != nil {
+			return fmt.Errorf("%s has invalid path pattern %q: %w", subject, pattern, err)
+		}
+	}
+	return nil
+}
+
 // ValidateTaskResources validates declarative resource requirements for a task:
+// - resource type must be non-empty.
 // - cpu and memory limits are only valid on resources of type sandbox or kind-cluster.
 // - cpu and memory limits must be positive (> 0).
 // - cpu limit must not exceed MaxTaskCPULimit (16).
 // - memory limit must not exceed MaxTaskMemoryLimit (64Gi).
 func ValidateTaskResources(task v1alpha1.ManifestTask) error {
-	taskID := task.ID
-	for _, manifestResource := range task.Resources {
+	return validateManifestResources(fmt.Sprintf("task %q", task.ID), task.Resources)
+}
+
+// ValidatePrebuildResources validates declarative resource requirements for a prebuild
+// using the same resource validation rules as ValidateTaskResources.
+func ValidatePrebuildResources(prebuildName string, prebuild v1alpha1.ManifestPrebuild) error {
+	return validateManifestResources(fmt.Sprintf("prebuild %q", prebuildName), prebuild.Resources)
+}
+
+func validateManifestResources(subject string, resources []v1alpha1.ManifestResource) error {
+	for _, manifestResource := range resources {
+		if strings.TrimSpace(manifestResource.Type) == "" {
+			return fmt.Errorf("%s has resource with empty type", subject)
+		}
 		if manifestResource.Type != v1alpha1.ResourceTypeSandbox && manifestResource.Type != v1alpha1.ResourceTypeKindCluster {
 			if len(manifestResource.Limits) > 0 {
-				return fmt.Errorf("task %q has invalid limits %v: limits are only valid on sandbox or kind-cluster resources", taskID, manifestResource.Limits)
+				return fmt.Errorf("%s has invalid limits %v: limits are only valid on sandbox or kind-cluster resources", subject, manifestResource.Limits)
 			}
 			continue
 		}
 
-		for resourceName, quantity := range manifestResource.Limits {
+		for _, resourceName := range slices.Sorted(maps.Keys(manifestResource.Limits)) {
+			quantity := manifestResource.Limits[resourceName]
 			limitCap, supported := maxTaskResourceLimits[resourceName]
 			if !supported {
-				return fmt.Errorf("task %q has invalid resource limit %q with value %q: unsupported resource key", taskID, string(resourceName), quantity.String())
+				return fmt.Errorf("%s has invalid resource limit %q with value %q: unsupported resource key", subject, string(resourceName), quantity.String())
 			}
 
 			if quantity.Sign() <= 0 {
-				return fmt.Errorf("task %q has invalid %s %q: must be positive", taskID, string(resourceName), quantity.String())
+				return fmt.Errorf("%s has invalid %s %q: must be positive", subject, string(resourceName), quantity.String())
 			}
 			if quantity.Cmp(limitCap.capQuantity) > 0 {
-				return fmt.Errorf("task %q has invalid %s %q: exceeds maximum allowed %s", taskID, string(resourceName), quantity.String(), limitCap.capString)
+				return fmt.Errorf("%s has invalid %s %q: exceeds maximum allowed %s", subject, string(resourceName), quantity.String(), limitCap.capString)
 			}
 		}
 	}
