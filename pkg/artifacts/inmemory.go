@@ -35,6 +35,7 @@ type InMemorySink struct {
 }
 
 var _ ArtifactSink = (*InMemorySink)(nil)
+var _ PrebuildMarkerStorer = (*InMemorySink)(nil)
 
 // NewInMemorySink creates a new InMemorySink.
 func NewInMemorySink() *InMemorySink {
@@ -133,6 +134,41 @@ func (s *InMemorySink) StoreTaskFile(ctx context.Context, meta RunMetadata, file
 	defer s.mu.Unlock()
 	stored, err := s.storeTaskFileLocked(meta, filename, data)
 	return stored.Location, err
+}
+
+// StorePrebuildMarker implements PrebuildMarkerStorer for InMemorySink, writing
+// runs/<commit>/prebuilds/<prebuildName>/done.json.
+func (s *InMemorySink) StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error) {
+	if err := ValidateSafeComponent("commit", commit); err != nil {
+		return "", err
+	}
+	if err := ValidateSafeComponent("prebuildName", prebuildName); err != nil {
+		return "", err
+	}
+
+	limit := s.maxBytes
+	if limit <= 0 {
+		limit = DefaultMaxLoadBytes
+	}
+	if int64(len(data)) > limit {
+		return "", fmt.Errorf("prebuild marker size %d exceeds maximum allowed size of %d bytes", len(data), limit)
+	}
+
+	objectKey := fmt.Sprintf("runs/%s/prebuilds/%s/%s", commit, prebuildName, PrebuildMarkerFilename)
+	uri := fmt.Sprintf("mem://%s", objectKey)
+
+	copied := make([]byte, len(data))
+	copy(copied, data)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[objectKey] = copied
+	s.metadata[objectKey] = map[string]string{
+		"commit":       commit,
+		"prebuildName": prebuildName,
+	}
+
+	return uri, nil
 }
 
 // StoreArtifact persists the raw log bytes for a task.

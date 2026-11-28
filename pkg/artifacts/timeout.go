@@ -67,6 +67,22 @@ func comparisonTarget(sink ArtifactSink, compName string) string {
 	return fmt.Sprintf("comparisons/%s.json", compName)
 }
 
+// PrebuildMarkerTarget resolves the storage target or URI for a per-commit prebuild
+// completion marker (runs/<commit>/prebuilds/<prebuildName>/done.json).
+func PrebuildMarkerTarget(sink ArtifactSink, commit, prebuildName string) string {
+	trimmedCommit := strings.TrimSpace(commit)
+	trimmedPrebuildName := strings.TrimSpace(prebuildName)
+	if trimmedCommit == "" || trimmedPrebuildName == "" {
+		return ""
+	}
+	if sink != nil {
+		if prefix := sink.ArtifactPrefix(trimmedCommit); prefix != "" {
+			return fmt.Sprintf("%sprebuilds/%s/%s", prefix, trimmedPrebuildName, PrebuildMarkerFilename)
+		}
+	}
+	return fmt.Sprintf("runs/%s/prebuilds/%s/%s", trimmedCommit, trimmedPrebuildName, PrebuildMarkerFilename)
+}
+
 func storeWithTimeout[T any](ctx context.Context, op, target string, fn func() (T, error)) (T, error) {
 	type result struct {
 		val T
@@ -126,6 +142,22 @@ func StoreTaskFileWithTimeout(ctx context.Context, sink ArtifactSink, meta RunMe
 	target := ArtifactTarget(sink, meta.Commit, meta.TaskID, filename)
 	return storeWithTimeout(ctx, "store task file "+filename, target, func() (string, error) {
 		return storer.StoreTaskFile(ctx, meta, filename, data)
+	})
+}
+
+// StorePrebuildMarkerWithTimeout executes StorePrebuildMarker concurrently if supported by sink,
+// returning immediately if ctx expires.
+func StorePrebuildMarkerWithTimeout(ctx context.Context, sink ArtifactSink, commit, prebuildName string, data []byte) (string, error) {
+	if sink == nil {
+		return "", ErrNoSinkConfigured
+	}
+	storer, ok := sink.(PrebuildMarkerStorer)
+	if !ok {
+		return "", fmt.Errorf("artifact sink %T does not support storing prebuild markers", sink)
+	}
+	target := PrebuildMarkerTarget(sink, commit, prebuildName)
+	return storeWithTimeout(ctx, "store prebuild marker", target, func() (string, error) {
+		return storer.StorePrebuildMarker(ctx, commit, prebuildName, data)
 	})
 }
 

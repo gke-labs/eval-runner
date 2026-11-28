@@ -53,6 +53,8 @@ func NewReloadableSink(initial ArtifactSink) *ReloadableSink {
 	return s
 }
 
+var _ PrebuildMarkerStorer = (*ReloadableSink)(nil)
+
 // SetOnCloseError registers a callback invoked if closing a retired sink returns an error.
 func (s *ReloadableSink) SetOnCloseError(fn func(error)) {
 	s.mu.Lock()
@@ -179,6 +181,28 @@ func (s *ReloadableSink) StoreTaskFile(ctx context.Context, meta RunMetadata, fi
 		return storer.StoreTaskFile(ctx, meta, filename, data)
 	}
 	return "", fmt.Errorf("artifact sink %T does not support storing task files", ts.sink)
+}
+
+// StorePrebuildMarker implements PrebuildMarkerStorer for ReloadableSink.
+func (s *ReloadableSink) StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error) {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return "", ErrSinkClosed
+	}
+	ts := s.currentTracked
+	if ts == nil || ts.sink == nil {
+		s.mu.RUnlock()
+		return "", ErrNoSinkConfigured
+	}
+	ts.wg.Add(1)
+	s.mu.RUnlock()
+	defer ts.wg.Done()
+
+	if storer, ok := ts.sink.(PrebuildMarkerStorer); ok {
+		return storer.StorePrebuildMarker(ctx, commit, prebuildName, data)
+	}
+	return "", fmt.Errorf("artifact sink %T does not support storing prebuild markers", ts.sink)
 }
 
 // StoreComparison persists comparison summary data using the current active sink.

@@ -43,6 +43,7 @@ const (
 type NoopSink struct{}
 
 var _ ArtifactSink = (*NoopSink)(nil)
+var _ PrebuildMarkerStorer = (*NoopSink)(nil)
 
 // StoreArtifact implements ArtifactSink for NoopSink.
 func (s *NoopSink) StoreArtifact(ctx context.Context, meta RunMetadata, filename string, data []byte) (StoredArtifact, error) {
@@ -51,6 +52,11 @@ func (s *NoopSink) StoreArtifact(ctx context.Context, meta RunMetadata, filename
 
 // StoreTaskFile implements TaskFileStorer for NoopSink.
 func (s *NoopSink) StoreTaskFile(ctx context.Context, meta RunMetadata, filename string, data []byte) (string, error) {
+	return "", nil
+}
+
+// StorePrebuildMarker implements PrebuildMarkerStorer for NoopSink.
+func (s *NoopSink) StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error) {
 	return "", nil
 }
 
@@ -95,6 +101,44 @@ type LocalDirSink struct {
 }
 
 var _ ArtifactSink = (*LocalDirSink)(nil)
+var _ PrebuildMarkerStorer = (*LocalDirSink)(nil)
+
+// StorePrebuildMarker implements PrebuildMarkerStorer for LocalDirSink, writing
+// runs/<commit>/prebuilds/<prebuildName>/done.json.
+func (s *LocalDirSink) StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error) {
+	if strings.TrimSpace(s.BaseDir) == "" {
+		return "", fmt.Errorf("base directory must not be empty")
+	}
+	if err := ValidateSafeComponent("commit", commit); err != nil {
+		return "", err
+	}
+	if err := ValidateSafeComponent("prebuildName", prebuildName); err != nil {
+		return "", err
+	}
+	if int64(len(data)) > DefaultMaxLoadBytes {
+		return "", fmt.Errorf("prebuild marker size %d exceeds maximum allowed size of %d bytes", len(data), DefaultMaxLoadBytes)
+	}
+
+	targetDir := filepath.Join(s.BaseDir, "runs", commit, "prebuilds", prebuildName)
+	targetPath := filepath.Join(targetDir, PrebuildMarkerFilename)
+
+	cleanBase := filepath.Clean(s.BaseDir)
+	cleanTarget := filepath.Clean(targetPath)
+	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return "", fmt.Errorf("artifact path %q escapes base directory %q", targetPath, s.BaseDir)
+	}
+
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", err
+	}
+
+	if err := os.WriteFile(targetPath, data, 0644); err != nil {
+		return "", err
+	}
+
+	return targetPath, nil
+}
 
 // StoreComparison implements ArtifactSink for LocalDirSink.
 func (s *LocalDirSink) StoreComparison(ctx context.Context, comparisonName string, data []byte) (string, error) {

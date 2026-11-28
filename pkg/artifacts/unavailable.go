@@ -30,6 +30,7 @@ type UnavailableSink struct {
 
 var _ ArtifactSink = (*UnavailableSink)(nil)
 var _ AccessChecker = (*UnavailableSink)(nil)
+var _ PrebuildMarkerStorer = (*UnavailableSink)(nil)
 
 // NewUnavailableSink creates a new UnavailableSink for the given bucket and underlying error.
 func NewUnavailableSink(bucket string, err error) *UnavailableSink {
@@ -56,6 +57,11 @@ func (s *UnavailableSink) StoreArtifact(ctx context.Context, meta RunMetadata, f
 
 // StoreTaskFile implements TaskFileStorer, failing immediately with the unavailability error.
 func (s *UnavailableSink) StoreTaskFile(ctx context.Context, meta RunMetadata, filename string, data []byte) (string, error) {
+	return "", fmt.Errorf("artifactBucket is set but artifact storage is unavailable: %w", s.err)
+}
+
+// StorePrebuildMarker implements PrebuildMarkerStorer, failing immediately with the unavailability error.
+func (s *UnavailableSink) StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error) {
 	return "", fmt.Errorf("artifactBucket is set but artifact storage is unavailable: %w", s.err)
 }
 

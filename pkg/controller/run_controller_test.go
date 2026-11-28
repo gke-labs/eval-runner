@@ -13896,7 +13896,7 @@ func TestDecidePendingTasks(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			decisions := decidePendingTasks(testCase.tasks, testCase.observations, testCase.availableSlots, currentInstance)
+			decisions := decidePendingTasks(testCase.tasks, testCase.observations, testCase.availableSlots, currentInstance, nil, nil)
 			if len(decisions) != len(testCase.want) {
 				t.Fatalf("len(decisions) = %d, want %d (%+v)", len(decisions), len(testCase.want), decisions)
 			}

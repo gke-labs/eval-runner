@@ -259,6 +259,47 @@ spec:
                 - Completed
                 - Failed
                 type: string
+              prebuilds:
+                description: Prebuilds records the execution status of named manifest
+                  prebuilds required by this Run.
+                items:
+                  description: PrebuildStatus records the execution status of a named
+                    manifest prebuild for a Run.
+                  properties:
+                    executionID:
+                      description: |-
+                        ExecutionID identifies the in-flight async process running inside the prebuild sandbox.
+                        Cleared when the prebuild reaches a terminal phase.
+                      type: string
+                    finishedAt:
+                      description: FinishedAt is the time when the prebuild reached
+                        a terminal phase (Completed or Failed).
+                      format: date-time
+                      type: string
+                    message:
+                      description: Message is human-readable detail on prebuild status
+                        or failure.
+                      type: string
+                    name:
+                      description: Name is the prebuild name from Manifest.Prebuilds.
+                      type: string
+                    phase:
+                      description: Phase is the current execution phase of this prebuild.
+                      enum:
+                      - Pending
+                      - Running
+                      - Completed
+                      - Failed
+                      type: string
+                    startedAt:
+                      description: StartedAt is the time when the prebuild transitioned
+                        to Running.
+                      format: date-time
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               reporting:
                 description: Reporting records the status of GitHub check run reporting.
                 properties:

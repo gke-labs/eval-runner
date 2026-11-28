@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
 	"github.com/gke-labs/eval-runner/internal/fakes"
@@ -787,4 +788,87 @@ func TestLocalAndInMemorySink_OpenStream(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrebuildMarker_StoreAndLoad(t *testing.T) {
+	baseDirectory := t.TempDir()
+	marker := artifacts.PrebuildCompletionMarker{
+		Commit:       "abcdef123456",
+		PrebuildName: "kind-images",
+		CompletedAt:  time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC),
+	}
+	markerBytes, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatalf("marshal marker: %v", err)
+	}
+
+	testCases := []struct {
+		name           string
+		sink           artifacts.ArtifactSink
+		expectedTarget string
+	}{
+		{
+			name:           "LocalDirSink",
+			sink:           &artifacts.LocalDirSink{BaseDir: baseDirectory},
+			expectedTarget: filepath.Join(baseDirectory, "runs", "abcdef123456", "prebuilds", "kind-images", "done.json"),
+		},
+		{
+			name:           "InMemorySink",
+			sink:           artifacts.NewInMemorySink(),
+			expectedTarget: "mem://runs/abcdef123456/prebuilds/kind-images/done.json",
+		},
+		{
+			name:           "ReloadableSink",
+			sink:           artifacts.NewReloadableSink(artifacts.NewInMemorySink()),
+			expectedTarget: "mem://runs/abcdef123456/prebuilds/kind-images/done.json",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			target := artifacts.PrebuildMarkerTarget(testCase.sink, marker.Commit, marker.PrebuildName)
+			if target != testCase.expectedTarget {
+				t.Fatalf("PrebuildMarkerTarget = %q, want %q", target, testCase.expectedTarget)
+			}
+
+			if _, err := artifacts.LoadWithTimeout(t.Context(), testCase.sink, target); !artifacts.IsNotFound(err) {
+				t.Fatalf("expected IsNotFound before store, got %v", err)
+			}
+
+			storedPath, err := artifacts.StorePrebuildMarkerWithTimeout(t.Context(), testCase.sink, marker.Commit, marker.PrebuildName, markerBytes)
+			if err != nil {
+				t.Fatalf("StorePrebuildMarkerWithTimeout failed: %v", err)
+			}
+			if storedPath != testCase.expectedTarget {
+				t.Errorf("storedPath = %q, want %q", storedPath, testCase.expectedTarget)
+			}
+
+			loadedBytes, err := artifacts.LoadWithTimeout(t.Context(), testCase.sink, target)
+			if err != nil {
+				t.Fatalf("LoadWithTimeout failed: %v", err)
+			}
+			var loaded artifacts.PrebuildCompletionMarker
+			if err := json.Unmarshal(loadedBytes, &loaded); err != nil {
+				t.Fatalf("unmarshal loaded marker: %v", err)
+			}
+			if loaded.Commit != marker.Commit || loaded.PrebuildName != marker.PrebuildName || !loaded.CompletedAt.Equal(marker.CompletedAt) {
+				t.Errorf("loaded marker = %+v, want %+v", loaded, marker)
+			}
+		})
+	}
+
+	t.Run("NoopSink", func(t *testing.T) {
+		noop := &artifacts.NoopSink{}
+		location, err := artifacts.StorePrebuildMarkerWithTimeout(t.Context(), noop, marker.Commit, marker.PrebuildName, markerBytes)
+		if err != nil || location != "" {
+			t.Errorf("NoopSink StorePrebuildMarker = (%q, %v), want (\"\", nil)", location, err)
+		}
+	})
+
+	t.Run("UnavailableSink", func(t *testing.T) {
+		unavailable := artifacts.NewUnavailableSink("eval-bucket", errors.New("no credentials"))
+		if _, err := artifacts.StorePrebuildMarkerWithTimeout(t.Context(), unavailable, marker.Commit, marker.PrebuildName, markerBytes); err == nil {
+			t.Fatal("expected error from UnavailableSink, got nil")
+		}
+	})
 }

@@ -1185,3 +1185,38 @@ func TestGCSSink_OpenStream(t *testing.T) {
 		t.Errorf("expected no files left behind after mid-stream failure: before %d, after %d", len(entriesBefore), len(entriesAfter))
 	}
 }
+
+func TestGCSSink_StorePrebuildMarkerAndLoad(t *testing.T) {
+	ctx := t.Context()
+	fakeClient := fakes.NewFakeStorageClient()
+	sink, err := New(ctx, "eval-bucket", WithStorageClient(fakeClient))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	var _ artifacts.PrebuildMarkerStorer = sink
+
+	marker := []byte(`{"commit":"abcdef12","prebuildName":"kind-images","completedAt":"2026-11-28T12:00:00Z"}`)
+	expectedURI := "gs://eval-bucket/runs/abcdef12/prebuilds/kind-images/done.json"
+
+	target := artifacts.PrebuildMarkerTarget(sink, "abcdef12", "kind-images")
+	if target != expectedURI {
+		t.Fatalf("PrebuildMarkerTarget = %q, want %q", target, expectedURI)
+	}
+
+	storedURI, err := sink.StorePrebuildMarker(ctx, "abcdef12", "kind-images", marker)
+	if err != nil {
+		t.Fatalf("StorePrebuildMarker failed: %v", err)
+	}
+	if storedURI != expectedURI {
+		t.Fatalf("storedURI = %q, want %q", storedURI, expectedURI)
+	}
+
+	loaded, err := sink.Load(ctx, target)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if string(loaded) != string(marker) {
+		t.Errorf("loaded = %q, want %q", string(loaded), string(marker))
+	}
+}

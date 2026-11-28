@@ -567,6 +567,37 @@ func (s *GCSSink) StoreTaskFile(ctx context.Context, meta artifacts.RunMetadata,
 	return stored.Location, err
 }
 
+// StorePrebuildMarker implements artifacts.PrebuildMarkerStorer for GCSSink, persisting
+// runs/<commit>/prebuilds/<prebuildName>/done.json.
+func (s *GCSSink) StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error) {
+	if err := artifacts.ValidateSafeComponent("commit", commit); err != nil {
+		return "", err
+	}
+	if err := artifacts.ValidateSafeComponent("prebuildName", prebuildName); err != nil {
+		return "", err
+	}
+	if s.bucket == "" {
+		return "", fmt.Errorf("bucket name is empty")
+	}
+
+	capLimit := s.effectiveCapBytes()
+	if int64(len(data)) > capLimit {
+		return "", fmt.Errorf("prebuild marker size %d exceeds maximum upload size of %d bytes", len(data), capLimit)
+	}
+
+	markerObject := fmt.Sprintf("runs/%s/prebuilds/%s/%s", commit, prebuildName, artifacts.PrebuildMarkerFilename)
+	metadata := map[string]string{
+		"commit":       commit,
+		"prebuildName": prebuildName,
+	}
+
+	if err := s.client.WriteObjectWithMetadata(ctx, s.bucket, markerObject, "application/json", "", metadata, data); err != nil {
+		return "", fmt.Errorf("store prebuild marker to gs://%s/%s: %w", s.bucket, markerObject, err)
+	}
+
+	return fmt.Sprintf("gs://%s/%s", s.bucket, markerObject), nil
+}
+
 // StoreArtifact writes the inspect log and summary.json to GCS and returns the stored location and content hash.
 func (s *GCSSink) StoreArtifact(ctx context.Context, meta artifacts.RunMetadata, filename string, data []byte) (artifacts.StoredArtifact, error) {
 	stored, err := s.storeObject(ctx, meta, filename, data)
