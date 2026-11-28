@@ -607,3 +607,74 @@ func TestRenderServicePortalEgressNetworkPolicy_Golden(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderRegistryServicePortalEgressNetworkPolicy_Golden(t *testing.T) {
+	testCases := []struct {
+		name                        string
+		sandboxNamespace            string
+		servicePortalsNamespace     string
+		wantSandboxNamespace        string
+		wantServicePortalsNamespace string
+	}{
+		{
+			name:                        "defaults when empty",
+			sandboxNamespace:            "",
+			servicePortalsNamespace:     "",
+			wantSandboxNamespace:        DefaultSandboxNamespace,
+			wantServicePortalsNamespace: DefaultServicePortalsNamespace,
+		},
+		{
+			name:                        "custom service portals namespace",
+			sandboxNamespace:            "custom-sandbox",
+			servicePortalsNamespace:     "custom-service-portals",
+			wantSandboxNamespace:        "custom-sandbox",
+			wantServicePortalsNamespace: "custom-service-portals",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			policy := RenderRegistryServicePortalEgressNetworkPolicy(testCase.sandboxNamespace, testCase.servicePortalsNamespace)
+			if policy == nil {
+				t.Fatal("RenderRegistryServicePortalEgressNetworkPolicy returned nil")
+			}
+			if policy.Name != DefaultRegistryServicePortalEgressNetworkPolicyName {
+				t.Errorf("expected name %s, got %s", DefaultRegistryServicePortalEgressNetworkPolicyName, policy.Name)
+			}
+			if policy.Namespace != testCase.wantSandboxNamespace {
+				t.Errorf("expected namespace %s, got %s", testCase.wantSandboxNamespace, policy.Namespace)
+			}
+			if len(policy.Spec.PodSelector.MatchLabels) != 1 || policy.Spec.PodSelector.MatchLabels[LabelSandbox] != "true" {
+				t.Errorf("expected podSelector %s=true, got %v", LabelSandbox, policy.Spec.PodSelector.MatchLabels)
+			}
+			if len(policy.Spec.PolicyTypes) != 1 || policy.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress {
+				t.Fatalf("expected policyTypes [Egress], got %v", policy.Spec.PolicyTypes)
+			}
+			if len(policy.Spec.Egress) != 1 {
+				t.Fatalf("expected 1 egress rule, got %d", len(policy.Spec.Egress))
+			}
+
+			rule := policy.Spec.Egress[0]
+			if len(rule.To) != 1 {
+				t.Fatalf("expected 1 peer, got %d", len(rule.To))
+			}
+			peer := rule.To[0]
+			if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != testCase.wantServicePortalsNamespace {
+				t.Errorf("expected namespaceSelector kubernetes.io/metadata.name=%q, got %+v", testCase.wantServicePortalsNamespace, peer.NamespaceSelector)
+			}
+			if peer.PodSelector != nil {
+				t.Errorf("expected nil podSelector so any registry pod labels in namespace match, got %+v", peer.PodSelector)
+			}
+			if len(rule.Ports) != 1 {
+				t.Fatalf("expected 1 port, got %d", len(rule.Ports))
+			}
+			port := rule.Ports[0]
+			if port.Protocol == nil || *port.Protocol != corev1.ProtocolTCP {
+				t.Errorf("expected TCP protocol, got %v", port.Protocol)
+			}
+			if port.Port == nil || port.Port.IntVal != DefaultRegistryServicePortalPort {
+				t.Errorf("expected port %d, got %v", DefaultRegistryServicePortalPort, port.Port)
+			}
+		})
+	}
+}

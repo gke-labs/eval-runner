@@ -644,3 +644,100 @@ func TestReconcileServicePortalEgress(t *testing.T) {
 		}
 	})
 }
+
+func TestReconcileRegistryServicePortalEgress(t *testing.T) {
+	ctx := t.Context()
+	scheme := newTestScheme()
+	logger := logr.Discard()
+	namespace := "eval-runner-sandbox"
+	policyKey := types.NamespacedName{
+		Namespace: namespace,
+		Name:      discovery.DefaultRegistryServicePortalEgressNetworkPolicyName,
+	}
+
+	t.Run("CreatesIdempotentRepairsDriftAndUpdatesNamespaceWhenEnabled", func(t *testing.T) {
+		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		if err := ReconcileRegistryServicePortalEgress(ctx, cl, namespace, true, DefaultServicePortalsNamespace, logger); err != nil {
+			t.Fatalf("initial reconcile failed: %v", err)
+		}
+
+		policy := &networkingv1.NetworkPolicy{}
+		if err := cl.Get(ctx, policyKey, policy); err != nil {
+			t.Fatalf("expected registry service portal egress NetworkPolicy to exist: %v", err)
+		}
+		if policy.Spec.PodSelector.MatchLabels[discovery.LabelSandbox] != "true" {
+			t.Fatalf("expected podSelector %s=true, got %v", discovery.LabelSandbox, policy.Spec.PodSelector.MatchLabels)
+		}
+		if len(policy.Spec.Egress) != 1 || len(policy.Spec.Egress[0].To) != 1 ||
+			policy.Spec.Egress[0].To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != DefaultServicePortalsNamespace {
+			t.Fatalf("unexpected egress rules: %+v", policy.Spec.Egress)
+		}
+		if len(policy.Spec.Egress[0].Ports) != 1 || policy.Spec.Egress[0].Ports[0].Port.IntVal != discovery.DefaultRegistryServicePortalPort {
+			t.Fatalf("expected TCP port %d, got %+v", discovery.DefaultRegistryServicePortalPort, policy.Spec.Egress[0].Ports)
+		}
+		resourceVersionAfterCreate := policy.ResourceVersion
+
+		// Second reconcile is a no-op.
+		if err := ReconcileRegistryServicePortalEgress(ctx, cl, namespace, true, DefaultServicePortalsNamespace, logger); err != nil {
+			t.Fatalf("idempotent reconcile failed: %v", err)
+		}
+		if err := cl.Get(ctx, policyKey, policy); err != nil {
+			t.Fatalf("failed to get policy after idempotent reconcile: %v", err)
+		}
+		if policy.ResourceVersion != resourceVersionAfterCreate {
+			t.Fatalf("expected ResourceVersion to remain %s, got %s", resourceVersionAfterCreate, policy.ResourceVersion)
+		}
+
+		// Drift is repaired.
+		policy.Spec.Egress = nil
+		if err := cl.Update(ctx, policy); err != nil {
+			t.Fatalf("failed to inject drift: %v", err)
+		}
+		if err := ReconcileRegistryServicePortalEgress(ctx, cl, namespace, true, "custom-service-portals", logger); err != nil {
+			t.Fatalf("drift/namespace update reconcile failed: %v", err)
+		}
+		if err := cl.Get(ctx, policyKey, policy); err != nil {
+			t.Fatalf("failed to get updated policy: %v", err)
+		}
+		if len(policy.Spec.Egress) != 1 || len(policy.Spec.Egress[0].To) != 1 ||
+			policy.Spec.Egress[0].To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "custom-service-portals" {
+			t.Fatalf("expected updated namespaceSelector custom-service-portals, got %+v", policy.Spec.Egress)
+		}
+	})
+
+	t.Run("SyncRegistryServicePortalTogglesAndDeletesStalePolicy", func(t *testing.T) {
+		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		controller := NewSandboxEgressController(SandboxEgressControllerOptions{
+			Client:                       cl,
+			SandboxNamespace:             namespace,
+			RegistryServicePortalEnabled: false,
+			Logger:                       logger,
+		})
+		if err := controller.Reconcile(ctx); err != nil {
+			t.Fatalf("initial reconcile failed: %v", err)
+		}
+		policy := &networkingv1.NetworkPolicy{}
+		if err := cl.Get(ctx, policyKey, policy); err == nil {
+			t.Fatal("expected no registry service portal egress NetworkPolicy when disabled")
+		}
+
+		if err := controller.SyncRegistryServicePortal(ctx, true, "custom-service-portals"); err != nil {
+			t.Fatalf("SyncRegistryServicePortal enable failed: %v", err)
+		}
+		if err := cl.Get(ctx, policyKey, policy); err != nil {
+			t.Fatalf("expected registry service portal egress NetworkPolicy after enabling: %v", err)
+		}
+		if policy.Spec.Egress[0].To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "custom-service-portals" {
+			t.Fatalf("unexpected namespaceSelector: %+v", policy.Spec.Egress[0].To[0].NamespaceSelector)
+		}
+
+		if err := controller.SyncRegistryServicePortal(ctx, false, DefaultServicePortalsNamespace); err != nil {
+			t.Fatalf("SyncRegistryServicePortal disable failed: %v", err)
+		}
+		if err := cl.Get(ctx, policyKey, policy); err == nil {
+			t.Fatal("expected registry service portal egress NetworkPolicy to be deleted when disabled")
+		}
+	})
+}

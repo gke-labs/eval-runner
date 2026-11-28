@@ -117,6 +117,8 @@ const (
 	ConfigMapKeyServicePortalModelBaseURL = configkeys.ConfigMapKeyServicePortalModelBaseURL
 	// ConfigMapKeyGoProxyServicePortalEnabled is the ConfigMap key enabling forwarding proxy.golang.org HTTPS traffic to the in-cluster Go proxy service portal.
 	ConfigMapKeyGoProxyServicePortalEnabled = configkeys.ConfigMapKeyGoProxyServicePortalEnabled
+	// ConfigMapKeyRegistryServicePortalEnabled is the ConfigMap key enabling the in-cluster OCI registry service portal for task sandboxes.
+	ConfigMapKeyRegistryServicePortalEnabled = configkeys.ConfigMapKeyRegistryServicePortalEnabled
 	// ConfigMapKeyServicePortalsNamespace is the ConfigMap key for the namespace where ecosystem caching service portals run.
 	ConfigMapKeyServicePortalsNamespace = configkeys.ConfigMapKeyServicePortalsNamespace
 )
@@ -187,6 +189,7 @@ var KnownConfigMapKeys = map[string]struct{}{
 	configkeys.ConfigMapKeyServicePortalAllowedHTTPHosts:  {},
 	configkeys.ConfigMapKeyServicePortalModelBaseURL:      {},
 	configkeys.ConfigMapKeyGoProxyServicePortalEnabled:    {},
+	configkeys.ConfigMapKeyRegistryServicePortalEnabled:   {},
 	configkeys.ConfigMapKeyServicePortalsNamespace:        {},
 
 	// Workload Identity Federation and ephemeral GCP project creation
@@ -1005,6 +1008,16 @@ func ResolveConfig(cm *corev1.ConfigMap, flags RawFlags) (ClusterConfig, error) 
 				cfg.ServicePortal.GoProxyServicePortalEnabled = enabled
 			}
 		}
+		if value, ok := cm.Data[ConfigMapKeyRegistryServicePortalEnabled]; ok {
+			trimmed := strings.TrimSpace(value)
+			if trimmed != "" {
+				enabled, err := strconv.ParseBool(trimmed)
+				if err != nil {
+					return cfg, fmt.Errorf("invalid %s %q in ConfigMap %s/%s: %w", ConfigMapKeyRegistryServicePortalEnabled, value, ns, name, err)
+				}
+				cfg.ServicePortal.RegistryServicePortalEnabled = enabled
+			}
+		}
 		if value, ok := cm.Data[ConfigMapKeyServicePortalsNamespace]; ok {
 			trimmed := strings.TrimSpace(value)
 			if trimmed != "" {
@@ -1289,6 +1302,7 @@ func LogEffectiveClusterSettings(logger logr.Logger, resolved ClusterConfig) {
 		"gcpProjectTaskRoles", strings.Join(resolved.GCPProjectTaskRoles, ","),
 		"servicePortalModelBaseURL", resolved.ServicePortal.ModelBaseURL,
 		"goproxyServicePortalEnabled", resolved.ServicePortal.GoProxyServicePortalEnabled,
+		"registryServicePortalEnabled", resolved.ServicePortal.RegistryServicePortalEnabled,
 		"servicePortalsNamespace", resolved.ServicePortal.ServicePortalsNamespace,
 		"headTopUpInterval", resolved.HeadTopUpInterval,
 		"headTargetCIHalfWidth", resolved.HeadTargetCIHalfWidth,
@@ -1298,35 +1312,37 @@ func LogEffectiveClusterSettings(logger logr.Logger, resolved ClusterConfig) {
 
 // ConfigReloaderOptions configures a ConfigReloader for runtime cluster configuration updates.
 type ConfigReloaderOptions struct {
-	RawFlags       RawFlags
-	Logger         logr.Logger
-	SinkFactory    sinkconfig.SinkFactory
-	ReloadableSink *artifacts.ReloadableSink
-	RunReconciler  *RunReconciler
-	CompReconciler *ComparisonReconciler
-	Syncer         *syncer.Syncer
-	Consumer       *consumer.Consumer
-	TopUpRunner    *HeadTopUpRunner
-	InitialConfig  *ClusterConfig
-	FQDNSyncFunc   func(ctx context.Context, hosts []string) error
-	GitHubClient   *github.HTTPClient
+	RawFlags                      RawFlags
+	Logger                        logr.Logger
+	SinkFactory                   sinkconfig.SinkFactory
+	ReloadableSink                *artifacts.ReloadableSink
+	RunReconciler                 *RunReconciler
+	CompReconciler                *ComparisonReconciler
+	Syncer                        *syncer.Syncer
+	Consumer                      *consumer.Consumer
+	TopUpRunner                   *HeadTopUpRunner
+	InitialConfig                 *ClusterConfig
+	FQDNSyncFunc                  func(ctx context.Context, hosts []string) error
+	RegistryServicePortalSyncFunc func(ctx context.Context, enabled bool, servicePortalsNamespace string) error
+	GitHubClient                  *github.HTTPClient
 }
 
 // ConfigReloader dynamically applies eval-runner-config updates at runtime.
 type ConfigReloader struct {
-	mu             sync.Mutex
-	rawFlags       RawFlags
-	logger         logr.Logger
-	sinkFactory    sinkconfig.SinkFactory
-	reloadableSink *artifacts.ReloadableSink
-	runReconciler  *RunReconciler
-	compReconciler *ComparisonReconciler
-	syncer         *syncer.Syncer
-	consumer       *consumer.Consumer
-	topUpRunner    *HeadTopUpRunner
-	fqdnSyncFunc   func(ctx context.Context, hosts []string) error
-	gitHubClient   *github.HTTPClient
-	lastConfig     *ClusterConfig
+	mu                            sync.Mutex
+	rawFlags                      RawFlags
+	logger                        logr.Logger
+	sinkFactory                   sinkconfig.SinkFactory
+	reloadableSink                *artifacts.ReloadableSink
+	runReconciler                 *RunReconciler
+	compReconciler                *ComparisonReconciler
+	syncer                        *syncer.Syncer
+	consumer                      *consumer.Consumer
+	topUpRunner                   *HeadTopUpRunner
+	fqdnSyncFunc                  func(ctx context.Context, hosts []string) error
+	registryServicePortalSyncFunc func(ctx context.Context, enabled bool, servicePortalsNamespace string) error
+	gitHubClient                  *github.HTTPClient
+	lastConfig                    *ClusterConfig
 }
 
 // NewConfigReloader constructs a new ConfigReloader.
@@ -1336,17 +1352,18 @@ func NewConfigReloader(opts ConfigReloaderOptions) *ConfigReloader {
 		sf = sinkconfig.NewArtifactSink
 	}
 	r := &ConfigReloader{
-		rawFlags:       opts.RawFlags,
-		logger:         opts.Logger,
-		sinkFactory:    sf,
-		reloadableSink: opts.ReloadableSink,
-		runReconciler:  opts.RunReconciler,
-		compReconciler: opts.CompReconciler,
-		syncer:         opts.Syncer,
-		consumer:       opts.Consumer,
-		topUpRunner:    opts.TopUpRunner,
-		fqdnSyncFunc:   opts.FQDNSyncFunc,
-		gitHubClient:   opts.GitHubClient,
+		rawFlags:                      opts.RawFlags,
+		logger:                        opts.Logger,
+		sinkFactory:                   sf,
+		reloadableSink:                opts.ReloadableSink,
+		runReconciler:                 opts.RunReconciler,
+		compReconciler:                opts.CompReconciler,
+		syncer:                        opts.Syncer,
+		consumer:                      opts.Consumer,
+		topUpRunner:                   opts.TopUpRunner,
+		fqdnSyncFunc:                  opts.FQDNSyncFunc,
+		registryServicePortalSyncFunc: opts.RegistryServicePortalSyncFunc,
+		gitHubClient:                  opts.GitHubClient,
 	}
 	if opts.InitialConfig != nil {
 		copied := *opts.InitialConfig
@@ -1481,6 +1498,19 @@ func (r *ConfigReloader) reloadInternal(ctx context.Context, cm *corev1.ConfigMa
 	if fqdnChanged && r.fqdnSyncFunc != nil {
 		if fqdnErr := r.fqdnSyncFunc(ctx, resolved.SandboxEgressHosts); fqdnErr != nil {
 			r.logger.Error(fqdnErr, "error updating sandbox FQDN network policy")
+		}
+	}
+
+	registryServicePortalChanged := r.lastConfig == nil ||
+		r.lastConfig.ServicePortal.RegistryServicePortalEnabled != resolved.ServicePortal.RegistryServicePortalEnabled ||
+		r.lastConfig.ServicePortal.EffectiveServicePortalsNamespace() != resolved.ServicePortal.EffectiveServicePortalsNamespace()
+	if registryServicePortalChanged && r.registryServicePortalSyncFunc != nil {
+		if syncErr := r.registryServicePortalSyncFunc(
+			ctx,
+			resolved.ServicePortal.RegistryServicePortalEnabled,
+			resolved.ServicePortal.EffectiveServicePortalsNamespace(),
+		); syncErr != nil {
+			r.logger.Error(syncErr, "error updating registry service portal egress network policy")
 		}
 	}
 

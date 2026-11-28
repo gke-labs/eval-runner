@@ -37,6 +37,17 @@ const (
 	// NetworkPolicy permitting intercepted sandbox pods to reach the local service-portal node proxy.
 	DefaultServicePortalEgressNetworkPolicyName = "eval-runner-sandbox-service-portal-egress"
 
+	// DefaultRegistryServicePortalEgressNetworkPolicyName is the default name for the companion
+	// NetworkPolicy permitting sandbox pods to reach the in-cluster OCI registry service portal.
+	DefaultRegistryServicePortalEgressNetworkPolicyName = "eval-runner-sandbox-registry-service-portal-egress"
+
+	// DefaultServicePortalsNamespace is the default Kubernetes namespace where
+	// ecosystem caching service portals run.
+	DefaultServicePortalsNamespace = "eval-runner-service-portals"
+
+	// DefaultRegistryServicePortalPort is the TCP port for the in-cluster OCI registry service portal.
+	DefaultRegistryServicePortalPort int32 = 5000
+
 	// DefaultFQDNNetworkPolicyName is the default name for the sandbox FQDNNetworkPolicy.
 	DefaultFQDNNetworkPolicyName = "eval-runner-sandbox-fqdn-egress"
 
@@ -447,6 +458,75 @@ func RenderServicePortalEgressNetworkPolicyWithName(name, namespace string) *net
 						{
 							Protocol: &tcpProto,
 							Port:     &port8443,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// RenderRegistryServicePortalEgressNetworkPolicy renders the companion egress NetworkPolicy
+// permitting sandbox pods to reach the in-cluster OCI registry service portal on TCP port 5000
+// in servicePortalsNamespace.
+func RenderRegistryServicePortalEgressNetworkPolicy(namespace, servicePortalsNamespace string) *networkingv1.NetworkPolicy {
+	return RenderRegistryServicePortalEgressNetworkPolicyWithName(
+		DefaultRegistryServicePortalEgressNetworkPolicyName,
+		namespace,
+		servicePortalsNamespace,
+	)
+}
+
+// RenderRegistryServicePortalEgressNetworkPolicyWithName renders the companion registry service
+// portal egress NetworkPolicy with a specific name. All v1-defaulted fields are explicitly populated.
+func RenderRegistryServicePortalEgressNetworkPolicyWithName(name, namespace, servicePortalsNamespace string) *networkingv1.NetworkPolicy {
+	if name == "" {
+		name = DefaultRegistryServicePortalEgressNetworkPolicyName
+	}
+	if namespace == "" {
+		namespace = DefaultSandboxNamespace
+	}
+	trimmedServicePortalsNamespace := strings.TrimSpace(servicePortalsNamespace)
+	if trimmedServicePortalsNamespace == "" {
+		trimmedServicePortalsNamespace = DefaultServicePortalsNamespace
+	}
+
+	tcpProtocol := corev1.ProtocolTCP
+	registryPort := intstr.FromInt32(DefaultRegistryServicePortalPort)
+
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "networking.k8s.io/v1",
+			Kind:       "NetworkPolicy",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					LabelSandbox: "true",
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeEgress,
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": trimmedServicePortalsNamespace,
+								},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{
+							Protocol: &tcpProtocol,
+							Port:     &registryPort,
 						},
 					},
 				},

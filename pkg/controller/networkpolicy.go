@@ -46,23 +46,26 @@ const (
 
 // SandboxEgressControllerOptions configures the SandboxEgressController.
 type SandboxEgressControllerOptions struct {
-	Client               client.Client
-	KubeClient           kubernetes.Interface
-	DynamicClient        dynamic.Interface
-	SandboxNamespace     string
-	FQDNSupported        bool
-	FQDNVersion          string
-	ServicePortalEnabled bool
-	InitialHosts         []string
-	Logger               logr.Logger
-	RateLimit            time.Duration
-	PeriodicInterval     time.Duration
+	Client                       client.Client
+	KubeClient                   kubernetes.Interface
+	DynamicClient                dynamic.Interface
+	SandboxNamespace             string
+	FQDNSupported                bool
+	FQDNVersion                  string
+	ServicePortalEnabled         bool
+	RegistryServicePortalEnabled bool
+	ServicePortalsNamespace      string
+	InitialHosts                 []string
+	Logger                       logr.Logger
+	RateLimit                    time.Duration
+	PeriodicInterval             time.Duration
 }
 
 // SandboxEgressController reconciles and maintains the sandbox baseline egress NetworkPolicy,
-// FQDNNetworkPolicy, and companion service-portal egress NetworkPolicy. It watches those
-// objects in the sandbox namespace and enforces that hostname narrowing removes the
-// 0.0.0.0/0:443 internet allow rule when FQDN policies are active.
+// FQDNNetworkPolicy, companion service-portal egress NetworkPolicy, and companion registry
+// service portal egress NetworkPolicy. It watches those objects in the sandbox namespace and
+// enforces that hostname narrowing removes the 0.0.0.0/0:443 internet allow rule when FQDN
+// policies are active.
 type SandboxEgressController struct {
 	client               client.Client
 	kubeClient           kubernetes.Interface
@@ -75,9 +78,12 @@ type SandboxEgressController struct {
 	rateLimit            time.Duration
 	periodicInterval     time.Duration
 
-	// hostsLock protects only currentHosts in memory. Never held across API calls.
-	hostsLock    sync.RWMutex
-	currentHosts []string
+	// hostsLock protects mutable in-memory policy inputs (currentHosts, registryServicePortalEnabled,
+	// servicePortalsNamespace). Never held across API calls.
+	hostsLock                    sync.RWMutex
+	currentHosts                 []string
+	registryServicePortalEnabled bool
+	servicePortalsNamespace      string
 
 	triggerCh chan struct{}
 }
@@ -100,18 +106,20 @@ func NewSandboxEgressController(opts SandboxEgressControllerOptions) *SandboxEgr
 	}
 
 	return &SandboxEgressController{
-		client:               opts.Client,
-		kubeClient:           opts.KubeClient,
-		dynamicClient:        opts.DynamicClient,
-		sandboxNamespace:     ns,
-		fqdnSupported:        opts.FQDNSupported,
-		fqdnVersion:          opts.FQDNVersion,
-		servicePortalEnabled: opts.ServicePortalEnabled,
-		logger:               opts.Logger.WithName("sandbox-egress-controller"),
-		rateLimit:            rateLimit,
-		periodicInterval:     periodicInterval,
-		currentHosts:         discovery.CloneSandboxEgressHosts(opts.InitialHosts),
-		triggerCh:            make(chan struct{}, 1),
+		client:                       opts.Client,
+		kubeClient:                   opts.KubeClient,
+		dynamicClient:                opts.DynamicClient,
+		sandboxNamespace:             ns,
+		fqdnSupported:                opts.FQDNSupported,
+		fqdnVersion:                  opts.FQDNVersion,
+		servicePortalEnabled:         opts.ServicePortalEnabled,
+		logger:                       opts.Logger.WithName("sandbox-egress-controller"),
+		rateLimit:                    rateLimit,
+		periodicInterval:             periodicInterval,
+		currentHosts:                 discovery.CloneSandboxEgressHosts(opts.InitialHosts),
+		registryServicePortalEnabled: opts.RegistryServicePortalEnabled,
+		servicePortalsNamespace:      opts.ServicePortalsNamespace,
+		triggerCh:                    make(chan struct{}, 1),
 	}
 }
 
@@ -133,18 +141,35 @@ func (c *SandboxEgressController) SyncHosts(ctx context.Context, hosts []string)
 	return c.Reconcile(ctx)
 }
 
+// SyncRegistryServicePortal updates the desired registry service portal egress settings
+// and immediately reconciles the policies. It is called on ConfigMap reload.
+func (c *SandboxEgressController) SyncRegistryServicePortal(ctx context.Context, enabled bool, servicePortalsNamespace string) error {
+	c.hostsLock.Lock()
+	c.registryServicePortalEnabled = enabled
+	c.servicePortalsNamespace = servicePortalsNamespace
+	c.hostsLock.Unlock()
+
+	return c.Reconcile(ctx)
+}
+
 // Reconcile executes a full reconciliation pass of the sandbox egress NetworkPolicy,
-// FQDNNetworkPolicy, and companion service-portal egress NetworkPolicy.
+// FQDNNetworkPolicy, companion service-portal egress NetworkPolicy, and companion
+// registry service portal egress NetworkPolicy.
 // No mutexes are held while waiting on the Kubernetes API.
 func (c *SandboxEgressController) Reconcile(ctx context.Context) error {
 	c.hostsLock.RLock()
 	hosts := discovery.CloneSandboxEgressHosts(c.currentHosts)
+	registryServicePortalEnabled := c.registryServicePortalEnabled
+	servicePortalsNamespace := c.servicePortalsNamespace
 	c.hostsLock.RUnlock()
 
 	if err := ReconcileSandboxEgress(ctx, c.client, c.sandboxNamespace, c.fqdnSupported, c.fqdnVersion, hosts, c.logger); err != nil {
 		return err
 	}
-	return ReconcileServicePortalEgress(ctx, c.client, c.sandboxNamespace, c.servicePortalEnabled, c.logger)
+	if err := ReconcileServicePortalEgress(ctx, c.client, c.sandboxNamespace, c.servicePortalEnabled, c.logger); err != nil {
+		return err
+	}
+	return ReconcileRegistryServicePortalEgress(ctx, c.client, c.sandboxNamespace, registryServicePortalEnabled, servicePortalsNamespace, c.logger)
 }
 
 // Start begins the background periodic ticker and namespaced watches.
@@ -189,6 +214,24 @@ func (c *SandboxEgressController) Start(ctx context.Context) error {
 				}
 			}()
 		}
+
+		go func() {
+			if err := sinkconfig.WatchNamedObject(
+				ctx,
+				discovery.DefaultRegistryServicePortalEgressNetworkPolicyName,
+				func(ctx context.Context) (metav1.Object, error) {
+					return c.kubeClient.NetworkingV1().NetworkPolicies(c.sandboxNamespace).Get(ctx, discovery.DefaultRegistryServicePortalEgressNetworkPolicyName, metav1.GetOptions{})
+				},
+				func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+					return c.kubeClient.NetworkingV1().NetworkPolicies(c.sandboxNamespace).Watch(ctx, opts)
+				},
+				func(obj metav1.Object) {
+					c.trigger()
+				},
+			); err != nil && ctx.Err() == nil {
+				c.logger.Error(err, "watch on registry service portal egress NetworkPolicy stopped")
+			}
+		}()
 	}
 
 	// Start namespaced watch for FQDNNetworkPolicy if supported on cluster
@@ -416,6 +459,73 @@ func ReconcileServicePortalEgress(
 			logger.Info("updated service portal egress NetworkPolicy",
 				"namespace", namespace,
 				"name", name,
+			)
+		}
+		return nil
+	})
+}
+
+// ReconcileRegistryServicePortalEgress ensures the companion registry service portal egress
+// NetworkPolicy exists when RegistryServicePortalEnabled is true, and removes it when disabled.
+func ReconcileRegistryServicePortalEgress(
+	ctx context.Context,
+	c client.Client,
+	namespace string,
+	enabled bool,
+	servicePortalsNamespace string,
+	logger logr.Logger,
+) error {
+	name := discovery.DefaultRegistryServicePortalEgressNetworkPolicyName
+
+	if !enabled {
+		existing := &networkingv1.NetworkPolicy{}
+		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to get registry service portal egress NetworkPolicy %s/%s: %w", namespace, name, err)
+		}
+		if err := c.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete registry service portal egress NetworkPolicy %s/%s: %w", namespace, name, err)
+		}
+		logger.Info("deleted registry service portal egress NetworkPolicy",
+			"namespace", namespace,
+			"name", name,
+		)
+		return nil
+	}
+
+	desired := discovery.RenderRegistryServicePortalEgressNetworkPolicy(namespace, servicePortalsNamespace)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existing := &networkingv1.NetworkPolicy{}
+		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing)
+		if apierrors.IsNotFound(err) {
+			if createErr := c.Create(ctx, desired); createErr != nil {
+				if apierrors.IsAlreadyExists(createErr) {
+					return apierrors.NewConflict(schema.GroupResource{Group: "networking.k8s.io", Resource: "networkpolicies"}, name, createErr)
+				}
+				return fmt.Errorf("failed to create registry service portal egress NetworkPolicy %s/%s: %w", namespace, name, createErr)
+			}
+			logger.Info("created registry service portal egress NetworkPolicy",
+				"namespace", namespace,
+				"name", name,
+				"servicePortalsNamespace", servicePortalsNamespace,
+			)
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("failed to get registry service portal egress NetworkPolicy %s/%s: %w", namespace, name, err)
+		}
+
+		if !equality.Semantic.DeepEqual(desired.Spec, existing.Spec) {
+			existing.Spec = desired.Spec
+			if updateErr := c.Update(ctx, existing); updateErr != nil {
+				return updateErr
+			}
+			logger.Info("updated registry service portal egress NetworkPolicy",
+				"namespace", namespace,
+				"name", name,
+				"servicePortalsNamespace", servicePortalsNamespace,
 			)
 		}
 		return nil

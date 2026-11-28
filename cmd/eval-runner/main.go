@@ -584,15 +584,17 @@ func main() {
 	}
 
 	egressController := controller.NewSandboxEgressController(controller.SandboxEgressControllerOptions{
-		Client:               mgr.GetClient(),
-		KubeClient:           kubeClient,
-		DynamicClient:        dynamicClient,
-		SandboxNamespace:     sandboxNamespace,
-		FQDNSupported:        fqdnSupported,
-		FQDNVersion:          fqdnVersion,
-		ServicePortalEnabled: servicePortalClient != nil,
-		InitialHosts:         clusterConfig.SandboxEgressHosts,
-		Logger:               setupLog,
+		Client:                       mgr.GetClient(),
+		KubeClient:                   kubeClient,
+		DynamicClient:                dynamicClient,
+		SandboxNamespace:             sandboxNamespace,
+		FQDNSupported:                fqdnSupported,
+		FQDNVersion:                  fqdnVersion,
+		ServicePortalEnabled:         servicePortalClient != nil,
+		RegistryServicePortalEnabled: clusterConfig.ServicePortal.RegistryServicePortalEnabled,
+		ServicePortalsNamespace:      clusterConfig.ServicePortal.EffectiveServicePortalsNamespace(),
+		InitialHosts:                 clusterConfig.SandboxEgressHosts,
+		Logger:                       setupLog,
 	})
 
 	egressCtx, egressCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -615,17 +617,18 @@ func main() {
 	}
 
 	reloader := controller.NewConfigReloader(controller.ConfigReloaderOptions{
-		RawFlags:       rawFlags,
-		Logger:         setupLog,
-		ReloadableSink: reloadableSink,
-		RunReconciler:  reconciler,
-		CompReconciler: comparisonReconciler,
-		Syncer:         forgeSyncer,
-		Consumer:       forgeConsumer,
-		TopUpRunner:    topUpRunner,
-		InitialConfig:  &clusterConfig,
-		FQDNSyncFunc:   egressController.SyncHosts,
-		GitHubClient:   ghClient,
+		RawFlags:                      rawFlags,
+		Logger:                        setupLog,
+		ReloadableSink:                reloadableSink,
+		RunReconciler:                 reconciler,
+		CompReconciler:                comparisonReconciler,
+		Syncer:                        forgeSyncer,
+		Consumer:                      forgeConsumer,
+		TopUpRunner:                   topUpRunner,
+		InitialConfig:                 &clusterConfig,
+		FQDNSyncFunc:                  egressController.SyncHosts,
+		RegistryServicePortalSyncFunc: egressController.SyncRegistryServicePortal,
+		GitHubClient:                  ghClient,
 	})
 
 	if err := mgr.Add(egressController); err != nil {

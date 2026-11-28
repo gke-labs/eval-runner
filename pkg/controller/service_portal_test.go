@@ -261,6 +261,189 @@ func TestBuildServicePortalEgressPolicy_GoProxyServicePortal(t *testing.T) {
 	})
 }
 
+func TestServicePortalOptions_RegistryServicePortalAddress(t *testing.T) {
+	testCases := []struct {
+		name        string
+		options     ServicePortalOptions
+		wantHost    string
+		wantAddress string
+	}{
+		{
+			name:        "disabled returns empty strings",
+			options:     ServicePortalOptions{RegistryServicePortalEnabled: false},
+			wantHost:    "",
+			wantAddress: "",
+		},
+		{
+			name:        "enabled with empty namespace uses default namespace",
+			options:     ServicePortalOptions{RegistryServicePortalEnabled: true},
+			wantHost:    "registry-service-portal.eval-runner-service-portals.svc",
+			wantAddress: "registry-service-portal.eval-runner-service-portals.svc:5000",
+		},
+		{
+			name: "enabled with whitespace namespace uses default namespace",
+			options: ServicePortalOptions{
+				RegistryServicePortalEnabled: true,
+				ServicePortalsNamespace:      "   ",
+			},
+			wantHost:    "registry-service-portal.eval-runner-service-portals.svc",
+			wantAddress: "registry-service-portal.eval-runner-service-portals.svc:5000",
+		},
+		{
+			name: "enabled with custom namespace trims whitespace",
+			options: ServicePortalOptions{
+				RegistryServicePortalEnabled: true,
+				ServicePortalsNamespace:      " custom-service-portals ",
+			},
+			wantHost:    "registry-service-portal.custom-service-portals.svc",
+			wantAddress: "registry-service-portal.custom-service-portals.svc:5000",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := testCase.options.RegistryServicePortalHost(); got != testCase.wantHost {
+				t.Errorf("RegistryServicePortalHost() = %q, want %q", got, testCase.wantHost)
+			}
+			if got := testCase.options.RegistryServicePortalAddress(); got != testCase.wantAddress {
+				t.Errorf("RegistryServicePortalAddress() = %q, want %q", got, testCase.wantAddress)
+			}
+		})
+	}
+}
+
+func TestBuildServicePortalEgressPolicy_RegistryServicePortal(t *testing.T) {
+	const defaultRegistryHost = "registry-service-portal.eval-runner-service-portals.svc"
+
+	t.Run("enabled with default namespace allows HTTP on port 5000 only", func(t *testing.T) {
+		options := ServicePortalOptions{
+			AllowedHosts:                 []string{"github.com", "*.googleapis.com"},
+			AllowedHTTPHosts:             []string{"deb.debian.org"},
+			RegistryServicePortalEnabled: true,
+		}
+		policy := BuildServicePortalEgressPolicyWithCredentials(options, nil, false)
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("policy failed validation: %v", err)
+		}
+
+		registryRule := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 5000)
+		if registryRule == nil || registryRule.GetHttp() == nil {
+			t.Fatalf("expected HTTP rule matching %s:5000, got %v", defaultRegistryHost, registryRule)
+		}
+		if gotPorts := registryRule.GetHttp().GetPorts().GetNumbers(); !reflect.DeepEqual(gotPorts, []int32{5000}) {
+			t.Fatalf("got ports %v, want [5000]", gotPorts)
+		}
+		if matchedPort80 := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 80); matchedPort80 != nil {
+			t.Fatalf("expected %s:80 not to match, got %v", defaultRegistryHost, matchedPort80)
+		}
+		if matchedHTTPS := policy.Match(portalsv1.ProtocolHTTPS, defaultRegistryHost, 5000); matchedHTTPS != nil {
+			t.Fatalf("expected HTTPS %s:5000 not to match, got %v", defaultRegistryHost, matchedHTTPS)
+		}
+	})
+
+	t.Run("enabled with empty allow lists still produces valid registry policy", func(t *testing.T) {
+		options := ServicePortalOptions{
+			RegistryServicePortalEnabled: true,
+		}
+		policy := BuildServicePortalEgressPolicyWithCredentials(options, nil, false)
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("policy failed validation: %v", err)
+		}
+		registryRule := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 5000)
+		if registryRule == nil || registryRule.GetHttp() == nil {
+			t.Fatalf("expected HTTP rule matching %s:5000, got %v", defaultRegistryHost, registryRule)
+		}
+	})
+
+	t.Run("enabled respects custom ServicePortalsNamespace", func(t *testing.T) {
+		options := ServicePortalOptions{
+			AllowedHosts:                 []string{"github.com"},
+			RegistryServicePortalEnabled: true,
+			ServicePortalsNamespace:      "custom-service-portals",
+		}
+		policy := BuildServicePortalEgressPolicyWithCredentials(options, nil, false)
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("policy failed validation: %v", err)
+		}
+
+		wantHost := "registry-service-portal.custom-service-portals.svc"
+		registryRule := policy.Match(portalsv1.ProtocolHTTP, wantHost, 5000)
+		if registryRule == nil || registryRule.GetHttp() == nil {
+			t.Fatalf("expected HTTP rule matching %s:5000, got %v", wantHost, registryRule)
+		}
+		if matchedDefault := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 5000); matchedDefault != nil {
+			t.Fatalf("expected default namespace host %s not to match when custom namespace is set, got %v", defaultRegistryHost, matchedDefault)
+		}
+	})
+
+	t.Run("enabled coexists without ties when registry host is also in AllowedHTTPHosts on port 80", func(t *testing.T) {
+		options := ServicePortalOptions{
+			AllowedHTTPHosts:             []string{"deb.debian.org", defaultRegistryHost},
+			RegistryServicePortalEnabled: true,
+		}
+		policy := BuildServicePortalEgressPolicyWithCredentials(options, nil, false)
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("policy failed validation: %v", err)
+		}
+		if matched5000 := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 5000); matched5000 == nil {
+			t.Fatalf("expected HTTP match on port 5000")
+		}
+		if matched80 := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 80); matched80 == nil {
+			t.Fatalf("expected HTTP match on port 80")
+		}
+	})
+
+	t.Run("disabled leaves policy unchanged without registry port 5000 rule", func(t *testing.T) {
+		options := ServicePortalOptions{
+			AllowedHosts:                 DefaultServicePortalAllowedHosts,
+			AllowedHTTPHosts:             DefaultServicePortalAllowedHTTPHosts,
+			RegistryServicePortalEnabled: false,
+		}
+		policy := BuildServicePortalEgressPolicyWithCredentials(options, nil, false)
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("policy failed validation: %v", err)
+		}
+		if matched := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 5000); matched != nil {
+			t.Fatalf("expected %s:5000 not to match when disabled, got %v", defaultRegistryHost, matched)
+		}
+	})
+
+	t.Run("coexists with goproxy, model credential, and GCP access token rules", func(t *testing.T) {
+		credential, ok, err := ModelCredentialForModel("google/gemini-2.5-flash", "")
+		if err != nil || !ok {
+			t.Fatalf("ModelCredentialForModel failed: ok=%v err=%v", ok, err)
+		}
+		options := ServicePortalOptions{
+			AllowedHosts:                 append([]string{"proxy.golang.org"}, DefaultServicePortalAllowedHosts...),
+			AllowedHTTPHosts:             DefaultServicePortalAllowedHTTPHosts,
+			GoProxyServicePortalEnabled:  true,
+			RegistryServicePortalEnabled: true,
+			ServicePortalsNamespace:      "eval-runner-service-portals",
+		}
+		policy := BuildServicePortalEgressPolicyWithCredentials(options, &credential, true)
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("policy failed validation: %v", err)
+		}
+
+		registryRule := policy.Match(portalsv1.ProtocolHTTP, defaultRegistryHost, 5000)
+		if registryRule == nil || registryRule.GetHttp() == nil {
+			t.Fatalf("expected HTTP registry rule matching %s:5000, got %v", defaultRegistryHost, registryRule)
+		}
+		goProxyRule := policy.Match(portalsv1.ProtocolHTTPS, "proxy.golang.org", 443)
+		if goProxyRule == nil || goProxyRule.GetHttps().GetEffects().GetBackendUrl() == "" {
+			t.Fatalf("expected Go proxy rule with BackendUrl, got %v", goProxyRule)
+		}
+		modelRule := policy.Match(portalsv1.ProtocolHTTPS, "generativelanguage.googleapis.com", 443)
+		if modelRule == nil || len(modelRule.GetHttps().GetEffects().GetReplaceHeaders()) != 1 {
+			t.Fatalf("expected model credential rule, got %v", modelRule)
+		}
+		gcpRule := policy.Match(portalsv1.ProtocolHTTPS, "storage.googleapis.com", 443)
+		if gcpRule == nil || len(gcpRule.GetHttps().GetEffects().GetReplaceHeaders()) != 1 {
+			t.Fatalf("expected GCP credential rule, got %v", gcpRule)
+		}
+	})
+}
+
 func TestModelCredentialForModel(t *testing.T) {
 	testCases := []struct {
 		name         string

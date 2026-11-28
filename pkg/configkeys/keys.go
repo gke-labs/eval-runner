@@ -93,6 +93,8 @@ const (
 	ConfigMapKeyServicePortalModelBaseURL = "servicePortalModelBaseURL"
 	// ConfigMapKeyGoProxyServicePortalEnabled is the ConfigMap key enabling forwarding proxy.golang.org HTTPS traffic to the in-cluster Go proxy service portal.
 	ConfigMapKeyGoProxyServicePortalEnabled = "goproxyServicePortalEnabled"
+	// ConfigMapKeyRegistryServicePortalEnabled is the ConfigMap key enabling the in-cluster OCI registry service portal for task sandboxes.
+	ConfigMapKeyRegistryServicePortalEnabled = "registryServicePortalEnabled"
 	// ConfigMapKeyServicePortalsNamespace is the ConfigMap key for the namespace where ecosystem caching service portals run.
 	ConfigMapKeyServicePortalsNamespace = "servicePortalsNamespace"
 
