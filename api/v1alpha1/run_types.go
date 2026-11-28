@@ -419,6 +419,37 @@ type ManifestTask struct {
 	// /out/results.json.
 	// +optional
 	Agent *ManifestTaskAgent `json:"agent,omitempty"`
+
+	// Prebuild is the optional name of a prebuild declared in Manifest.Prebuilds
+	// that prepares shared artifacts before this task runs.
+	// +optional
+	Prebuild string `json:"prebuild,omitempty"`
+}
+
+// ManifestPrebuild describes an optional named prebuild script declared in .evals/list
+// that can be run once per (repo, commit, prebuildName) and cached across tasks.
+type ManifestPrebuild struct {
+	// Image is the container image to run the prebuild command in.
+	// +kubebuilder:validation:Required
+	Image string `json:"image"`
+
+	// Command is the command/script argv to run inside the prebuild container.
+	// +kubebuilder:validation:Required
+	Command []string `json:"command"`
+
+	// TimeoutSeconds is the optional maximum duration in seconds the prebuild command may run.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// Paths specifies optional repository-relative path globs that affect this prebuild.
+	// +optional
+	Paths []string `json:"paths,omitempty"`
+
+	// Resources specifies optional declarative resource requirements for the prebuild
+	// (e.g. sandbox, kind-cluster).
+	// +optional
+	Resources []ManifestResource `json:"resources,omitempty"`
 }
 
 // ManifestTaskAgent configures an agent evaluation on a sandbox task.
@@ -468,6 +499,10 @@ type Manifest struct {
 	// Images lists the images declared by the repository.
 	// +optional
 	Images []ManifestImage `json:"images,omitempty"`
+
+	// Prebuilds lists optional named prebuild scripts declared by the repository.
+	// +optional
+	Prebuilds map[string]ManifestPrebuild `json:"prebuilds,omitempty"`
 
 	// Tasks lists all discovered eval tasks.
 	Tasks []ManifestTask `json:"tasks"`
