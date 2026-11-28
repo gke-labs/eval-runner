@@ -127,6 +127,7 @@ status:
 | `manifest` | `*Manifest` | The parsed output of `.evals/list` upon successful discovery. |
 | `discoveryDeadline` | `*metav1.Time` | Overall deadline by which discovery must complete. |
 | `executionDeadline` | `*metav1.Time` | Overall deadline by which sample execution must complete. |
+| `prebuilds` | `[]PrebuildStatus` | Per-prebuild execution status for manifest prebuilds required by this Run. See [PrebuildStatus](#prebuildstatus-statusprebuilds). |
 | `tasks` | `[]TaskStatus` | Per-task execution results and score aggregates. See [Tasks](#taskstatus). |
 | `artifacts` | `string` | Storage base URI or prefix where artifacts for this Run are persisted (e.g. `gs://<bucket>/runs/<commit>/`). |
 | `summary` | `*RunSummary` | Aggregate execution counts and success rate range across tasks. See [Summary](#runsummary). |
@@ -142,6 +143,17 @@ status:
 | `Running` | Sample tasks are actively executing in parallel sandboxes in `eval-runner-sandbox`. |
 | `Completed` | All sample tasks have finished execution and per-task aggregates are recorded in `status.tasks`. |
 | `Failed` | Discovery or execution encountered a terminal error (e.g. invalid commit, non-zero command exit, invalid manifest, deadline exceeded). Details are in `status.message`. |
+
+### PrebuildStatus (`status.prebuilds[]`)
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | `string` | Prebuild name matching a key in `Manifest.Prebuilds`. |
+| `phase` | `string` | Execution phase of the prebuild (`Pending`, `Running`, `Completed`, `Failed`). |
+| `startedAt` | `*metav1.Time` | Timestamp when the prebuild transitioned to `Running`. |
+| `finishedAt` | `*metav1.Time` | Timestamp when the prebuild reached a terminal phase (`Completed`, `Failed`). |
+| `message` | `string` | Human-readable detail on prebuild status (such as cache hit or failure detail). |
+| `executionID` | `string` | In-flight async process identifier while the prebuild is running (cleared on terminal phase). |
 
 ### TaskStatus (`status.tasks[]`)
 

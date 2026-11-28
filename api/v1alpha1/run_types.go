@@ -64,6 +64,52 @@ const (
 	TaskPhaseSkipped TaskPhase = "Skipped"
 )
 
+// PrebuildPhase defines the lifecycle phase of a manifest prebuild.
+// +kubebuilder:validation:Enum=Pending;Running;Completed;Failed
+type PrebuildPhase string
+
+const (
+	// PrebuildPhasePending means the prebuild is waiting to start.
+	PrebuildPhasePending PrebuildPhase = "Pending"
+
+	// PrebuildPhaseRunning means the prebuild is currently executing in a sandbox.
+	PrebuildPhaseRunning PrebuildPhase = "Running"
+
+	// PrebuildPhaseCompleted means the prebuild completed (or hit cache) and dependent tasks may start.
+	PrebuildPhaseCompleted PrebuildPhase = "Completed"
+
+	// PrebuildPhaseFailed means the prebuild encountered an error and dependent tasks will be failed.
+	PrebuildPhaseFailed PrebuildPhase = "Failed"
+)
+
+// PrebuildStatus records the execution status of a named manifest prebuild for a Run.
+type PrebuildStatus struct {
+	// Name is the prebuild name from Manifest.Prebuilds.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Phase is the current execution phase of this prebuild.
+	// +optional
+	Phase PrebuildPhase `json:"phase,omitempty"`
+
+	// StartedAt is the time when the prebuild transitioned to Running.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// FinishedAt is the time when the prebuild reached a terminal phase (Completed or Failed).
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+
+	// Message is human-readable detail on prebuild status or failure.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// ExecutionID identifies the in-flight async process running inside the prebuild sandbox.
+	// Cleared when the prebuild reaches a terminal phase.
+	// +optional
+	ExecutionID string `json:"executionID,omitempty"`
+}
+
 // CostSource represents the provenance of model prices used to compute costUSD.
 // +kubebuilder:validation:Enum=configmap;default
 type CostSource string
@@ -598,6 +644,10 @@ type RunStatus struct {
 	// ExecutionDeadline is the deadline by which sample execution must complete.
 	// +optional
 	ExecutionDeadline *metav1.Time `json:"executionDeadline,omitempty"`
+
+	// Prebuilds records the execution status of named manifest prebuilds required by this Run.
+	// +optional
+	Prebuilds []PrebuildStatus `json:"prebuilds,omitempty"`
 
 	// Tasks records the status and results for each executed eval task.
 	// +optional
