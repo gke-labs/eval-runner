@@ -1771,3 +1771,119 @@ func TestBuildTaskSandbox_KindCluster(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildTaskSandbox_RegistryServicePortal(t *testing.T) {
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-registry-run",
+			Namespace: "eval-runner",
+			UID:       "uid-registry-1",
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/example/kube-agents.git",
+				Commit: "abcdef123456",
+			},
+		},
+	}
+	digest := AuthTokenDigest("token-registry")
+	const registryAddress = "registry-service-portal.eval-runner-service-portals.svc:5000"
+
+	t.Run("injects EVAL_IMAGE_REGISTRY and DinD --insecure-registry when enabled on kind-cluster sandbox", func(t *testing.T) {
+		sandbox := BuildTaskSandbox(run, "kind-registry-task", TaskSandboxConfig{
+			Namespace:       "eval-runner-sandbox",
+			Image:           "kube-agents-eval:v1",
+			AuthTokenDigest: digest,
+			SandboxTask:     true,
+			KindCluster:     true,
+			ImageRegistry:   registryAddress,
+		})
+
+		podSpec := sandbox.Spec.PodTemplate.Spec
+		if len(podSpec.Containers) != 2 {
+			t.Fatalf("len(Containers) = %d, want 2", len(podSpec.Containers))
+		}
+
+		taskContainer := podSpec.Containers[0]
+		foundRegistryEnvironmentVariable := false
+		for _, environmentVariable := range taskContainer.Env {
+			if environmentVariable.Name == EvalImageRegistryEnvironmentVariable {
+				foundRegistryEnvironmentVariable = true
+				if environmentVariable.Value != registryAddress {
+					t.Errorf("%s = %q, want %q", EvalImageRegistryEnvironmentVariable, environmentVariable.Value, registryAddress)
+				}
+			}
+		}
+		if !foundRegistryEnvironmentVariable {
+			t.Errorf("expected task container env to contain %s=%q", EvalImageRegistryEnvironmentVariable, registryAddress)
+		}
+
+		sidecarContainer := podSpec.Containers[1]
+		if sidecarContainer.Name != DockerInDockerContainerName {
+			t.Fatalf("sidecar Name = %q, want %q", sidecarContainer.Name, DockerInDockerContainerName)
+		}
+		wantArgs := []string{"--insecure-registry=" + registryAddress}
+		if len(sidecarContainer.Args) != len(wantArgs) || sidecarContainer.Args[0] != wantArgs[0] {
+			t.Errorf("sidecar Args = %v, want %v", sidecarContainer.Args, wantArgs)
+		}
+	})
+
+	t.Run("injects EVAL_IMAGE_REGISTRY on non-kind task sandboxes when enabled", func(t *testing.T) {
+		for _, sandboxTask := range []bool{false, true} {
+			sandbox := BuildTaskSandbox(run, "regular-registry-task", TaskSandboxConfig{
+				Namespace:       "eval-runner-sandbox",
+				Image:           "regular-eval:v1",
+				AuthTokenDigest: digest,
+				SandboxTask:     sandboxTask,
+				KindCluster:     false,
+				ImageRegistry:   registryAddress,
+			})
+
+			podSpec := sandbox.Spec.PodTemplate.Spec
+			if len(podSpec.Containers) != 1 {
+				t.Fatalf("SandboxTask=%v: len(Containers) = %d, want 1", sandboxTask, len(podSpec.Containers))
+			}
+
+			foundRegistryEnvironmentVariable := false
+			for _, environmentVariable := range podSpec.Containers[0].Env {
+				if environmentVariable.Name == EvalImageRegistryEnvironmentVariable {
+					foundRegistryEnvironmentVariable = true
+					if environmentVariable.Value != registryAddress {
+						t.Errorf("SandboxTask=%v: %s = %q, want %q", sandboxTask, EvalImageRegistryEnvironmentVariable, environmentVariable.Value, registryAddress)
+					}
+				}
+			}
+			if !foundRegistryEnvironmentVariable {
+				t.Errorf("SandboxTask=%v: expected task container env to contain %s=%q", sandboxTask, EvalImageRegistryEnvironmentVariable, registryAddress)
+			}
+		}
+	})
+
+	t.Run("omits EVAL_IMAGE_REGISTRY and DinD args when disabled", func(t *testing.T) {
+		for _, kindCluster := range []bool{false, true} {
+			sandbox := BuildTaskSandbox(run, "disabled-registry-task", TaskSandboxConfig{
+				Namespace:       "eval-runner-sandbox",
+				Image:           "regular-eval:v1",
+				AuthTokenDigest: digest,
+				SandboxTask:     true,
+				KindCluster:     kindCluster,
+				ImageRegistry:   "",
+			})
+
+			podSpec := sandbox.Spec.PodTemplate.Spec
+			for _, environmentVariable := range podSpec.Containers[0].Env {
+				if environmentVariable.Name == EvalImageRegistryEnvironmentVariable {
+					t.Errorf("KindCluster=%v: expected %s to be absent when ImageRegistry is empty", kindCluster, EvalImageRegistryEnvironmentVariable)
+				}
+			}
+			if kindCluster {
+				if len(podSpec.Containers) != 2 {
+					t.Fatalf("KindCluster=true: len(Containers) = %d, want 2", len(podSpec.Containers))
+				}
+				if len(podSpec.Containers[1].Args) != 0 {
+					t.Errorf("expected empty sidecar Args when ImageRegistry is empty, got %v", podSpec.Containers[1].Args)
+				}
+			}
+		}
+	})
+}

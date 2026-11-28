@@ -1101,6 +1101,7 @@ func TestUnknownConfigMapKeys(t *testing.T) {
 			configkeys.ConfigMapKeyHeadTargetCIHalfWidth:    "0.05",
 			configkeys.ConfigMapKeyHeadMaxSamplesPerTask:    "64",
 			ConfigMapKeyGoProxyServicePortalEnabled:         "true",
+			ConfigMapKeyRegistryServicePortalEnabled:        "true",
 			ConfigMapKeyServicePortalsNamespace:             "eval-runner-service-portals",
 		},
 	}
@@ -3388,6 +3389,163 @@ func TestResolveConfig_ServicePortal(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), configkeys.ConfigMapKeyServicePortalsNamespace) {
 			t.Errorf("expected error mentioning %s, got %q", configkeys.ConfigMapKeyServicePortalsNamespace, err.Error())
+		}
+	})
+
+	t.Run("registry service portal defaults to disabled", func(t *testing.T) {
+		cfg, err := ResolveConfig(nil, RawFlags{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ServicePortal.RegistryServicePortalEnabled {
+			t.Errorf("ServicePortal.RegistryServicePortalEnabled = true, want false")
+		}
+		if got := cfg.ServicePortal.RegistryServicePortalAddress(); got != "" {
+			t.Errorf("ServicePortal.RegistryServicePortalAddress() = %q, want empty string", got)
+		}
+	})
+
+	t.Run("registryServicePortalEnabled true and false parsed from configmap", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			value       string
+			wantEnabled bool
+			wantAddress string
+		}{
+			{
+				name:        "true",
+				value:       "true",
+				wantEnabled: true,
+				wantAddress: "registry-service-portal.eval-runner-service-portals.svc:5000",
+			},
+			{
+				name:        "true with whitespace",
+				value:       " true ",
+				wantEnabled: true,
+				wantAddress: "registry-service-portal.eval-runner-service-portals.svc:5000",
+			},
+			{
+				name:        "false",
+				value:       "false",
+				wantEnabled: false,
+				wantAddress: "",
+			},
+			{
+				name:        "whitespace retains default false",
+				value:       "   ",
+				wantEnabled: false,
+				wantAddress: "",
+			},
+		}
+		for _, testCase := range testCases {
+			t.Run(testCase.name, func(t *testing.T) {
+				configMap := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "eval-runner", Name: "eval-runner-config"},
+					Data: map[string]string{
+						configkeys.ConfigMapKeyRegistryServicePortalEnabled: testCase.value,
+					},
+				}
+				cfg, err := ResolveConfig(configMap, RawFlags{})
+				if err != nil {
+					t.Fatalf("unexpected error for %q: %v", testCase.value, err)
+				}
+				if cfg.ServicePortal.RegistryServicePortalEnabled != testCase.wantEnabled {
+					t.Errorf("ServicePortal.RegistryServicePortalEnabled = %v, want %v", cfg.ServicePortal.RegistryServicePortalEnabled, testCase.wantEnabled)
+				}
+				if got := cfg.ServicePortal.RegistryServicePortalAddress(); got != testCase.wantAddress {
+					t.Errorf("ServicePortal.RegistryServicePortalAddress() = %q, want %q", got, testCase.wantAddress)
+				}
+			})
+		}
+	})
+
+	t.Run("registryServicePortalEnabled respects custom servicePortalsNamespace", func(t *testing.T) {
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "eval-runner", Name: "eval-runner-config"},
+			Data: map[string]string{
+				configkeys.ConfigMapKeyRegistryServicePortalEnabled: "true",
+				configkeys.ConfigMapKeyServicePortalsNamespace:      "custom-service-portals",
+			},
+		}
+		cfg, err := ResolveConfig(configMap, RawFlags{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		wantAddress := "registry-service-portal.custom-service-portals.svc:5000"
+		if got := cfg.ServicePortal.RegistryServicePortalAddress(); got != wantAddress {
+			t.Errorf("ServicePortal.RegistryServicePortalAddress() = %q, want %q", got, wantAddress)
+		}
+	})
+
+	t.Run("invalid registryServicePortalEnabled returns error", func(t *testing.T) {
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "eval-runner", Name: "eval-runner-config"},
+			Data: map[string]string{
+				configkeys.ConfigMapKeyRegistryServicePortalEnabled: "not-a-bool",
+			},
+		}
+		_, err := ResolveConfig(configMap, RawFlags{})
+		if err == nil {
+			t.Fatal("expected error for invalid registryServicePortalEnabled, got nil")
+		}
+		if !strings.Contains(err.Error(), configkeys.ConfigMapKeyRegistryServicePortalEnabled) {
+			t.Errorf("expected error mentioning %s, got %q", configkeys.ConfigMapKeyRegistryServicePortalEnabled, err.Error())
+		}
+	})
+
+	t.Run("ConfigReloader invokes RegistryServicePortalSyncFunc on changes", func(t *testing.T) {
+		ctx := t.Context()
+		initialConfig := DefaultClusterConfig()
+		var syncCalls int
+		var syncedEnabled bool
+		var syncedNamespace string
+
+		reloader := NewConfigReloader(ConfigReloaderOptions{
+			Logger:        logr.Discard(),
+			InitialConfig: &initialConfig,
+			RegistryServicePortalSyncFunc: func(ctx context.Context, enabled bool, servicePortalsNamespace string) error {
+				syncCalls++
+				syncedEnabled = enabled
+				syncedNamespace = servicePortalsNamespace
+				return nil
+			},
+		})
+
+		// Unchanged ConfigMap does not invoke callback.
+		if err := reloader.Reload(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "eval-runner", Name: DefaultConfigMapName},
+		}); err != nil {
+			t.Fatalf("unexpected reload error: %v", err)
+		}
+		if syncCalls != 0 {
+			t.Fatalf("expected 0 sync calls for unchanged config, got %d", syncCalls)
+		}
+
+		// Enabling registryServicePortalEnabled invokes callback.
+		if err := reloader.Reload(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "eval-runner", Name: DefaultConfigMapName},
+			Data: map[string]string{
+				ConfigMapKeyRegistryServicePortalEnabled: "true",
+			},
+		}); err != nil {
+			t.Fatalf("unexpected reload error: %v", err)
+		}
+		if syncCalls != 1 || !syncedEnabled || syncedNamespace != DefaultServicePortalsNamespace {
+			t.Fatalf("got syncCalls=%d enabled=%v namespace=%q, want 1/true/%q", syncCalls, syncedEnabled, syncedNamespace, DefaultServicePortalsNamespace)
+		}
+
+		// Updating servicePortalsNamespace invokes callback with new namespace.
+		if err := reloader.Reload(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "eval-runner", Name: DefaultConfigMapName},
+			Data: map[string]string{
+				ConfigMapKeyRegistryServicePortalEnabled: "true",
+				ConfigMapKeyServicePortalsNamespace:      "custom-service-portals",
+			},
+		}); err != nil {
+			t.Fatalf("unexpected reload error: %v", err)
+		}
+		if syncCalls != 2 || !syncedEnabled || syncedNamespace != "custom-service-portals" {
+			t.Fatalf("got syncCalls=%d enabled=%v namespace=%q, want 2/true/%q", syncCalls, syncedEnabled, syncedNamespace, "custom-service-portals")
 		}
 	})
 }

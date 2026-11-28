@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/gke-labs/eval-runner/api/v1alpha1"
+	"github.com/gke-labs/eval-runner/pkg/discovery"
 	"github.com/gke-labs/eval-runner/pkg/modelclient/gemini"
 	serviceportalclient "github.com/gke-labs/service-portals/pkg/client"
 	portalsv1 "github.com/gke-labs/service-portals/pkg/portals/v1"
@@ -39,7 +40,14 @@ const (
 
 	// DefaultServicePortalsNamespace is the default Kubernetes namespace where
 	// ecosystem caching service portals run.
-	DefaultServicePortalsNamespace = "eval-runner-service-portals"
+	DefaultServicePortalsNamespace = discovery.DefaultServicePortalsNamespace
+
+	// DefaultRegistryServicePortalServiceName is the Kubernetes Service name for the
+	// in-cluster OCI registry service portal.
+	DefaultRegistryServicePortalServiceName = "registry-service-portal"
+
+	// DefaultRegistryServicePortalPort is the TCP port for the in-cluster OCI registry service portal.
+	DefaultRegistryServicePortalPort = discovery.DefaultRegistryServicePortalPort
 
 	servicePortalCredentialURIScheme = "secret://"
 
@@ -117,9 +125,43 @@ type ServicePortalOptions struct {
 	// GoProxyServicePortalEnabled forwards proxy.golang.org HTTPS traffic to the in-cluster Go proxy service portal.
 	GoProxyServicePortalEnabled bool
 
+	// RegistryServicePortalEnabled enables the in-cluster OCI registry service portal for task sandboxes.
+	RegistryServicePortalEnabled bool
+
 	// ServicePortalsNamespace is the Kubernetes namespace where ecosystem caching service portals run.
 	// Defaults to DefaultServicePortalsNamespace when empty.
 	ServicePortalsNamespace string
+}
+
+// EffectiveServicePortalsNamespace returns the normalized Kubernetes namespace where
+// ecosystem service portals run, defaulting to DefaultServicePortalsNamespace when empty.
+func (options ServicePortalOptions) EffectiveServicePortalsNamespace() string {
+	trimmedNamespace := strings.TrimSpace(options.ServicePortalsNamespace)
+	if trimmedNamespace == "" {
+		return DefaultServicePortalsNamespace
+	}
+	return trimmedNamespace
+}
+
+// RegistryServicePortalHost returns the DNS hostname of the in-cluster OCI registry
+// service portal (registry-service-portal.<namespace>.svc) when RegistryServicePortalEnabled
+// is true, or "" when disabled.
+func (options ServicePortalOptions) RegistryServicePortalHost() string {
+	if !options.RegistryServicePortalEnabled {
+		return ""
+	}
+	return fmt.Sprintf("%s.%s.svc", DefaultRegistryServicePortalServiceName, options.EffectiveServicePortalsNamespace())
+}
+
+// RegistryServicePortalAddress returns the host:port address of the in-cluster OCI registry
+// service portal (registry-service-portal.<namespace>.svc:5000) when RegistryServicePortalEnabled
+// is true, or "" when disabled.
+func (options ServicePortalOptions) RegistryServicePortalAddress() string {
+	host := options.RegistryServicePortalHost()
+	if host == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", host, DefaultRegistryServicePortalPort)
 }
 
 type cachingServicePortal struct {
@@ -353,8 +395,10 @@ func BuildServicePortalEgressPolicyWithCredentials(
 	}
 
 	var credentialRule *portalsv1.EgressRule
+	var credentialHost string
+	var credentialEffectivePort int32
 	if modelCredential != nil {
-		credentialHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(modelCredential.Host)), ".")
+		credentialHost = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(modelCredential.Host)), ".")
 		isHTTP := strings.EqualFold(modelCredential.Protocol, "http")
 		effectivePort := modelCredential.Port
 		if effectivePort == 0 {
@@ -364,6 +408,7 @@ func BuildServicePortalEgressPolicyWithCredentials(
 				effectivePort = 443
 			}
 		}
+		credentialEffectivePort = effectivePort
 		// Remove exact duplicates on the same port from the plain allow lists so EgressPolicy.Validate() sees no ties.
 		if effectivePort == 80 {
 			httpHosts = filterOutHostname(httpHosts, credentialHost)
@@ -404,7 +449,25 @@ func BuildServicePortalEgressPolicyWithCredentials(
 		}
 	}
 
-	if len(httpHosts) == 0 && len(httpsHosts) == 0 && len(cachingServicePortalRules) == 0 && gcpCredentialRule == nil && credentialRule == nil {
+	var registryServicePortalRule *portalsv1.EgressRule
+	if options.RegistryServicePortalEnabled {
+		registryHost := options.RegistryServicePortalHost()
+		credentialMatchesRegistry := credentialRule != nil &&
+			credentialHost == registryHost &&
+			credentialEffectivePort == DefaultRegistryServicePortalPort
+		if !credentialMatchesRegistry {
+			registryServicePortalRule = &portalsv1.EgressRule{
+				Http: &portalsv1.HttpRule{
+					Hostnames: []string{registryHost},
+					Ports: &portalsv1.Ports{
+						Numbers: []int32{DefaultRegistryServicePortalPort},
+					},
+				},
+			}
+		}
+	}
+
+	if len(httpHosts) == 0 && len(httpsHosts) == 0 && len(cachingServicePortalRules) == 0 && registryServicePortalRule == nil && gcpCredentialRule == nil && credentialRule == nil {
 		return &portalsv1.EgressPolicy{}
 	}
 	var rules []*portalsv1.EgressRule
@@ -423,6 +486,9 @@ func BuildServicePortalEgressPolicyWithCredentials(
 		})
 	}
 	rules = append(rules, cachingServicePortalRules...)
+	if registryServicePortalRule != nil {
+		rules = append(rules, registryServicePortalRule)
+	}
 	if gcpCredentialRule != nil {
 		rules = append(rules, gcpCredentialRule)
 	}

@@ -14408,6 +14408,49 @@ func TestKindClusterTaskEligibilityAndSandboxConstruction(t *testing.T) {
 			t.Errorf("expected 1 container on non-kind sandbox, got %d", len(regularPodSpec.Containers))
 		}
 	})
+
+	t.Run("buildPendingTaskSandbox injects EVAL_IMAGE_REGISTRY and DinD --insecure-registry when registryServicePortalEnabled is true", func(t *testing.T) {
+		registryReconciler := &RunReconciler{
+			Config: ClusterConfig{
+				ServicePortal: ServicePortalOptions{
+					RegistryServicePortalEnabled: true,
+					ServicePortalsNamespace:      "custom-service-portals",
+				},
+			},
+		}
+		run := &v1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "run-kind-registry", Namespace: "eval-runner"},
+			Spec: v1alpha1.RunSpec{
+				Repo: v1alpha1.RepoSpec{URL: "https://github.com/example/kube-agents.git", Commit: "abcdef1"},
+			},
+		}
+
+		wantAddress := "registry-service-portal.custom-service-portals.svc:5000"
+		kindSandbox := registryReconciler.buildPendingTaskSandbox(
+			run,
+			v1alpha1.TaskStatus{ID: manifest.Tasks[0].ID},
+			&manifest.Tasks[0],
+			"task-run-kind-registry-sandbox",
+			"token-registry",
+		)
+		kindPodSpec := kindSandbox.Spec.PodTemplate.Spec
+		if len(kindPodSpec.Containers) != 2 {
+			t.Fatalf("expected 2 containers, got %d", len(kindPodSpec.Containers))
+		}
+		registryEnvironmentVariableFound := false
+		for _, environmentVariable := range kindPodSpec.Containers[0].Env {
+			if environmentVariable.Name == discovery.EvalImageRegistryEnvironmentVariable && environmentVariable.Value == wantAddress {
+				registryEnvironmentVariableFound = true
+			}
+		}
+		if !registryEnvironmentVariableFound {
+			t.Errorf("expected %s=%q in task container env, got %+v", discovery.EvalImageRegistryEnvironmentVariable, wantAddress, kindPodSpec.Containers[0].Env)
+		}
+		wantArgs := []string{"--insecure-registry=" + wantAddress}
+		if !reflect.DeepEqual(kindPodSpec.Containers[1].Args, wantArgs) {
+			t.Errorf("dind sidecar Args = %v, want %v", kindPodSpec.Containers[1].Args, wantArgs)
+		}
+	})
 }
 
 func gitCommandSubcommand(command []string) string {

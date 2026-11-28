@@ -124,6 +124,10 @@ const (
 	// DockerInDockerHost is the DOCKER_HOST value injected into kind-cluster task containers.
 	DockerInDockerHost = "tcp://127.0.0.1:2375"
 
+	// EvalImageRegistryEnvironmentVariable is the environment variable injected into task
+	// sandboxes pointing at the in-cluster OCI registry service portal (host:port) when enabled.
+	EvalImageRegistryEnvironmentVariable = "EVAL_IMAGE_REGISTRY"
+
 	// DefaultDockerInDockerCPURequest is the default CPU request for the dind sidecar container.
 	DefaultDockerInDockerCPURequest = "500m"
 
@@ -276,6 +280,7 @@ type TaskSandboxConfig struct {
 	KindClusterLimits      corev1.ResourceList
 	Limits                 corev1.ResourceList
 	ServicePortalIntercept bool
+	ImageRegistry          string
 }
 
 // BuildTaskSandbox constructs the Sandbox CR for executing an eval task for a Run.
@@ -585,6 +590,13 @@ fi
 			Value: DockerInDockerHost,
 		})
 	}
+	imageRegistry := strings.TrimSpace(cfg.ImageRegistry)
+	if imageRegistry != "" {
+		taskEnvironmentVariables = append(taskEnvironmentVariables, corev1.EnvVar{
+			Name:  EvalImageRegistryEnvironmentVariable,
+			Value: imageRegistry,
+		})
+	}
 
 	sandbox := &sandboxv1beta1.Sandbox{
 		TypeMeta: metav1.TypeMeta{
@@ -727,7 +739,7 @@ fi
 		}
 		sandbox.Spec.PodTemplate.Spec.Containers = append(
 			sandbox.Spec.PodTemplate.Spec.Containers,
-			buildDockerInDockerSidecarContainer(cfg.KindClusterLimits),
+			buildDockerInDockerSidecarContainer(cfg.KindClusterLimits, imageRegistry),
 		)
 	}
 
@@ -736,7 +748,7 @@ fi
 
 // buildDockerInDockerSidecarContainer returns the privileged Docker-in-Docker sidecar
 // container attached to task sandboxes declaring the kind-cluster resource.
-func buildDockerInDockerSidecarContainer(customLimits corev1.ResourceList) corev1.Container {
+func buildDockerInDockerSidecarContainer(customLimits corev1.ResourceList, imageRegistry string) corev1.Container {
 	limits := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(DefaultDockerInDockerCPULimit),
 		corev1.ResourceMemory: resource.MustParse(DefaultDockerInDockerMemoryLimit),
@@ -748,9 +760,15 @@ func buildDockerInDockerSidecarContainer(customLimits corev1.ResourceList) corev
 		limits[corev1.ResourceMemory] = quantity.DeepCopy()
 	}
 
+	var args []string
+	if trimmedRegistry := strings.TrimSpace(imageRegistry); trimmedRegistry != "" {
+		args = []string{"--insecure-registry=" + trimmedRegistry}
+	}
+
 	return corev1.Container{
 		Name:  DockerInDockerContainerName,
 		Image: DockerInDockerImage,
+		Args:  args,
 		Env: []corev1.EnvVar{
 			{
 				Name:  "DOCKER_TLS_CERTDIR",

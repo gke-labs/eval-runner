@@ -3147,6 +3147,10 @@ func (r *RunReconciler) buildPendingTaskSandbox(
 			}
 		}
 	}
+	r.cfgMu.RLock()
+	servicePortalOptions := r.Config.ServicePortal
+	r.cfgMu.RUnlock()
+
 	return discovery.BuildTaskSandbox(run, task.ID, discovery.TaskSandboxConfig{
 		Namespace:              r.sandboxNamespace(),
 		ControllerInstance:     r.InstanceID,
@@ -3164,6 +3168,7 @@ func (r *RunReconciler) buildPendingTaskSandbox(
 		KindClusterLimits:      kindClusterLimits,
 		Limits:                 taskLimits,
 		ServicePortalIntercept: r.ServicePortalClient != nil,
+		ImageRegistry:          servicePortalOptions.RegistryServicePortalAddress(),
 	})
 }
 
