@@ -187,10 +187,10 @@ var KnownConfigMapKeys = map[string]struct{}{
 	configkeys.ConfigMapKeyServicePortalTokenFile:         {},
 	configkeys.ConfigMapKeyServicePortalAllowedHosts:      {},
 	configkeys.ConfigMapKeyServicePortalAllowedHTTPHosts:  {},
-	configkeys.ConfigMapKeyServicePortalModelBaseURL:        {},
-	configkeys.ConfigMapKeyGoProxyServicePortalEnabled:      {},
-	configkeys.ConfigMapKeyRegistryServicePortalEnabled:     {},
-	configkeys.ConfigMapKeyServicePortalsNamespace:          {},
+	configkeys.ConfigMapKeyServicePortalModelBaseURL:      {},
+	configkeys.ConfigMapKeyGoProxyServicePortalEnabled:    {},
+	configkeys.ConfigMapKeyRegistryServicePortalEnabled:   {},
+	configkeys.ConfigMapKeyServicePortalsNamespace:        {},
 
 	// Workload Identity Federation and ephemeral GCP project creation
 	configkeys.ConfigMapKeyGCPWorkloadIdentityProvider: {},
