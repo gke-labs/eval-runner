@@ -721,6 +721,37 @@ type repositoryFetchResult struct {
 	timedOut       bool
 }
 
+func (r *RunReconciler) executeSandboxStep(
+	ctx context.Context,
+	sandboxClient sandboxclient.Client,
+	deadline *metav1.Time,
+	stepTimeout time.Duration,
+	processConfig sandboxclient.ProcessConfig,
+) (*sandboxclient.ExecuteResult, bool, error) {
+	stepContext, stepCancel := r.stepContext(ctx, deadline, stepTimeout)
+	stepResult, stepErr := executeSandboxWithTimeout(stepContext, sandboxClient, processConfig)
+	stepCancel()
+	return stepResult, isStepTimeout(stepContext, stepErr), stepErr
+}
+
+func (r *RunReconciler) cleanRepositoryDirectory(
+	ctx context.Context,
+	sandboxClient sandboxclient.Client,
+	deadline *metav1.Time,
+	stepTimeout time.Duration,
+) (bool, error) {
+	_, timedOut, cleanErr := r.executeSandboxStep(ctx, sandboxClient, deadline, stepTimeout, sandboxclient.ProcessConfig{
+		Command: []string{"rm", "-rf", "repo"},
+	})
+	if cleanErr != nil {
+		log.FromContext(ctx).V(1).Info("Failed to clean repo directory before git operation", "error", cleanErr)
+		if timedOut || isUnavailableOrDialTimeout(cleanErr) || status.Code(cleanErr) == codes.Unauthenticated {
+			return timedOut, cleanErr
+		}
+	}
+	return false, nil
+}
+
 // fetchOrCloneRepository populates the "repo" directory inside the sandbox.
 // When commit is non-empty, it prefers a shallow single-commit fetch
 // (git init repo + git -C repo fetch --depth 1 -- <url> <commit>). If the git
@@ -736,31 +767,12 @@ func (r *RunReconciler) fetchOrCloneRepository(
 ) (repositoryFetchResult, error) {
 	logger := log.FromContext(ctx)
 
-	runStep := func(processConfig sandboxclient.ProcessConfig) (*sandboxclient.ExecuteResult, bool, error) {
-		stepContext, stepCancel := r.stepContext(ctx, deadline, stepTimeout)
-		stepResult, stepErr := executeSandboxWithTimeout(stepContext, sandboxClient, processConfig)
-		stepCancel()
-		return stepResult, isStepTimeout(stepContext, stepErr), stepErr
-	}
-
-	cleanRepositoryDirectory := func() (bool, error) {
-		if _, timedOut, cleanErr := runStep(sandboxclient.ProcessConfig{
-			Command: []string{"rm", "-rf", "repo"},
-		}); cleanErr != nil {
-			logger.V(1).Info("Failed to clean repo directory before git operation", "error", cleanErr)
-			if timedOut || isUnavailableOrDialTimeout(cleanErr) || status.Code(cleanErr) == codes.Unauthenticated {
-				return timedOut, cleanErr
-			}
-		}
-		return false, nil
-	}
-
 	if commit != "" {
-		if timedOut, cleanErr := cleanRepositoryDirectory(); cleanErr != nil {
+		if timedOut, cleanErr := r.cleanRepositoryDirectory(ctx, sandboxClient, deadline, stepTimeout); cleanErr != nil {
 			return repositoryFetchResult{timedOut: timedOut}, cleanErr
 		}
 
-		gitInitResult, gitInitTimedOut, gitInitErr := runStep(sandboxclient.ProcessConfig{
+		gitInitResult, gitInitTimedOut, gitInitErr := r.executeSandboxStep(ctx, sandboxClient, deadline, stepTimeout, sandboxclient.ProcessConfig{
 			Command: []string{"git", "init", "repo"},
 		})
 		if gitInitErr != nil {
@@ -768,17 +780,14 @@ func (r *RunReconciler) fetchOrCloneRepository(
 		}
 
 		if gitInitResult != nil && gitInitResult.ExitCode == 0 {
-			fetchResult, fetchTimedOut, fetchErr := runStep(sandboxclient.ProcessConfig{
+			fetchResult, fetchTimedOut, fetchErr := r.executeSandboxStep(ctx, sandboxClient, deadline, stepTimeout, sandboxclient.ProcessConfig{
 				Command: []string{"git", "-C", "repo", "fetch", "--depth", "1", "--", repositoryURL, commit},
 			})
 			if fetchErr != nil {
 				return repositoryFetchResult{executeResult: fetchResult, timedOut: fetchTimedOut}, fetchErr
 			}
 			if fetchResult != nil && fetchResult.ExitCode == 0 {
-				return repositoryFetchResult{shallowFetched: true, executeResult: fetchResult, timedOut: fetchTimedOut}, nil
-			}
-			if fetchTimedOut {
-				return repositoryFetchResult{executeResult: fetchResult, timedOut: true}, nil
+				return repositoryFetchResult{shallowFetched: true, executeResult: fetchResult}, nil
 			}
 			if deadline != nil && !r.now().Before(deadline.Time) {
 				return repositoryFetchResult{executeResult: fetchResult}, nil
@@ -789,9 +798,6 @@ func (r *RunReconciler) fetchOrCloneRepository(
 			}
 			logger.Info("Shallow git fetch failed; falling back to full git clone", "exitCode", fetchExitCode)
 		} else {
-			if gitInitTimedOut {
-				return repositoryFetchResult{executeResult: gitInitResult, timedOut: true}, nil
-			}
 			if deadline != nil && !r.now().Before(deadline.Time) {
 				return repositoryFetchResult{executeResult: gitInitResult}, nil
 			}
@@ -799,11 +805,11 @@ func (r *RunReconciler) fetchOrCloneRepository(
 		}
 	}
 
-	if timedOut, cleanErr := cleanRepositoryDirectory(); cleanErr != nil {
+	if timedOut, cleanErr := r.cleanRepositoryDirectory(ctx, sandboxClient, deadline, stepTimeout); cleanErr != nil {
 		return repositoryFetchResult{timedOut: timedOut}, cleanErr
 	}
 
-	cloneResult, cloneTimedOut, cloneErr := runStep(sandboxclient.ProcessConfig{
+	cloneResult, cloneTimedOut, cloneErr := r.executeSandboxStep(ctx, sandboxClient, deadline, stepTimeout, sandboxclient.ProcessConfig{
 		Command: []string{"git", "clone", "--", repositoryURL, "repo"},
 	})
 	return repositoryFetchResult{executeResult: cloneResult, timedOut: cloneTimedOut}, cloneErr
