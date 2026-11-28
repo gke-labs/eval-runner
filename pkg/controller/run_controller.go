@@ -1939,11 +1939,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	initialTasks := r.initializeTasks(run.Spec, manifest)
+	initialPrebuilds := initializePrebuilds(initialTasks, manifest)
 	dl := metav1.NewTime(r.now().Add(r.executionDeadline()))
 	err = r.updateRunStatus(ctx, req.NamespacedName, func(status *v1alpha1.RunStatus, gen int64) {
 		status.Phase = v1alpha1.RunPhaseRunning
 		status.Message = successMsg
 		status.Discovery = discoveryStatus
+		status.Prebuilds = initialPrebuilds
 		status.Tasks = initialTasks
 		status.ExecutionDeadline = &dl
 		if prefix := r.artifactSink().ArtifactPrefix(run.Spec.Repo.Commit); prefix != "" {
@@ -2133,6 +2135,10 @@ func (r *RunReconciler) deleteAllSandboxesForRun(ctx context.Context, runNamespa
 		taskID := sb.Annotations[discovery.AnnotationTaskID]
 		if taskID != "" {
 			r.cleanupTaskAuthToken(ctx, runNamespace, runName, taskID, sbKey)
+		}
+		prebuildName := sb.Annotations[discovery.AnnotationPrebuildName]
+		if prebuildName != "" {
+			r.cleanupPrebuildAuthToken(ctx, runNamespace, runName, prebuildName, sbKey)
 		}
 		if err := r.Delete(ctx, sb); err != nil && !apierrors.IsNotFound(err) {
 			logger.Error(err, "failed to delete sandbox for run", "sandbox", sb.Name, "run", runName)
@@ -2578,6 +2584,7 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 				status.Phase = v1alpha1.RunPhasePending
 				status.DiscoveryDeadline = nil
 				status.Discovery = nil
+				status.Prebuilds = nil
 				status.Tasks = nil
 				status.Summary = nil
 				status.Message = "Manifest missing; re-discovering"
@@ -2608,15 +2615,33 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 
 	if len(run.Status.Tasks) == 0 && manifest != nil {
 		initialTasks := r.initializeTasks(run.Spec, manifest)
+		initialPrebuilds := initializePrebuilds(initialTasks, manifest)
 		err := r.updateRunStatus(ctx, req.NamespacedName, func(status *v1alpha1.RunStatus, gen int64) {
+			status.Prebuilds = initialPrebuilds
 			status.Tasks = initialTasks
 			status.Summary = ComputeRunSummary(status.Tasks)
 		})
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		run.Status.Prebuilds = initialPrebuilds
 		run.Status.Tasks = initialTasks
 		run.Status.Summary = ComputeRunSummary(initialTasks)
+	} else if len(run.Status.Prebuilds) == 0 && manifest != nil {
+		if initialPrebuilds := initializePrebuilds(run.Status.Tasks, manifest); len(initialPrebuilds) > 0 {
+			err := r.updateRunStatus(ctx, req.NamespacedName, func(status *v1alpha1.RunStatus, gen int64) {
+				status.Prebuilds = initialPrebuilds
+			})
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			run.Status.Prebuilds = initialPrebuilds
+		}
+	}
+
+	prebuildResult, err := r.reconcilePrebuilds(ctx, req, run, manifest)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// List current task sandboxes in sandbox namespace
@@ -2661,16 +2686,25 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 
 	// Start pending tasks up to MaxParallelTasks: observe, decide, apply.
 	availableSlots := r.maxParallelTasks() - runningCount
-	waitingForOldSandbox := false
+	waitingForOldSandbox := prebuildResult.waitingForOldSandbox
 	if availableSlots > 0 {
 		pendingObservations, err := r.observePendingTasks(ctx, run, sandboxesByTask)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		pendingDecisions := decidePendingTasks(run.Status.Tasks, pendingObservations, availableSlots, r.InstanceID)
+		pendingDecisions := decidePendingTasks(
+			run.Status.Tasks,
+			pendingObservations,
+			availableSlots,
+			r.InstanceID,
+			taskPrebuildByID(manifest),
+			prebuildPhaseByName(run.Status.Prebuilds),
+		)
 
 		var startOutcomes map[string]pendingTaskStartOutcome
-		waitingForOldSandbox, startOutcomes = r.executePendingTaskDecisions(ctx, run, manifest, pendingDecisions, sandboxesByTask)
+		waitingForOldTaskSandbox := false
+		waitingForOldTaskSandbox, startOutcomes = r.executePendingTaskDecisions(ctx, run, manifest, pendingDecisions, sandboxesByTask)
+		waitingForOldSandbox = waitingForOldSandbox || waitingForOldTaskSandbox
 		if len(startOutcomes) > 0 {
 			statusNow := metav1.NewTime(r.now())
 			err := r.updateRunStatus(ctx, req.NamespacedName, func(status *v1alpha1.RunStatus, generation int64) {
@@ -2798,20 +2832,27 @@ func (r *RunReconciler) reconcileRunning(ctx context.Context, req reconcile.Requ
 	}
 
 	if len(readyTasks) == 0 && len(asyncTaskResults) == 0 {
-		if hasStatusUpdates {
+		if hasStatusUpdates || prebuildResult.hasStatusUpdates {
 			return ctrl.Result{Requeue: true}, nil
 		}
 		if waitingForOldSandbox {
 			return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
 		}
-		if pollingAsync && !waitingInGracePeriod && !waitingForPod {
+		combinedWaitingInGracePeriod := waitingInGracePeriod || prebuildResult.waitingInGracePeriod
+		combinedWaitingForPod := waitingForPod || prebuildResult.waitingForPod
+		combinedPollingAsync := pollingAsync || prebuildResult.pollingAsync
+		combinedMinGraceRemaining := minGraceRemaining
+		if prebuildResult.minGraceRemaining > 0 && (combinedMinGraceRemaining == 0 || prebuildResult.minGraceRemaining < combinedMinGraceRemaining) {
+			combinedMinGraceRemaining = prebuildResult.minGraceRemaining
+		}
+		if combinedPollingAsync && !combinedWaitingInGracePeriod && !combinedWaitingForPod {
 			return ctrl.Result{RequeueAfter: r.pollProgressInterval()}, nil
 		}
 		requeueAfter := 1 * time.Second
-		if waitingInGracePeriod && minGraceRemaining > 0 && minGraceRemaining < requeueAfter {
-			requeueAfter = minGraceRemaining
+		if combinedWaitingInGracePeriod && combinedMinGraceRemaining > 0 && combinedMinGraceRemaining < requeueAfter {
+			requeueAfter = combinedMinGraceRemaining
 		}
-		if pollingAsync && r.pollProgressInterval() < requeueAfter {
+		if combinedPollingAsync && r.pollProgressInterval() < requeueAfter {
 			requeueAfter = r.pollProgressInterval()
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
@@ -2920,6 +2961,8 @@ func decidePendingTasks(
 	observations map[string]pendingTaskObservation,
 	availableSlots int,
 	controllerInstance string,
+	prebuildsByTask map[string]string,
+	prebuildPhases map[string]v1alpha1.PrebuildPhase,
 ) []pendingTaskDecision {
 	if availableSlots <= 0 {
 		return nil
@@ -2929,6 +2972,11 @@ func decidePendingTasks(
 	for _, task := range tasks {
 		if task.Phase != v1alpha1.TaskPhasePending {
 			continue
+		}
+		if prebuildName := prebuildsByTask[task.ID]; prebuildName != "" {
+			if prebuildPhases[prebuildName] != v1alpha1.PrebuildPhaseCompleted {
+				continue
+			}
 		}
 		if remainingSlots <= 0 {
 			break
@@ -4031,6 +4079,18 @@ func (r *RunReconciler) markDeadlineCutOff(status *v1alpha1.RunStatus, generatio
 	now := metav1.NewTime(r.now())
 	runningCutOffCount := 0
 	pendingCutOffCount := 0
+
+	for i := range status.Prebuilds {
+		prebuild := &status.Prebuilds[i]
+		if prebuild.Phase == v1alpha1.PrebuildPhasePending || prebuild.Phase == v1alpha1.PrebuildPhaseRunning {
+			prebuild.Phase = v1alpha1.PrebuildPhaseFailed
+			prebuild.ExecutionID = ""
+			if prebuild.FinishedAt == nil {
+				prebuild.FinishedAt = &now
+			}
+			prebuild.Message = "cut off by Run execution deadline"
+		}
+	}
 
 	for i := range status.Tasks {
 		task := &status.Tasks[i]
