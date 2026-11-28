@@ -306,3 +306,19 @@ type AccessChecker interface {
 type TaskFileStorer interface {
 	StoreTaskFile(ctx context.Context, meta RunMetadata, filename string, data []byte) (string, error)
 }
+
+// PrebuildMarkerFilename is the filename used for per-commit prebuild completion markers.
+const PrebuildMarkerFilename = "done.json"
+
+// PrebuildCompletionMarker records that a named prebuild completed for a commit.
+type PrebuildCompletionMarker struct {
+	Commit       string    `json:"commit"`
+	PrebuildName string    `json:"prebuildName"`
+	CompletedAt  time.Time `json:"completedAt"`
+}
+
+// PrebuildMarkerStorer is implemented by sinks that support persisting per-commit
+// prebuild completion markers at runs/<commit>/prebuilds/<prebuildName>/done.json.
+type PrebuildMarkerStorer interface {
+	StorePrebuildMarker(ctx context.Context, commit, prebuildName string, data []byte) (string, error)
+}
