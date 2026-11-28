@@ -82,11 +82,17 @@ const (
 	// RoleSample is the role value for sample execution sandboxes.
 	RoleSample = "sample"
 
+	// RolePrebuild is the role value for manifest prebuild sandboxes.
+	RolePrebuild = "prebuild"
+
 	// DefaultSampleRunnerImage is the default image used for sample sandboxes.
 	DefaultSampleRunnerImage = "sample-runner:latest"
 
 	// AnnotationTaskID tracks the original task ID on the sandbox.
 	AnnotationTaskID = "evalrunner.gke-labs.dev/task-id"
+
+	// AnnotationPrebuildName tracks the manifest prebuild name on a prebuild sandbox.
+	AnnotationPrebuildName = "evalrunner.gke-labs.dev/prebuild-name"
 
 	// AnnotationControllerInstance tracks the controller instance that created the sandbox.
 	AnnotationControllerInstance = "evalrunner.gke-labs.dev/controller-instance"
@@ -258,7 +264,48 @@ func TaskSandboxNameForRun(runName, taskID string) string {
 	return base + hashSuffix
 }
 
-// TaskSandboxConfig configures task sandbox creation.
+// PrebuildAuthSecretNameForRun deterministically generates a valid Kubernetes resource name
+// for a Run's prebuild auth Secret (DNS-1123 label, max 63 characters).
+func PrebuildAuthSecretNameForRun(runName, prebuildName string) string {
+	return namedResourceForRun("prebuild-auth-", runName, prebuildName, runName+"/"+prebuildName)
+}
+
+// PrebuildSandboxNameForRun deterministically generates a valid Kubernetes resource name
+// for a Run's prebuild execution sandbox (DNS-1123 label, max 63 characters).
+func PrebuildSandboxNameForRun(runName, prebuildName string) string {
+	return namedResourceForRun("prebuild-", runName, prebuildName, prebuildName)
+}
+
+func namedResourceForRun(prefix, runName, identifier, hashInput string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return '-'
+	}, identifier)
+	sanitized = strings.Trim(sanitized, "-")
+
+	sum := sha256.Sum256([]byte(hashInput))
+	hashSuffix := "-" + hex.EncodeToString(sum[:4])
+
+	fullName := prefix + runName + "-" + sanitized + hashSuffix
+	if len(fullName) <= 63 {
+		return fullName
+	}
+
+	maxBaseLen := 63 - len(hashSuffix)
+	base := prefix + runName + "-" + sanitized
+	if len(base) > maxBaseLen {
+		base = base[:maxBaseLen]
+		base = strings.TrimRight(base, "-")
+	}
+	return base + hashSuffix
+}
+
+// TaskSandboxConfig configures task and prebuild sandbox creation.
 type TaskSandboxConfig struct {
 	Namespace              string
 	ControllerInstance     string
@@ -280,6 +327,29 @@ type TaskSandboxConfig struct {
 
 // BuildTaskSandbox constructs the Sandbox CR for executing an eval task for a Run.
 func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *sandboxv1beta1.Sandbox {
+	annotations := map[string]string{
+		AnnotationTaskID:      taskID,
+		AnnotationTaskAttempt: strconv.Itoa(cfg.TaskAttempt),
+	}
+	return buildWorkloadSandbox(run, TaskSandboxNameForRun(run.Name, taskID), RoleSample, annotations, cfg)
+}
+
+// BuildPrebuildSandbox constructs the Sandbox CR for executing a manifest prebuild for a Run.
+func BuildPrebuildSandbox(run *v1alpha1.Run, prebuildName string, cfg TaskSandboxConfig) *sandboxv1beta1.Sandbox {
+	annotations := map[string]string{
+		AnnotationPrebuildName: prebuildName,
+	}
+	cfg.SandboxTask = true
+	return buildWorkloadSandbox(run, PrebuildSandboxNameForRun(run.Name, prebuildName), RolePrebuild, annotations, cfg)
+}
+
+func buildWorkloadSandbox(
+	run *v1alpha1.Run,
+	sandboxName string,
+	role string,
+	baseAnnotations map[string]string,
+	cfg TaskSandboxConfig,
+) *sandboxv1beta1.Sandbox {
 	if cfg.AuthTokenDigest == "" {
 		panic("authTokenDigest is required")
 	}
@@ -301,7 +371,7 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 			corev1.ResourceMemory: resource.MustParse(v1alpha1.DefaultTaskMemoryLimit),
 		}
 	}
-	sbName := TaskSandboxNameForRun(run.Name, taskID)
+	sbName := sandboxName
 	serverCertSecret := cfg.ServerCertSecret
 	if serverCertSecret == "" {
 		serverCertSecret = pki.ServerSecretName(sbName)
@@ -352,7 +422,7 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 	labels := map[string]string{
 		LabelRunName:      run.Name,
 		LabelRunNamespace: run.Namespace,
-		LabelRole:         RoleSample,
+		LabelRole:         role,
 		LabelSandbox:      "true",
 	}
 	if run.UID != "" {
@@ -362,9 +432,9 @@ func BuildTaskSandbox(run *v1alpha1.Run, taskID string, cfg TaskSandboxConfig) *
 		labels[LabelServicePortalIntercept] = "true"
 	}
 
-	annotations := map[string]string{
-		AnnotationTaskID:      taskID,
-		AnnotationTaskAttempt: strconv.Itoa(cfg.TaskAttempt),
+	annotations := make(map[string]string, len(baseAnnotations)+1)
+	for key, value := range baseAnnotations {
+		annotations[key] = value
 	}
 	if cfg.ControllerInstance != "" {
 		annotations[AnnotationControllerInstance] = cfg.ControllerInstance

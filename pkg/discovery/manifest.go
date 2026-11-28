@@ -260,12 +260,21 @@ func validateManifestResources(subject string, resources []v1alpha1.ManifestReso
 // For sandbox tasks, if limits are specified in resources, those values are used,
 // with the defaults (500m / 512Mi) filled in for keys the manifest omits.
 func TaskResourceLimits(task v1alpha1.ManifestTask) corev1.ResourceList {
+	return sandboxResourceLimits(task.Resources)
+}
+
+// PrebuildResourceLimits returns a prebuild's effective sandbox container limits as a corev1.ResourceList.
+func PrebuildResourceLimits(prebuild v1alpha1.ManifestPrebuild) corev1.ResourceList {
+	return sandboxResourceLimits(prebuild.Resources)
+}
+
+func sandboxResourceLimits(resources []v1alpha1.ManifestResource) corev1.ResourceList {
 	limits := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(v1alpha1.DefaultTaskCPULimit),
 		corev1.ResourceMemory: resource.MustParse(v1alpha1.DefaultTaskMemoryLimit),
 	}
 
-	for _, manifestResource := range task.Resources {
+	for _, manifestResource := range resources {
 		if manifestResource.Type == v1alpha1.ResourceTypeSandbox {
 			if manifestResource.Limits != nil {
 				if quantity, ok := manifestResource.Limits[corev1.ResourceCPU]; ok && !quantity.IsZero() {
@@ -288,12 +297,22 @@ func TaskResourceLimits(task v1alpha1.ManifestTask) corev1.ResourceList {
 // with the defaults (DefaultDockerInDockerCPULimit / DefaultDockerInDockerMemoryLimit)
 // filled in for keys the manifest omits.
 func KindClusterResourceLimits(task v1alpha1.ManifestTask) corev1.ResourceList {
+	return kindClusterResourceLimits(task.Resources)
+}
+
+// PrebuildKindClusterResourceLimits returns the effective Docker-in-Docker sidecar limits
+// for a prebuild declaring a kind-cluster resource as a corev1.ResourceList.
+func PrebuildKindClusterResourceLimits(prebuild v1alpha1.ManifestPrebuild) corev1.ResourceList {
+	return kindClusterResourceLimits(prebuild.Resources)
+}
+
+func kindClusterResourceLimits(resources []v1alpha1.ManifestResource) corev1.ResourceList {
 	limits := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(DefaultDockerInDockerCPULimit),
 		corev1.ResourceMemory: resource.MustParse(DefaultDockerInDockerMemoryLimit),
 	}
 
-	for _, manifestResource := range task.Resources {
+	for _, manifestResource := range resources {
 		if manifestResource.Type == v1alpha1.ResourceTypeKindCluster {
 			if manifestResource.Limits != nil {
 				if quantity, ok := manifestResource.Limits[corev1.ResourceCPU]; ok && !quantity.IsZero() {

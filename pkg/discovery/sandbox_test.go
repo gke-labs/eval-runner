@@ -1771,3 +1771,109 @@ func TestBuildTaskSandbox_KindCluster(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildPrebuildSandbox(t *testing.T) {
+	run := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-prebuild-run",
+			Namespace: "eval-runner",
+			UID:       "uid-prebuild-1",
+		},
+		Spec: v1alpha1.RunSpec{
+			Repo: v1alpha1.RepoSpec{
+				URL:    "https://github.com/example/repo.git",
+				Commit: "abcdef1234567890",
+			},
+		},
+	}
+
+	prebuild := v1alpha1.ManifestPrebuild{
+		Image:   "builder:v1",
+		Command: []string{"./scripts/prebuild.sh"},
+		Resources: []v1alpha1.ManifestResource{
+			{
+				Type: v1alpha1.ResourceTypeSandbox,
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+			},
+			{
+				Type: v1alpha1.ResourceTypeKindCluster,
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("6"),
+					corev1.ResourceMemory: resource.MustParse("12Gi"),
+				},
+			},
+		},
+	}
+
+	sandbox := BuildPrebuildSandbox(run, "kind-images", TaskSandboxConfig{
+		Namespace:              "eval-runner-sandbox",
+		ControllerInstance:     "controller-1",
+		Image:                  prebuild.Image,
+		AuthTokenDigest:        AuthTokenDigest("secret-token"),
+		CloneRepo:              true,
+		KindCluster:            true,
+		KindClusterLimits:      PrebuildKindClusterResourceLimits(prebuild),
+		Limits:                 PrebuildResourceLimits(prebuild),
+		ServicePortalIntercept: true,
+	})
+
+	if sandbox.Name != PrebuildSandboxNameForRun(run.Name, "kind-images") {
+		t.Errorf("sandbox.Name = %q, want %q", sandbox.Name, PrebuildSandboxNameForRun(run.Name, "kind-images"))
+	}
+	if len(sandbox.Name) > 63 {
+		t.Errorf("sandbox.Name exceeds 63 chars: %q", sandbox.Name)
+	}
+	if sandbox.Labels[LabelRole] != RolePrebuild {
+		t.Errorf("LabelRole = %q, want %q", sandbox.Labels[LabelRole], RolePrebuild)
+	}
+	if sandbox.Labels[LabelSandbox] != "true" {
+		t.Errorf("LabelSandbox = %q, want true", sandbox.Labels[LabelSandbox])
+	}
+	if sandbox.Labels[LabelServicePortalIntercept] != "true" {
+		t.Errorf("LabelServicePortalIntercept = %q, want true", sandbox.Labels[LabelServicePortalIntercept])
+	}
+	if sandbox.Annotations[AnnotationPrebuildName] != "kind-images" {
+		t.Errorf("AnnotationPrebuildName = %q, want kind-images", sandbox.Annotations[AnnotationPrebuildName])
+	}
+	if sandbox.Annotations[AnnotationControllerInstance] != "controller-1" {
+		t.Errorf("AnnotationControllerInstance = %q, want controller-1", sandbox.Annotations[AnnotationControllerInstance])
+	}
+
+	podSpec := sandbox.Spec.PodTemplate.Spec
+	if len(podSpec.InitContainers) != 2 || podSpec.InitContainers[1].Name != RepoCheckoutInitContainerName {
+		t.Fatalf("expected repo checkout init container, got %+v", podSpec.InitContainers)
+	}
+	if len(podSpec.Containers) != 2 || podSpec.Containers[1].Name != DockerInDockerContainerName {
+		t.Fatalf("expected agent and dind containers, got %d containers", len(podSpec.Containers))
+	}
+	if podSpec.Containers[0].Image != "builder:v1" {
+		t.Errorf("agent image = %q, want builder:v1", podSpec.Containers[0].Image)
+	}
+	if gotCPU := podSpec.Containers[0].Resources.Limits[corev1.ResourceCPU]; gotCPU.String() != "2" {
+		t.Errorf("agent CPU limit = %q, want 2", gotCPU.String())
+	}
+	if gotMemory := podSpec.Containers[0].Resources.Limits[corev1.ResourceMemory]; gotMemory.String() != "4Gi" {
+		t.Errorf("agent memory limit = %q, want 4Gi", gotMemory.String())
+	}
+	if gotDindCPU := podSpec.Containers[1].Resources.Limits[corev1.ResourceCPU]; gotDindCPU.String() != "6" {
+		t.Errorf("dind CPU limit = %q, want 6", gotDindCPU.String())
+	}
+	if gotDindMemory := podSpec.Containers[1].Resources.Limits[corev1.ResourceMemory]; gotDindMemory.String() != "12Gi" {
+		t.Errorf("dind memory limit = %q, want 12Gi", gotDindMemory.String())
+	}
+	if podSpec.NodeSelector[KindNodeSelectorLabel] != "true" {
+		t.Errorf("expected kind node selector, got %v", podSpec.NodeSelector)
+	}
+
+	longRunName := strings.Repeat("a", 55)
+	longPrebuildName := strings.Repeat("b", 55)
+	if name := PrebuildSandboxNameForRun(longRunName, longPrebuildName); len(name) > 63 {
+		t.Errorf("long PrebuildSandboxNameForRun exceeds 63 chars: len=%d (%q)", len(name), name)
+	}
+	if secretName := PrebuildAuthSecretNameForRun(longRunName, longPrebuildName); len(secretName) > 63 {
+		t.Errorf("long PrebuildAuthSecretNameForRun exceeds 63 chars: len=%d (%q)", len(secretName), secretName)
+	}
+}
